@@ -518,9 +518,11 @@ struct ZeroSpyAnalysis{
         byte* pc = (byte*)pc_app;
         instr_init(drcontext, &instr);
         decode(drcontext, pc, &instr);
+#ifdef DEBUG_VGATHER
         printf("\n^^ CheckNByteValueAfterVGather: ");
         disassemble(drcontext, pc, 1/*sdtout file desc*/);
         printf("\n");
+#endif
         if(isApprox) {
             uint32_t zeros=0;
             uint64_t map=0;
@@ -726,13 +728,13 @@ struct ZerospyInstrument{
         opnd_t opnd = instr_get_src(ins, 0);
         uint32_t operSize = FloatOperandSizeTable(ins, opnd); // VGather's second operand is the memory operand
         uint32_t refSize = opnd_size_in_bytes(opnd_get_size(instr_get_dst(ins, 0)));
-
+#ifdef DEBUG_VGATHER
         printf("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
         printf("^^ refSize = %d, operSize = %d\n", refSize, operSize);
         printf("^^ Disassembled Instruction ^^^\n");
         disassemble(drcontext, instr_get_app_pc(ins), STDOUT);
         printf("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
-
+#endif
         switch(refSize) {
             case 1:
             case 2: 
