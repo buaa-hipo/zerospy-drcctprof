@@ -1,7 +1,7 @@
 #! /bin/bash
 
 # **********************************************************
-# Copyright (c) 2020 Xuhpclab. All rights reserved.
+# Copyright (c) 2020-2021 Xuhpclab. All rights reserved.
 # Licensed under the MIT License.
 # See LICENSE file for more information.
 # **********************************************************
@@ -41,3 +41,14 @@ do
     rm -rf $DYNAMORIO_CLIENT_PATH/$CLIENT
     ln -s $DRCCTLIB_CLIENTS_ROOT_PATH/$CLIENT $DYNAMORIO_CLIENT_PATH/$CLIENT
 done
+
+# PLATFORM=$(uname -m)
+# IS_X86=false
+# if [ $PLATFORM == 'x86_64' ]; then
+#     IS_X86=true
+# fi
+
+# if [ "$IS_X86" == "true" ]; then
+    # # necessary patch for dynamorio
+    # $CUR_DIR/patch_for_dr/add_update_patch.sh
+# fi
