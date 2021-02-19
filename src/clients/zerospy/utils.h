@@ -228,3 +228,21 @@ FloatOperandSizeTable(instr_t *instr, opnd_t opnd)
     default: return 0;
     }
 }
+
+// Currently, we mark x87 control instructions handling FPU states are ignorable (not insterested)
+bool instr_is_ignorable(instr_t *ins) {
+    int opc = instr_get_opcode(ins);
+    switch (opc) {
+        case OP_fldenv:
+        case OP_fldcw:
+        case OP_fnstenv:
+        case OP_fnstcw:
+        case OP_fnsave:
+        case OP_fnstsw:
+        case OP_frstor:
+            return true;
+        default:
+            return false;
+    }
+    return false;
+}

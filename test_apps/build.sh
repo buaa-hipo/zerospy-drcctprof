@@ -1,7 +1,7 @@
 #! /bin/bash
 
 # **********************************************************
-# Copyright (c) 2020 Xuhpclab. All rights reserved.
+# Copyright (c) 2020-2021 Xuhpclab. All rights reserved.
 # Licensed under the MIT License.
 # See LICENSE file for more information.
 # **********************************************************
@@ -20,4 +20,6 @@ g++ -g ${SRC}/test_app_cct.cpp -o ${BUILD}/test_app_cct
 g++ -g ${SRC}/test_app_multithread.cpp -o ${BUILD}/test_app_multithread -pthread
 g++ -g ${SRC}/test_app_reuse.cpp -o ${BUILD}/test_app_reuse 
 g++ -g ${SRC}/test_app_signal.cpp -o ${BUILD}/test_app_signal
+g++ -g ${SRC}/test_app_keep_running.cpp -o ${BUILD}/test_app_keep_running
+g++ -g ${SRC}/test_app_keep_running_multithread.cpp -o ${BUILD}/test_app_keep_running_multithread -pthread
 echo -e "\033[32m Build test apps successfully! \033[0m"

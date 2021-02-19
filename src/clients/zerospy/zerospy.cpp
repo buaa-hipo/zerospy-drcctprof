@@ -5,6 +5,18 @@
 #include <assert.h>
 #include <algorithm>
 
+#define _WERROR
+
+#ifdef TIMING
+#include <time.h>
+#include <math.h>
+uint64_t get_miliseconds() {
+    struct timespec spec;
+    clock_gettime(CLOCK_REALTIME, &spec);
+    return spec.tv_sec*1000 + round(spec.tv_nsec / 1.0e6); // Convert nanoseconds to milliseconds
+}
+#endif
+
 #include "dr_api.h"
 #include "drmgr.h"
 #include "drreg.h"
@@ -69,6 +81,10 @@ typedef struct _per_thread_t {
 
 file_t gFile;
 static void *gLock;
+#ifndef _WERROR
+file_t fwarn;
+bool warned=false;
+#endif
 
 // global metrics
 uint64_t grandTotBytesLoad = 0;
@@ -488,6 +504,47 @@ struct ZeroSpyAnalysis{
             }
         }
     }
+#ifdef X86
+    static __attribute__((always_inline)) void CheckNByteValueAfterVGather(int32_t slot, void* pc_app)
+    {
+        dr_mcontext_t mcontext;
+        mcontext.size = sizeof(mcontext);
+        mcontext.flags= DR_MC_ALL;
+        void *drcontext = dr_get_current_drcontext();
+        DR_ASSERT(dr_get_mcontext(drcontext, &mcontext));
+        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+        context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
+        instr_t instr;
+        byte* pc = (byte*)pc_app;
+        instr_init(drcontext, &instr);
+        decode(drcontext, pc, &instr);
+#ifdef DEBUG_VGATHER
+        printf("\n^^ CheckNByteValueAfterVGather: ");
+        disassemble(drcontext, pc, 1/*sdtout file desc*/);
+        printf("\n");
+#endif
+        if(isApprox) {
+            uint32_t zeros=0;
+            uint64_t map=0;
+            app_pc addr;
+            bool is_write;
+            uint32_t pos;
+            for( int index=0; instr_compute_address_ex_pos(&instr, &mcontext, index, &addr, &is_write, &pos); ++index ) {
+                DR_ASSERT(!is_write);
+                uint8_t* bytes = reinterpret_cast<uint8_t*>(addr);
+                bool hasRedundancy = (bytes[sizeof(T)-1]==0);
+                if(hasRedundancy) {
+                    if(sizeof(T)==4) { map = map | (UnrolledConjunctionApprox<0,sizeof(T),sizeof(T)>::BodyRedMap(bytes) << (SP_MAP_SIZE * pos) ); }
+                    else if(sizeof(T)==8) { map = map |  (UnrolledConjunctionApprox<0,sizeof(T),sizeof(T)>::BodyRedMap(bytes) << (DP_MAP_SIZE * pos) ); }
+                    zeros = zeros + UnrolledConjunctionApprox<0,sizeof(T),sizeof(T)>::BodyZeros(bytes);
+                }
+            }
+            AddToApproximateRedTable((uint64_t)curCtxtHandle, map, AccessLen, zeros, AccessLen/sizeof(T), sizeof(T), pt);
+        } else {
+            assert(0 && "VGather should be a floating point operation!");
+        }
+    }
+#endif
 };
 
 static inline void CheckAfterLargeRead(int32_t slot, void* addr, uint32_t accessLen)
@@ -574,39 +631,78 @@ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN)
 #define HANDLE_LARGE() \
 dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize))
 
+#ifdef X86
+#define HANDLE_VGATHER(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX, ins) \
+dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX)>::CheckNByteValueAfterVGather, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(instr_get_app_pc(ins)))
+#endif
+
 #include <signal.h>
 
 struct ZerospyInstrument{
     static __attribute__((always_inline)) void InstrumentReadValueBeforeAndAfterLoading(void *drcontext, instrlist_t *bb, instr_t *ins, opnd_t opnd, reg_id_t addr_reg, int32_t slot)
-    {    
+    {
         uint32_t refSize = opnd_size_in_bytes(opnd_get_size(opnd));
         uint32_t operSize = FloatOperandSizeTable(ins, opnd);
         if (refSize==0) {
             // Something strange happened, so ignore it
             return ;
         }
-        if (instr_is_floating(ins) && operSize>0) {
-            switch(refSize) {
-                case 1:
-                case 2: assert(0 && "memory read floating data with unexptected small size");
-                case 4: HANDLE_CASE(float, 4, 4, true); break;
-                case 8: HANDLE_CASE(double, 8, 8, true); break;
-                case 10: HANDLE_CASE(uint8_t, 10, 1, true); break;
-                case 16: {
-                    switch (operSize) {
-                        case 4: HANDLE_CASE(float, 16, 4, true); break;
-                        case 8: HANDLE_CASE(double, 16, 8, true); break;
-                        default: assert(0 && "handle large mem read with unexpected operand size\n"); break;
-                    }
-                }break;
-                case 32: {
-                    switch (operSize) {
-                        case 4: HANDLE_CASE(float, 32, 4, true); break;
-                        case 8: HANDLE_CASE(double, 32, 8, true); break;
-                        default: assert(0 && "handle large mem read with unexpected operand size\n"); break;
-                    }
-                }break;
-                default: assert(0 && "unexpected large memory read\n"); break;
+        if (instr_is_floating(ins)) {
+            if(operSize>0) {
+                switch(refSize) {
+                    case 1:
+                    case 2:
+#ifdef _WERROR
+                        printf("\nERROR: refSize for floating point instruction is too small: %d!\n", refSize);
+                        printf("^^ Disassembled Instruction ^^^\n");
+                        disassemble(drcontext, instr_get_app_pc(ins), 1/*sdtout file desc*/);
+                        printf("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                        fflush(stdout);
+                        assert(0 && "memory read floating data with unexptected small size");
+#else
+                        dr_fprintf(fwarn, "\nERROR: refSize for floating point instruction is too small: %d!\n", refSize);
+                        dr_fprintf(fwarn, "^^ Disassembled Instruction ^^^\n");
+                        disassemble(drcontext, instr_get_app_pc(ins), fwarn);
+                        dr_fprintf(fwarn, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                        warned = true;
+                        /* Do nothing, just report warning */
+                        break;
+#endif
+                    case 4: HANDLE_CASE(float, 4, 4, true); break;
+                    case 8: HANDLE_CASE(double, 8, 8, true); break;
+                    case 10: HANDLE_CASE(uint8_t, 10, 1, true); break;
+                    case 16: {
+                        switch (operSize) {
+                            case 4: HANDLE_CASE(float, 16, 4, true); break;
+                            case 8: HANDLE_CASE(double, 16, 8, true); break;
+                            default: assert(0 && "handle large mem read with unexpected operand size\n"); break;
+                        }
+                    }break;
+                    case 32: {
+                        switch (operSize) {
+                            case 4: HANDLE_CASE(float, 32, 4, true); break;
+                            case 8: HANDLE_CASE(double, 32, 8, true); break;
+                            default: assert(0 && "handle large mem read with unexpected operand size\n"); break;
+                        }
+                    }break;
+                    default: 
+#ifdef _WERROR
+                        printf("\nERROR: refSize for floating point instruction is too large: %d!\n", refSize);
+                        printf("^^ Disassembled Instruction ^^^\n");
+                        disassemble(drcontext, instr_get_app_pc(ins), 1/*sdtout file desc*/);
+                        printf("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                        fflush(stdout);
+                        assert(0 && "unexpected large memory read\n"); break;
+#else
+                        dr_fprintf(fwarn, "\nERROR: refSize for floating point instruction is too large: %d!\n", refSize);
+                        dr_fprintf(fwarn, "^^ Disassembled Instruction ^^^\n");
+                        disassemble(drcontext, instr_get_app_pc(ins), fwarn);
+                        dr_fprintf(fwarn, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                        warned = true;
+                        /* Do nothing, just report warning */
+                        break;
+#endif
+                }
             }
         } else {
             switch(refSize) {
@@ -627,6 +723,74 @@ struct ZerospyInstrument{
             }
         }
     }
+#ifdef X86
+    static __attribute__((always_inline)) void InstrumentReadValueBeforeVGather(void *drcontext, instrlist_t *bb, instr_t *ins, int32_t slot){
+        opnd_t opnd = instr_get_src(ins, 0);
+        uint32_t operSize = FloatOperandSizeTable(ins, opnd); // VGather's second operand is the memory operand
+        uint32_t refSize = opnd_size_in_bytes(opnd_get_size(instr_get_dst(ins, 0)));
+#ifdef DEBUG_VGATHER
+        printf("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+        printf("^^ refSize = %d, operSize = %d\n", refSize, operSize);
+        printf("^^ Disassembled Instruction ^^^\n");
+        disassemble(drcontext, instr_get_app_pc(ins), STDOUT);
+        printf("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+#endif
+        switch(refSize) {
+            case 1:
+            case 2: 
+            case 4: 
+            case 8: 
+            case 10: 
+#ifdef _WERROR
+                    printf("\nERROR: refSize for floating point instruction is too small: %d!\n", refSize);
+                    printf("^^ Disassembled Instruction ^^^\n");
+                    disassemble(drcontext, instr_get_app_pc(ins), 1/*sdtout file desc*/);
+                    printf("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                    fflush(stdout);
+                    assert(0 && "memory read floating data with unexptected small size");
+#else
+                    dr_fprintf(fwarn, "\nERROR: refSize for floating point instruction is too small: %d!\n", refSize);
+                    dr_fprintf(fwarn, "^^ Disassembled Instruction ^^^\n");
+                    disassemble(drcontext, instr_get_app_pc(ins), fwarn);
+                    dr_fprintf(fwarn, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                    warned = true;
+                    /* Do nothing, just report warning */
+                    break;
+#endif
+            case 16: {
+                switch (operSize) {
+                    case 4: HANDLE_VGATHER(float, 16, 4, true, ins); break;
+                    case 8: HANDLE_VGATHER(double, 16, 8, true, ins); break;
+                    default: assert(0 && "handle large mem read with unexpected operand size\n"); break;
+                }
+            }break;
+            case 32: {
+                switch (operSize) {
+                    case 4: HANDLE_VGATHER(float, 32, 4, true, ins); break;
+                    case 8: HANDLE_VGATHER(double, 32, 8, true, ins); break;
+                    default: assert(0 && "handle large mem read with unexpected operand size\n"); break;
+                }
+            }break;
+            default: 
+#ifdef _WERROR
+                    printf("\nERROR: refSize for floating point instruction is too large: %d!\n", refSize);
+                    printf("^^ Disassembled Instruction ^^^\n");
+                    disassemble(drcontext, instr_get_app_pc(ins), 1/*sdtout file desc*/);
+                    printf("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                    fflush(stdout);
+                    assert(0 && "unexpected large memory read\n"); break;
+#else
+                    dr_fprintf(fwarn, "\nERROR: refSize for floating point instruction is too large: %d!\n", refSize);
+                    dr_fprintf(fwarn, "^^ Disassembled Instruction ^^^\n");
+                    disassemble(drcontext, instr_get_app_pc(ins), fwarn);
+                    dr_fprintf(fwarn, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                    warned = true;
+                    /* Do nothing, just report warning */
+                    break;
+#endif
+        }
+    }
+#endif
 };
 
 static void
@@ -663,10 +827,18 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
 
     // store cct in tls filed
     // InstrumentIns(drcontext, bb, instr, slot);
-
-    // TODO: gather may result in failure, need special care
+#ifdef X86
+    // gather may result in failure, need special care
     if(instr_is_gather(instr)) {
-        // TODO: We can use instr_compute_VSIB_index or other VSIB functions to handle gather
+        // We use instr_compute_address_ex_pos to handle gather (with VSIB addressing)
+        printf("INFO: HANDLE vgather\n");
+        ZerospyInstrument::InstrumentReadValueBeforeVGather(drcontext, bb, instr, slot);
+        return ;
+    }
+#endif
+
+    // Currently, we mark x87 control instructions handling FPU states are ignorable (not insterested)
+    if(instr_is_ignorable(instr)) {
         return ;
     }
     
@@ -919,7 +1091,9 @@ static uint64_t getThreadByteLoad(per_thread_t *pt) {
 static void
 ClientThreadEnd(void *drcontext)
 {
-    uint64_t time = dr_get_miliseconds();
+#ifdef TIMING
+    uint64_t time = get_miliseconds();
+#endif
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
     if (pt->INTRedMap->empty() && pt->FPRedMap->empty()) return;
     uint64_t threadByteLoad = getThreadByteLoad(pt);
@@ -927,8 +1101,10 @@ ClientThreadEnd(void *drcontext)
     int threadId = drcctlib_get_thread_id();
     uint64_t threadRedByteLoadINT = PrintRedundancyPairs(pt, threadByteLoad, threadId);
     uint64_t threadRedByteLoadFP = PrintApproximationRedundancyPairs(pt, threadByteLoad, threadId);
-    time = dr_get_miliseconds() - time;
+#ifdef TIMING
+    time = get_miliseconds() - time;
     printf("Thread %d: Time %ld ms for generating outputs\n", threadId, time);
+#endif
 
     dr_mutex_lock(gLock);
     dr_fprintf(gFile, "\n#THREAD %d Redundant Read:", threadId);
@@ -962,6 +1138,11 @@ ClientInit(int argc, const char *argv[])
     sprintf(name+strlen(name), "/zerospy.log");
     gFile = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
     DR_ASSERT(gFile != INVALID_FILE);
+#ifndef _WERROR
+    sprintf(name+strlen(name), ".warn");
+    fwarn = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
+    DR_ASSERT(fwarn != INVALID_FILE);
+#endif
 }
 
 static void
@@ -971,6 +1152,13 @@ ClientExit(void)
     dr_fprintf(gFile, "\nTotalBytesLoad: %lu \n",grandTotBytesLoad);
     dr_fprintf(gFile, "\nRedundantBytesLoad: %lu %.2f\n",grandTotBytesRedLoad, grandTotBytesRedLoad * 100.0/grandTotBytesLoad);
     dr_fprintf(gFile, "\nApproxRedundantBytesLoad: %lu %.2f\n",grandTotBytesApproxRedLoad, grandTotBytesApproxRedLoad * 100.0/grandTotBytesLoad);
+#ifndef _WERROR
+    if(warned) {
+        dr_fprintf(gFile, "####################################\n");
+        dr_fprintf(gFile, "WARNING: some unexpected instructions are ignored. Please check zerospy.log.warn for detail.\n");
+        dr_fprintf(gFile, "####################################\n");
+    }
+#endif
     dr_close_file(gFile);
     dr_mutex_destroy(gLock);
     drcctlib_exit();

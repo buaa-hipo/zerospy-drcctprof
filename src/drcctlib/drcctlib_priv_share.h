@@ -1,5 +1,5 @@
 /* 
- *  Copyright (c) 2020 Xuhpclab. All rights reserved.
+ *  Copyright (c) 2020-2021 Xuhpclab. All rights reserved.
  *  Licensed under the MIT License.
  *  See LICENSE file for more information.
  */
@@ -9,7 +9,8 @@
 
 #include <vector>
 
-#include "drcctlib_global_share.h"
+#include "drcctlib_defines.h"
+#include "drcctlib_utils.h"
 #include "splay_tree.h"
 
 #define bb_key_t int32_t
