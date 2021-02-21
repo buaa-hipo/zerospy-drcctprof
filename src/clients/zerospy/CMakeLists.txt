@@ -31,6 +31,7 @@ add_library(zerospy SHARED
 
 configure_DynamoRIO_client(zerospy)
 use_DynamoRIO_extension(zerospy drcctlib)
+use_DynamoRIO_extension(zerospy droption) 
 place_shared_lib_in_lib_dir(zerospy)
 
 add_dependencies(zerospy api_headers)

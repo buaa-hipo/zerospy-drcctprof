@@ -24,6 +24,12 @@ uint64_t get_miliseconds() {
 #include "drcctlib.h"
 #include "utils.h"
 
+// Client Options
+#include "droption.h"
+static droption_t<bool> op_enable_sampling
+(DROPTION_SCOPE_CLIENT, "enable_sampling", 0, 0, 64, "Enable Bursty Sampling",
+ "Enable bursty sampling for lower overhead with less profiling accuracy.");
+
 using namespace std;
 
 #define ZEROSPY_PRINTF(format, args...) \
@@ -73,10 +79,21 @@ struct FPRedLogs{
 // maximum cct depth to print
 #define MAX_DEPTH 10
 
+#define ENABLE_SAMPLING 1
+#ifdef ENABLE_SAMPLING
+#define WINDOW_ENABLE 1000000
+#define WINDOW_DISABLE 100000000
+#define WINDOW_CLEAN 10
+#endif
+
 typedef struct _per_thread_t {
     unordered_map<uint64_t, INTRedLogs> *INTRedMap;
     unordered_map<uint64_t, FPRedLogs > *FPRedMap;
     file_t output_file;
+#ifdef ENABLE_SAMPLING
+    long long numIns;
+    bool sampleFlag;
+#endif
 } per_thread_t;
 
 file_t gFile;
@@ -476,12 +493,55 @@ struct UnrolledConjunction<end , end , incr>{
 };
 /*******************************************************************************************/
 
+#ifdef ENABLE_SAMPLING
+static void
+update_per_bb(uint instruction_count)
+{
+    void *drcontext = dr_get_current_drcontext();
+    per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+    if(pt->sampleFlag) {
+        pt->numIns += instruction_count;
+        if(pt->numIns > WINDOW_ENABLE) {
+            pt->sampleFlag = false;
+            pt->numIns = 0;
+        }
+    } else {
+        pt->numIns += instruction_count;
+        if(pt->numIns > WINDOW_DISABLE) {
+            pt->sampleFlag = true;
+            pt->numIns = 0;
+        }
+    }
+}
+
+static dr_emit_flags_t
+event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, bool translating, OUT void **user_data)
+{
+    uint num_instructions = 0;
+    instr_t *instr;
+    /* count the number of instructions in this block */
+    for (instr = instrlist_first(bb); instr != NULL; instr = instr_get_next(instr)) {
+        num_instructions++;
+    }
+    
+    /* insert clean call */
+    dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) update_per_bb, false, 1, 
+                        OPND_CREATE_INT32(num_instructions));
+    return DR_EMIT_DEFAULT;
+}
+#endif
+
 template<class T, uint32_t AccessLen, uint32_t ElemLen, bool isApprox>
 struct ZeroSpyAnalysis{
     static __attribute__((always_inline)) void CheckNByteValueAfterRead(int32_t slot, void* addr)
     {
         void *drcontext = dr_get_current_drcontext();
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+#ifdef ENABLE_SAMPLING
+        if(!pt->sampleFlag) {
+            return;
+        }
+#endif
         context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
         uint8_t* bytes = static_cast<uint8_t*>(addr);
         if(isApprox) {
@@ -507,12 +567,17 @@ struct ZeroSpyAnalysis{
 #ifdef X86
     static __attribute__((always_inline)) void CheckNByteValueAfterVGather(int32_t slot, void* pc_app)
     {
+        void *drcontext = dr_get_current_drcontext();
+        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+#ifdef ENABLE_SAMPLING
+        if(!pt->sampleFlag) {
+            return;
+        }
+#endif
         dr_mcontext_t mcontext;
         mcontext.size = sizeof(mcontext);
         mcontext.flags= DR_MC_ALL;
-        void *drcontext = dr_get_current_drcontext();
         DR_ASSERT(dr_get_mcontext(drcontext, &mcontext));
-        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
         context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
         instr_t instr;
         byte* pc = (byte*)pc_app;
@@ -551,6 +616,11 @@ static inline void CheckAfterLargeRead(int32_t slot, void* addr, uint32_t access
 {
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+#ifdef ENABLE_SAMPLING
+    if(!pt->sampleFlag) {
+        return;
+    }
+#endif
     context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
     uint8_t* bytes = static_cast<uint8_t*>(addr);
     // quick check whether the most significant byte of the read memory is redundant zero or not
@@ -831,7 +901,9 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
     // gather may result in failure, need special care
     if(instr_is_gather(instr)) {
         // We use instr_compute_address_ex_pos to handle gather (with VSIB addressing)
+#ifdef DEBUG
         printf("INFO: HANDLE vgather\n");
+#endif
         ZerospyInstrument::InstrumentReadValueBeforeVGather(drcontext, bb, instr, slot);
         return ;
     }
@@ -859,6 +931,9 @@ ThreadOutputFileInit(per_thread_t *pt)
     sprintf(name + strlen(name), "%s/thread-%d.topn.log", g_folder_name.c_str(), id);
     pt->output_file = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
     DR_ASSERT(pt->output_file != INVALID_FILE);
+    if (op_enable_sampling.get_value()) {
+        dr_fprintf(pt->output_file, "[ZEROSPY INFO] Sampling Enabled\n");
+    }
 }
 
 static void
@@ -872,6 +947,10 @@ ClientThreadStart(void *drcontext)
     pt->FPRedMap = new unordered_map<uint64_t, FPRedLogs>();
     pt->INTRedMap->rehash(10000000);
     pt->FPRedMap->rehash(10000000);
+#ifdef ENABLE_SAMPLING
+    pt->numIns = 0;
+    pt->sampleFlag = true;
+#endif
     drmgr_set_tls_field(drcontext, tls_idx, (void *)pt);
     ThreadOutputFileInit(pt);
 }
@@ -1125,6 +1204,14 @@ ClientThreadEnd(void *drcontext)
 static void
 ClientInit(int argc, const char *argv[])
 {
+    /* Parse options */
+    std::string parse_err;
+    int last_index;
+    if (!droption_parser_t::parse_argv(DROPTION_SCOPE_CLIENT, argc, argv, &parse_err, &last_index)) {
+        dr_fprintf(STDERR, "Usage error: %s", parse_err.c_str());
+        dr_abort();
+    }
+    /* Creating result directories */
     pid_t pid = getpid();
 #ifdef ARM_CCTLIB
     char name[MAXIMUM_PATH] = "arm-";
@@ -1138,6 +1225,10 @@ ClientInit(int argc, const char *argv[])
     sprintf(name+strlen(name), "/zerospy.log");
     gFile = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
     DR_ASSERT(gFile != INVALID_FILE);
+    if (op_enable_sampling.get_value()) {
+        dr_fprintf(STDOUT, "[ZEROSPY INFO] Sampling Enabled\n");
+        dr_fprintf(gFile, "[ZEROSPY INFO] Sampling Enabled\n");
+    }
 #ifndef _WERROR
     sprintf(name+strlen(name), ".warn");
     fwarn = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
@@ -1164,6 +1255,9 @@ ClientExit(void)
     drcctlib_exit();
     if (!drmgr_unregister_thread_init_event(ClientThreadStart) ||
         !drmgr_unregister_thread_exit_event(ClientThreadEnd) ||
+#ifdef ENABLE_SAMPLING
+        ( op_enable_sampling.get_value() && !drmgr_unregister_bb_instrumentation_event(event_basic_block) ) ||
+#endif
         !drmgr_unregister_tls_field(tls_idx)) {
         printf("ERROR: zerospy failed to unregister in ClientExit");
         fflush(stdout);
@@ -1184,17 +1278,14 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     ClientInit(argc, argv);
 
     if (!drmgr_init()) {
-        ZEROSPY_EXIT_PROCESS("ERROR: drcctlib_memory_with_addr_and_refsize_clean_call "
-                              "unable to initialize drmgr");
+        ZEROSPY_EXIT_PROCESS("ERROR: zerospy unable to initialize drmgr");
     }
     drreg_options_t ops = { sizeof(ops), 4 /*max slots needed*/, false };
     if (drreg_init(&ops) != DRREG_SUCCESS) {
-        ZEROSPY_EXIT_PROCESS("ERROR: drcctlib_memory_with_addr_and_refsize_clean_call "
-                              "unable to initialize drreg");
+        ZEROSPY_EXIT_PROCESS("ERROR: zerospy unable to initialize drreg");
     }
     if (!drutil_init()) {
-        ZEROSPY_EXIT_PROCESS("ERROR: drcctlib_memory_with_addr_and_refsize_clean_call "
-                              "unable to initialize drutil");
+        ZEROSPY_EXIT_PROCESS("ERROR: zerospy unable to initialize drutil");
     }
     drmgr_priority_t thread_init_pri = { sizeof(thread_init_pri),
                                          "zerospy-thread-init", NULL, NULL,
@@ -1202,13 +1293,19 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     drmgr_priority_t thread_exit_pri = { sizeof(thread_exit_pri),
                                          "zerispy-thread-exit", NULL, NULL,
                                          DRCCTLIB_THREAD_EVENT_PRI + 1 };
-    drmgr_register_thread_init_event_ex(ClientThreadStart, &thread_init_pri);
-    drmgr_register_thread_exit_event_ex(ClientThreadEnd, &thread_exit_pri);
+    if (
+#ifdef ENABLE_SAMPLING
+        // bb instrumentation event must be performed in analysis passes (as we don't change the application codes)
+        ( op_enable_sampling.get_value() && !drmgr_register_bb_instrumentation_event(event_basic_block, NULL, NULL) ) ||
+#endif
+        !drmgr_register_thread_init_event_ex(ClientThreadStart, &thread_init_pri) ||
+        !drmgr_register_thread_exit_event_ex(ClientThreadEnd, &thread_exit_pri) ) {
+        ZEROSPY_EXIT_PROCESS("ERROR: zerospy unable to register events");
+    }
 
     tls_idx = drmgr_register_tls_field();
     if (tls_idx == -1) {
-        ZEROSPY_EXIT_PROCESS("ERROR: drcctlib_memory_with_addr_and_refsize_clean_call "
-                              "drmgr_register_tls_field fail");
+        ZEROSPY_EXIT_PROCESS("ERROR: zerospy drmgr_register_tls_field fail");
     }
 
     gLock = dr_mutex_create();
