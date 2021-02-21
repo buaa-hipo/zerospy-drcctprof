@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <algorithm>
 
+// #define ZEROSPY_DEBUG
 #define _WERROR
 
 #ifdef TIMING
@@ -86,6 +87,8 @@ struct FPRedLogs{
 #define WINDOW_CLEAN 10
 #endif
 
+// 1M
+#define MAX_CLONE_INS 1048576
 typedef struct _per_thread_t {
     unordered_map<uint64_t, INTRedLogs> *INTRedMap;
     unordered_map<uint64_t, FPRedLogs > *FPRedMap;
@@ -94,6 +97,7 @@ typedef struct _per_thread_t {
     long long numIns;
     bool sampleFlag;
 #endif
+    vector<instr_t*> *instr_clones;
 } per_thread_t;
 
 file_t gFile;
@@ -101,6 +105,9 @@ static void *gLock;
 #ifndef _WERROR
 file_t fwarn;
 bool warned=false;
+#endif
+#ifdef ZEROSPY_DEBUG
+file_t gDebug;
 #endif
 
 // global metrics
@@ -531,17 +538,44 @@ event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, b
 }
 #endif
 
-template<class T, uint32_t AccessLen, uint32_t ElemLen, bool isApprox>
+template<class T, uint32_t AccessLen, uint32_t ElemLen, bool isApprox, bool enable_sampling>
 struct ZeroSpyAnalysis{
+#ifdef ZEROSPY_DEBUG
+    static __attribute__((always_inline)) void CheckNByteValueAfterRead(int32_t slot, void* addr, instr_t* instr)
+#else
     static __attribute__((always_inline)) void CheckNByteValueAfterRead(int32_t slot, void* addr)
+#endif
     {
         void *drcontext = dr_get_current_drcontext();
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
 #ifdef ENABLE_SAMPLING
-        if(!pt->sampleFlag) {
-            return;
+        if(enable_sampling) {
+            if(!pt->sampleFlag) {
+                return;
+            }
         }
 #endif
+// #ifdef ZEROSPY_DEBUG
+//         byte* base;
+//         size_t size;
+//         uint prot; 
+//         bool printDisassemble = false;
+//         if(!dr_query_memory((byte*)addr, &base, &size, &prot)) {
+//             dr_fprintf(STDERR, "\nWARNING: dr_query_memory failed!\n");
+//             printDisassemble = true;
+//         } else if((prot&DR_MEMPROT_READ)==0) {
+//             dr_fprintf(STDERR, "\nWARNING: memory address %p is protected and cannot read!\n", addr);
+//             printDisassemble = true;
+//         }
+//         if(printDisassemble) {
+//             dr_fprintf(STDERR, "^^ Disassembled Instruction instr=%p, PC=%p ^^^\n", instr, instr_get_app_pc(instr));
+//             dr_fprintf(STDERR, "addr=%p, AccessLen=%d, ElemLen=%d, isApprox=%d\n", addr, AccessLen, ElemLen, isApprox);
+//             disassemble(drcontext, instr_get_app_pc(instr), STDERR);
+//             dr_fprintf(STDERR, "ADDR[0]: %d\n", *((uint8_t*)addr));
+//             dr_fprintf(STDERR, "ADDR[%d]: %d\n", AccessLen-1, *((uint8_t*)addr+AccessLen-1));
+//             dr_fprintf(STDERR, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+//         }
+// #endif
         context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
         uint8_t* bytes = static_cast<uint8_t*>(addr);
         if(isApprox) {
@@ -565,13 +599,15 @@ struct ZeroSpyAnalysis{
         }
     }
 #ifdef X86
-    static __attribute__((always_inline)) void CheckNByteValueAfterVGather(int32_t slot, void* pc_app)
+    static __attribute__((always_inline)) void CheckNByteValueAfterVGather(int32_t slot, instr_t* instr)
     {
         void *drcontext = dr_get_current_drcontext();
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
 #ifdef ENABLE_SAMPLING
-        if(!pt->sampleFlag) {
-            return;
+        if(enable_sampling) {
+            if(!pt->sampleFlag) {
+                return;
+            }
         }
 #endif
         dr_mcontext_t mcontext;
@@ -579,13 +615,9 @@ struct ZeroSpyAnalysis{
         mcontext.flags= DR_MC_ALL;
         DR_ASSERT(dr_get_mcontext(drcontext, &mcontext));
         context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
-        instr_t instr;
-        byte* pc = (byte*)pc_app;
-        instr_init(drcontext, &instr);
-        decode(drcontext, pc, &instr);
 #ifdef DEBUG_VGATHER
         printf("\n^^ CheckNByteValueAfterVGather: ");
-        disassemble(drcontext, pc, 1/*sdtout file desc*/);
+        disassemble(drcontext, instr_get_app_pc(instr), 1/*sdtout file desc*/);
         printf("\n");
 #endif
         if(isApprox) {
@@ -594,7 +626,7 @@ struct ZeroSpyAnalysis{
             app_pc addr;
             bool is_write;
             uint32_t pos;
-            for( int index=0; instr_compute_address_ex_pos(&instr, &mcontext, index, &addr, &is_write, &pos); ++index ) {
+            for( int index=0; instr_compute_address_ex_pos(instr, &mcontext, index, &addr, &is_write, &pos); ++index ) {
                 DR_ASSERT(!is_write);
                 uint8_t* bytes = reinterpret_cast<uint8_t*>(addr);
                 bool hasRedundancy = (bytes[sizeof(T)-1]==0);
@@ -612,13 +644,16 @@ struct ZeroSpyAnalysis{
 #endif
 };
 
+template<bool enable_sampling>
 static inline void CheckAfterLargeRead(int32_t slot, void* addr, uint32_t accessLen)
 {
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
 #ifdef ENABLE_SAMPLING
-    if(!pt->sampleFlag) {
-        return;
+    if(enable_sampling) {
+        if(!pt->sampleFlag) {
+            return;
+        }
     }
 #endif
     context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
@@ -694,17 +729,51 @@ static inline void CheckAfterLargeRead(int32_t slot, void* addr, uint32_t access
         AddToRedTable((uint64_t)MAKE_CONTEXT_PAIR(accessLen, curCtxtHandle), 0, 0, accessLen, pt);
     }
 }
+#ifdef ENABLE_SAMPLING
+/* Check if sampling is enabled */
+#ifdef ZEROSPY_DEBUG
+#define HANDLE_CASE(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) \
+do { if(op_enable_sampling.get_value()) \
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg),  OPND_CREATE_INTPTR(ins_clone)); } else \
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg),  OPND_CREATE_INTPTR(ins_clone)); } } while(0)
+#else
+#define HANDLE_CASE(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) \
+do { if(op_enable_sampling.get_value()) \
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg)); } else \
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg)); } } while(0)
 
+#endif
+
+#define HANDLE_LARGE() \
+do { if(op_enable_sampling.get_value()) \
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead<true/*sample*/>, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize)); } else \
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead<false/* not */>, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize)); } } while(0)
+
+#ifdef X86
+#define HANDLE_VGATHER(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX, ins) \
+do { if(op_enable_sampling.get_value()) \
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterVGather, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone)); } else\
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterVGather, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone)); } } while (0)
+#endif
+
+#else
+/* NO SAMPLING */
+#ifdef ZEROSPY_DEBUG
+#define HANDLE_CASE(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) \
+dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX)>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg),  OPND_CREATE_INTPTR(instr_get_app_pc(ins)))
+#else
 #define HANDLE_CASE(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) \
 dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX)>::CheckNByteValueAfterRead, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg))
+#endif
 
 #define HANDLE_LARGE() \
 dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize))
 
 #ifdef X86
 #define HANDLE_VGATHER(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX, ins) \
-dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX)>::CheckNByteValueAfterVGather, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(instr_get_app_pc(ins)))
+dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX)>::CheckNByteValueAfterVGather, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone))
 #endif
+#endif /*ENABLE_SAMPLING*/
 
 #include <signal.h>
 
@@ -712,12 +781,24 @@ struct ZerospyInstrument{
     static __attribute__((always_inline)) void InstrumentReadValueBeforeAndAfterLoading(void *drcontext, instrlist_t *bb, instr_t *ins, opnd_t opnd, reg_id_t addr_reg, int32_t slot)
     {
         uint32_t refSize = opnd_size_in_bytes(opnd_get_size(opnd));
-        uint32_t operSize = FloatOperandSizeTable(ins, opnd);
         if (refSize==0) {
             // Something strange happened, so ignore it
             return ;
         }
+#ifdef ZEROSPY_DEBUG
+        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+        instr_t* ins_clone = instr_clone(drcontext, ins);
+        pt->instr_clones->push_back(ins_clone);
+            dr_mutex_lock(gLock);
+            dr_fprintf(gDebug, "^^ INFO: Disassembled Instruction ^^^\n");
+            dr_fprintf(gDebug, "ins=%p, ins_clone=%p\n", ins, ins_clone);
+            disassemble(drcontext, instr_get_app_pc(ins), gDebug);
+            disassemble(drcontext, instr_get_app_pc(ins_clone), gDebug);
+            dr_fprintf(gDebug, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+            dr_mutex_unlock(gLock);
+#endif
         if (instr_is_floating(ins)) {
+            uint32_t operSize = FloatOperandSizeTable(ins, opnd);
             if(operSize>0) {
                 switch(refSize) {
                     case 1:
@@ -730,11 +811,13 @@ struct ZerospyInstrument{
                         fflush(stdout);
                         assert(0 && "memory read floating data with unexptected small size");
 #else
+                        dr_mutex_lock(gLock);
                         dr_fprintf(fwarn, "\nERROR: refSize for floating point instruction is too small: %d!\n", refSize);
                         dr_fprintf(fwarn, "^^ Disassembled Instruction ^^^\n");
                         disassemble(drcontext, instr_get_app_pc(ins), fwarn);
                         dr_fprintf(fwarn, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
                         warned = true;
+                        dr_mutex_unlock(gLock);
                         /* Do nothing, just report warning */
                         break;
 #endif
@@ -764,11 +847,13 @@ struct ZerospyInstrument{
                         fflush(stdout);
                         assert(0 && "unexpected large memory read\n"); break;
 #else
+                        dr_mutex_lock(gLock);
                         dr_fprintf(fwarn, "\nERROR: refSize for floating point instruction is too large: %d!\n", refSize);
                         dr_fprintf(fwarn, "^^ Disassembled Instruction ^^^\n");
                         disassemble(drcontext, instr_get_app_pc(ins), fwarn);
                         dr_fprintf(fwarn, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
                         warned = true;
+                        dr_mutex_unlock(gLock);
                         /* Do nothing, just report warning */
                         break;
 #endif
@@ -798,6 +883,9 @@ struct ZerospyInstrument{
         opnd_t opnd = instr_get_src(ins, 0);
         uint32_t operSize = FloatOperandSizeTable(ins, opnd); // VGather's second operand is the memory operand
         uint32_t refSize = opnd_size_in_bytes(opnd_get_size(instr_get_dst(ins, 0)));
+        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+        instr_t* ins_clone = instr_clone(drcontext, ins);
+        pt->instr_clones->push_back(ins_clone);
 #ifdef DEBUG_VGATHER
         printf("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
         printf("^^ refSize = %d, operSize = %d\n", refSize, operSize);
@@ -819,11 +907,13 @@ struct ZerospyInstrument{
                     fflush(stdout);
                     assert(0 && "memory read floating data with unexptected small size");
 #else
+                    dr_mutex_lock(gLock);
                     dr_fprintf(fwarn, "\nERROR: refSize for floating point instruction is too small: %d!\n", refSize);
                     dr_fprintf(fwarn, "^^ Disassembled Instruction ^^^\n");
                     disassemble(drcontext, instr_get_app_pc(ins), fwarn);
                     dr_fprintf(fwarn, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
                     warned = true;
+                    dr_mutex_unlock(gLock);
                     /* Do nothing, just report warning */
                     break;
 #endif
@@ -850,11 +940,13 @@ struct ZerospyInstrument{
                     fflush(stdout);
                     assert(0 && "unexpected large memory read\n"); break;
 #else
+                    dr_mutex_lock(gLock);
                     dr_fprintf(fwarn, "\nERROR: refSize for floating point instruction is too large: %d!\n", refSize);
                     dr_fprintf(fwarn, "^^ Disassembled Instruction ^^^\n");
                     disassemble(drcontext, instr_get_app_pc(ins), fwarn);
                     dr_fprintf(fwarn, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
                     warned = true;
+                    dr_mutex_unlock(gLock);
                     /* Do nothing, just report warning */
                     break;
 #endif
@@ -874,11 +966,24 @@ InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, i
     }
     if (!drutil_insert_get_mem_addr(drcontext, ilist, where, ref, reg1/*addr*/,
                                     reg2/*scratch*/)) {
-        MINSERT(ilist, where,
-                XINST_CREATE_load_int(drcontext, opnd_create_reg(reg1),
-                                      OPND_CREATE_CCT_INT(0)));
+#ifdef _WERROR
+        dr_fprintf(STDERR, "\nERROR: drutil_insert_get_mem_addr failed!\n");
+        dr_fprintf(STDERR, "^^ Disassembled Instruction ^^^\n");
+        disassemble(drcontext, instr_get_app_pc(where), STDERR);
+        dr_fprintf(STDERR, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+        ZEROSPY_EXIT_PROCESS("InstrumentMem drutil_insert_get_mem_addr failed!");
+#else
+        dr_mutex_lock(gLock);
+        dr_fprintf(fwarn, "\nERROR: drutil_insert_get_mem_addr failed!\n");
+        dr_fprintf(fwarn, "^^ Disassembled Instruction ^^^\n");
+        disassemble(drcontext, instr_get_app_pc(where), fwarn);
+        dr_fprintf(fwarn, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+        warned = true;
+        dr_mutex_unlock(gLock);
+#endif
+    } else {
+        ZerospyInstrument::InstrumentReadValueBeforeAndAfterLoading(drcontext, ilist, where, ref, reg1, slot);
     }
-    ZerospyInstrument::InstrumentReadValueBeforeAndAfterLoading(drcontext, ilist, where, ref, reg1, slot);
     /* Restore scratch registers */
     if (drreg_unreserve_register(drcontext, ilist, where, reg1) != DRREG_SUCCESS ||
         drreg_unreserve_register(drcontext, ilist, where, reg2) != DRREG_SUCCESS) {
@@ -894,6 +999,9 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
     int32_t slot = instrument_msg->slot;
     // check if this instruction is actually our interest
     if(!instr_reads_memory(instr)) return;
+    // If this instr is prefetch, the memory address is not guaranteed to be valid, and it may be also ignored by hardware
+    // Besides, prefetch instructions are not the actual memory access instructions, so we also ignore them
+    if(instr_is_prefetch(instr)) return;
 
     // store cct in tls filed
     // InstrumentIns(drcontext, bb, instr, slot);
@@ -945,6 +1053,7 @@ ClientThreadStart(void *drcontext)
     }
     pt->INTRedMap = new unordered_map<uint64_t, INTRedLogs>();
     pt->FPRedMap = new unordered_map<uint64_t, FPRedLogs>();
+    pt->instr_clones = new vector<instr_t*>();
     pt->INTRedMap->rehash(10000000);
     pt->FPRedMap->rehash(10000000);
 #ifdef ENABLE_SAMPLING
@@ -1195,6 +1304,10 @@ ClientThreadEnd(void *drcontext)
     dr_close_file(pt->output_file);
     delete pt->INTRedMap;
     delete pt->FPRedMap;
+    for(size_t i=0;i<pt->instr_clones->size();++i) {
+        instr_destroy(drcontext, (*pt->instr_clones)[i]);
+    }
+    delete pt->instr_clones;
 #ifdef DEBUG_REUSE
     dr_close_file(pt->log_file);
 #endif
@@ -1222,6 +1335,9 @@ ClientInit(int argc, const char *argv[])
     sprintf(name + strlen(name), "-%d-zerospy", pid);
     g_folder_name.assign(name, strlen(name));
     mkdir(g_folder_name.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+
+    dr_fprintf(STDOUT, "[ZEROSPY INFO] Profiling result directory: %s\n", g_folder_name.c_str());
+
     sprintf(name+strlen(name), "/zerospy.log");
     gFile = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
     DR_ASSERT(gFile != INVALID_FILE);
@@ -1233,6 +1349,11 @@ ClientInit(int argc, const char *argv[])
     sprintf(name+strlen(name), ".warn");
     fwarn = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
     DR_ASSERT(fwarn != INVALID_FILE);
+#endif
+#ifdef ZEROSPY_DEBUG
+    sprintf(name+strlen(name), ".debug");
+    gDebug = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
+    DR_ASSERT(gDebug != INVALID_FILE);
 #endif
 }
 
