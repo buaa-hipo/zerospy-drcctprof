@@ -1256,6 +1256,7 @@ ClientExit(void)
     if (!drmgr_unregister_thread_init_event(ClientThreadStart) ||
         !drmgr_unregister_thread_exit_event(ClientThreadEnd) ||
 #ifdef ENABLE_SAMPLING
+        // must unregister event after client exit, or it will cause unexpected errors during execution
         ( op_enable_sampling.get_value() && !drmgr_unregister_bb_instrumentation_event(event_basic_block) ) ||
 #endif
         !drmgr_unregister_tls_field(tls_idx)) {
