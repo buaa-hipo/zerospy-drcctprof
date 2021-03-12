@@ -502,21 +502,32 @@ struct UnrolledConjunction<end , end , incr>{
 
 #ifdef ENABLE_SAMPLING
 static void
-update_per_bb(uint instruction_count)
+update_per_bb(uint instruction_count, app_pc src)
 {
     void *drcontext = dr_get_current_drcontext();
+    dr_mcontext_t mcontext;
+    mcontext.size = sizeof(mcontext);
+    mcontext.flags = DR_MC_ALL;
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
     if(pt->sampleFlag) {
         pt->numIns += instruction_count;
         if(pt->numIns > WINDOW_ENABLE) {
             pt->sampleFlag = false;
             pt->numIns = 0;
+            dr_delay_flush_region(src, instruction_count, 0, NULL);
+            dr_get_mcontext(drcontext, &mcontext);
+            mcontext.pc = src;
+            dr_redirect_execution(&mcontext);
         }
     } else {
         pt->numIns += instruction_count;
         if(pt->numIns > WINDOW_DISABLE) {
             pt->sampleFlag = true;
             pt->numIns = 0;
+            dr_delay_flush_region(src, instruction_count, 0, NULL);
+            dr_get_mcontext(drcontext, &mcontext);
+            mcontext.pc = src;
+            dr_redirect_execution(&mcontext);
         }
     }
 }
@@ -526,14 +537,15 @@ event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, b
 {
     uint num_instructions = 0;
     instr_t *instr;
+    app_pc src = instr_get_app_pc(instrlist_first(bb));
     /* count the number of instructions in this block */
     for (instr = instrlist_first(bb); instr != NULL; instr = instr_get_next(instr)) {
         num_instructions++;
     }
     
     /* insert clean call */
-    dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) update_per_bb, false, 1, 
-                        OPND_CREATE_INT32(num_instructions));
+    dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) update_per_bb, false, 2, 
+                        OPND_CREATE_INT32(num_instructions), OPND_CREATE_INTPTR(src));
     return DR_EMIT_DEFAULT;
 }
 #endif
@@ -548,13 +560,6 @@ struct ZeroSpyAnalysis{
     {
         void *drcontext = dr_get_current_drcontext();
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-#ifdef ENABLE_SAMPLING
-        if(enable_sampling) {
-            if(!pt->sampleFlag) {
-                return;
-            }
-        }
-#endif
 // #ifdef ZEROSPY_DEBUG
 //         byte* base;
 //         size_t size;
@@ -603,13 +608,6 @@ struct ZeroSpyAnalysis{
     {
         void *drcontext = dr_get_current_drcontext();
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-#ifdef ENABLE_SAMPLING
-        if(enable_sampling) {
-            if(!pt->sampleFlag) {
-                return;
-            }
-        }
-#endif
         dr_mcontext_t mcontext;
         mcontext.size = sizeof(mcontext);
         mcontext.flags= DR_MC_ALL;
@@ -649,13 +647,6 @@ static inline void CheckAfterLargeRead(int32_t slot, void* addr, uint32_t access
 {
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-#ifdef ENABLE_SAMPLING
-    if(enable_sampling) {
-        if(!pt->sampleFlag) {
-            return;
-        }
-    }
-#endif
     context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
     uint8_t* bytes = static_cast<uint8_t*>(addr);
     // quick check whether the most significant byte of the read memory is redundant zero or not
@@ -733,27 +724,31 @@ static inline void CheckAfterLargeRead(int32_t slot, void* addr, uint32_t access
 /* Check if sampling is enabled */
 #ifdef ZEROSPY_DEBUG
 #define HANDLE_CASE(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) \
-do { if(op_enable_sampling.get_value()) \
+do { if(pt2->sampleFlag) \
+{ if(op_enable_sampling.get_value()) \
 { dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg),  OPND_CREATE_INTPTR(ins_clone)); } else \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg),  OPND_CREATE_INTPTR(ins_clone)); } } while(0)
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg),  OPND_CREATE_INTPTR(ins_clone)); } } } while(0)
 #else
 #define HANDLE_CASE(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) \
-do { if(op_enable_sampling.get_value()) \
+do { if(pt->sampleFlag) \
+{ if(op_enable_sampling.get_value()) \
 { dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg)); } else \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg)); } } while(0)
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg)); } } } while(0)
 
 #endif
 
 #define HANDLE_LARGE() \
-do { if(op_enable_sampling.get_value()) \
+do { if(pt->sampleFlag) \
+{ if(op_enable_sampling.get_value()) \
 { dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead<true/*sample*/>, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize)); } else \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead<false/* not */>, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize)); } } while(0)
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead<false/* not */>, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize)); } } } while(0)
 
 #ifdef X86
 #define HANDLE_VGATHER(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX, ins) \
-do { if(op_enable_sampling.get_value()) \
+do { if(pt->sampleFlag) \
+{ if(op_enable_sampling.get_value()) \
 { dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterVGather, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone)); } else\
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterVGather, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone)); } } while (0)
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterVGather, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone)); } } } while (0)
 #endif
 
 #else
@@ -786,9 +781,9 @@ struct ZerospyInstrument{
             return ;
         }
 #ifdef ZEROSPY_DEBUG
-        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+        per_thread_t *pt2 = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
         instr_t* ins_clone = instr_clone(drcontext, ins);
-        pt->instr_clones->push_back(ins_clone);
+        pt2->instr_clones->push_back(ins_clone);
             dr_mutex_lock(gLock);
             dr_fprintf(gDebug, "^^ INFO: Disassembled Instruction ^^^\n");
             dr_fprintf(gDebug, "ins=%p, ins_clone=%p\n", ins, ins_clone);
@@ -796,6 +791,9 @@ struct ZerospyInstrument{
             disassemble(drcontext, instr_get_app_pc(ins_clone), gDebug);
             dr_fprintf(gDebug, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
             dr_mutex_unlock(gLock);
+#endif
+#ifdef ENABLE_SAMPLING
+        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
 #endif
         if (instr_is_floating(ins)) {
             uint32_t operSize = FloatOperandSizeTable(ins, opnd);
