@@ -1385,6 +1385,8 @@ ClientExit(void)
         fflush(stdout);
         exit(-1);
     }
+    drutil_exit();
+    drreg_exit();
     drmgr_exit();
 }
 
