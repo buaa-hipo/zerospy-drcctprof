@@ -769,29 +769,29 @@ template<bool enable_sampling>
 #define HANDLE_CASE(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) \
 do { if(pt2->sampleFlag) \
 { if(op_enable_sampling.get_value()) \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 4, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), opnd_create_pc(instr_get_app_pc(ins)), OPND_CREATE_INTPTR(ins_clone)); } else \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 4, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), opnd_create_pc(instr_get_app_pc(ins)), OPND_CREATE_INTPTR(ins_clone)); } } } while(0)
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 4, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_INTPTR(instr_get_app_pc(ins)), OPND_CREATE_INTPTR(ins_clone)); } else \
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 4, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_INTPTR(instr_get_app_pc(ins)), OPND_CREATE_INTPTR(ins_clone)); } } } while(0)
 #else
 #define HANDLE_CASE(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) \
 do { if(pt->sampleFlag) \
 { if(op_enable_sampling.get_value()) \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), opnd_create_pc(instr_get_app_pc(ins))); } else \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), opnd_create_pc(instr_get_app_pc(ins))); } } } while(0)
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_INTPTR(instr_get_app_pc(ins))); } else \
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_INTPTR(instr_get_app_pc(ins))); } } } while(0)
 
 #endif
 
 #define HANDLE_LARGE() \
 do { if(pt->sampleFlag) \
 { if(op_enable_sampling.get_value()) \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead<true/*sample*/>, false, 4, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize), opnd_create_pc(instr_get_app_pc(ins))); } else \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead<false/* not */>, false, 4, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize), opnd_create_pc(instr_get_app_pc(ins))); } } } while(0)
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead<true/*sample*/>, false, 4, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize), OPND_CREATE_INTPTR(instr_get_app_pc(ins))); } else \
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead<false/* not */>, false, 4, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize), OPND_CREATE_INTPTR(instr_get_app_pc(ins))); } } } while(0)
 
 #ifdef X86
 #define HANDLE_VGATHER(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX, ins) \
 do { if(pt->sampleFlag) \
 { if(op_enable_sampling.get_value()) \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterVGather, false, 3, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone), opnd_create_pc(instr_get_app_pc(ins))); } else\
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterVGather, false, 3, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone), opnd_create_pc(instr_get_app_pc(ins))); } } } while (0)
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterVGather, false, 3, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone), OPND_CREATE_INTPTR(instr_get_app_pc(ins))); } else\
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterVGather, false, 3, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone), OPND_CREATE_INTPTR(instr_get_app_pc(ins))); } } } while (0)
 #endif
 
 #else
