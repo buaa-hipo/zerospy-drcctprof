@@ -846,10 +846,15 @@ struct ZerospyInstrument{
             dr_fprintf(gDebug, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
             dr_mutex_unlock(gLock);
 #endif
-#ifdef ENABLE_SAMPLING
-        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+#ifdef ARM_CCTLIB
+        // Currently, we cannot identify the difference between floating point operand 
+        // and inter operand from instruction type (both is LD), so just ignore the fp
+        // FIXME i#4: to identify the floating point through data flow analysis.
+        if (false)
+#else
+        if (instr_is_floating(ins))
 #endif
-        if (instr_is_floating(ins)) {
+        {
             uint32_t operSize = FloatOperandSizeTable(ins, opnd);
             if(operSize>0) {
                 switch(refSize) {
