@@ -361,6 +361,15 @@ FloatOperandSizeTable(instr_t *instr, opnd_t opnd)
     case OP_vtestpd:
         return 8;
 
+    /* SSE packed instruction */
+    case OP_addpd:
+    case OP_mulpd:
+        return 8;
+
+    case OP_addps:
+    case OP_mulps:
+        return 4;
+
     /* FMA */
     case OP_vfmadd132ps:
     case OP_vfmadd213ps:
