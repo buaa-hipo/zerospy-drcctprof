@@ -25,6 +25,38 @@ uint64_t get_miliseconds() {
 #include "drcctlib.h"
 #include "utils.h"
 
+#define ENABLE_SAMPLING 1
+#ifdef ENABLE_SAMPLING
+// different frequency configurations:
+//      Rate:   1/10, 1/100, 1/1000, 5/10, 5/100, 5/1000
+//      Window: 1e6, 1e7, 1e8, 1e9, 1e10 
+// #define WINDOW_ENABLE 1000000
+// #define WINDOW_DISABLE 100000000
+// #define WINDOW_CLEAN 10
+// Enumuration of RATEs
+#define RATE_NUM 6
+#define RATE_0 (0.5)
+#define RATE_1 (0.1)
+#define RATE_2 (0.05)
+#define RATE_3 (0.01)
+#define RATE_4 (0.005)
+#define RATE_5 (0.001)
+// RATE -> WINDOW_ENABLE mapping
+#define RATE_0_WIN(WINDOW) ((int64_t)(RATE_0*WINDOW))
+#define RATE_1_WIN(WINDOW) ((int64_t)(RATE_1*WINDOW))
+#define RATE_2_WIN(WINDOW) ((int64_t)(RATE_2*WINDOW))
+#define RATE_3_WIN(WINDOW) ((int64_t)(RATE_3*WINDOW))
+#define RATE_4_WIN(WINDOW) ((int64_t)(RATE_4*WINDOW))
+#define RATE_5_WIN(WINDOW) ((int64_t)(RATE_5*WINDOW))
+// Enumuration of WINDOWs
+#define WINDOW_NUM 5
+#define WINDOW_0 (1000000)
+#define WINDOW_1 (10000000)
+#define WINDOW_2 (100000000)
+#define WINDOW_3 (1000000000)
+#define WINDOW_4 (10000000000)
+#endif
+
 // Client Options
 #include "droption.h"
 static droption_t<bool> op_enable_sampling
@@ -34,6 +66,48 @@ static droption_t<bool> op_enable_sampling
 static droption_t<bool> op_no_flush
 (DROPTION_SCOPE_CLIENT, "no_flush", 0, 0, 64, "Disable code flushing of Bursty Sampling",
  "Disable code flushing of Bursty Sampling.");
+
+static droption_t<bool> op_help
+(DROPTION_SCOPE_CLIENT, "help", 0, 0, 64, "Show this help",
+ "Show this help.");
+
+static droption_t<int> op_rate
+(DROPTION_SCOPE_CLIENT, "rate", 3, 0, RATE_NUM, "Sampling rate configuration of bursty sampling",
+ "Sampling rate configuration of bursty sampling. Only available when sampling is enabled."
+ "Only the following configurations are valid:\n"
+ "\t0: 0.5\n"
+ "\t1: 0.1\n"
+ "\t2: 0.05\n"
+ "\t3: 0.01\n"
+ "\t4: 0.005\n"
+ "\t5: 0.001\n");
+
+const float conf2rate[RATE_NUM] = {
+    RATE_0,
+    RATE_1,
+    RATE_2,
+    RATE_3,
+    RATE_4,
+    RATE_5
+};
+
+static droption_t<int> op_window
+(DROPTION_SCOPE_CLIENT, "window", 2, 0, WINDOW_NUM, "Window size configuration of sampling",
+ "Window size of sampling. Only available when sampling is enabled."
+ "Only the following configurations are valid:\n"
+ "\t0: 1000000\n"
+ "\t1: 10000000\n"
+ "\t2: 100000000\n"
+ "\t3: 1000000000\n"
+ "\t4: 10000000000\n");
+
+const uint64_t conf2window[WINDOW_NUM] = {
+    WINDOW_0,
+    WINDOW_1,
+    WINDOW_2,
+    WINDOW_3,
+    WINDOW_4
+};
 
 using namespace std;
 
@@ -83,13 +157,6 @@ struct FPRedLogs{
 #define MAX_REDUNDANT_CONTEXTS_TO_LOG (1000)
 // maximum cct depth to print
 #define MAX_DEPTH 10
-
-#define ENABLE_SAMPLING 1
-#ifdef ENABLE_SAMPLING
-#define WINDOW_ENABLE 1000000
-#define WINDOW_DISABLE 100000000
-#define WINDOW_CLEAN 10
-#endif
 
 // 1M
 #define MAX_CLONE_INS 1048576
@@ -505,7 +572,7 @@ struct UnrolledConjunction<end , end , incr>{
 /*******************************************************************************************/
 
 #ifdef ENABLE_SAMPLING
-template<bool sampleFlag>
+template<int64_t WINDOW_ENABLE, int64_t WINDOW_DISABLE, bool sampleFlag>
 struct BBSample {
     static void update_per_bb(uint instruction_count, app_pc src)
     {
@@ -535,6 +602,47 @@ struct BBSample {
     }
 };
 
+void (*BBSampleTable[RATE_NUM][WINDOW_NUM][2])(uint, app_pc) = {
+    {   {BBSample<RATE_0_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
+        {BBSample<RATE_0_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
+        {BBSample<RATE_0_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
+        {BBSample<RATE_0_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
+        {BBSample<RATE_0_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
+    },
+    {   {BBSample<RATE_1_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
+        {BBSample<RATE_1_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
+        {BBSample<RATE_1_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
+        {BBSample<RATE_1_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
+        {BBSample<RATE_1_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
+    },
+    {   {BBSample<RATE_2_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
+        {BBSample<RATE_2_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
+        {BBSample<RATE_2_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
+        {BBSample<RATE_2_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
+        {BBSample<RATE_2_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
+    },
+    {   {BBSample<RATE_3_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
+        {BBSample<RATE_3_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
+        {BBSample<RATE_3_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
+        {BBSample<RATE_3_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
+        {BBSample<RATE_3_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
+    },
+    {   {BBSample<RATE_4_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
+        {BBSample<RATE_4_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
+        {BBSample<RATE_4_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
+        {BBSample<RATE_4_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
+        {BBSample<RATE_4_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
+    },
+    {   {BBSample<RATE_5_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
+        {BBSample<RATE_5_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
+        {BBSample<RATE_5_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
+        {BBSample<RATE_5_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
+        {BBSample<RATE_5_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
+    },
+};
+void (*BBSample_target[2])(uint, app_pc);
+
+template<int64_t WINDOW_ENABLE, int64_t WINDOW_DISABLE>
 struct BBSampleNoFlush {
     static void update_per_bb(uint instruction_count)
     {
@@ -554,6 +662,46 @@ struct BBSampleNoFlush {
     }
 };
 
+void (*BBSampleNoFlushTable[RATE_NUM][WINDOW_NUM])(uint) {
+    {   BBSampleNoFlush<RATE_0_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
+        BBSampleNoFlush<RATE_0_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
+        BBSampleNoFlush<RATE_0_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
+        BBSampleNoFlush<RATE_0_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
+        BBSampleNoFlush<RATE_0_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
+    },
+    {   BBSampleNoFlush<RATE_1_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
+        BBSampleNoFlush<RATE_1_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
+        BBSampleNoFlush<RATE_1_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
+        BBSampleNoFlush<RATE_1_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
+        BBSampleNoFlush<RATE_1_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
+    },
+    {   BBSampleNoFlush<RATE_2_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
+        BBSampleNoFlush<RATE_2_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
+        BBSampleNoFlush<RATE_2_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
+        BBSampleNoFlush<RATE_2_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
+        BBSampleNoFlush<RATE_2_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
+    },
+    {   BBSampleNoFlush<RATE_3_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
+        BBSampleNoFlush<RATE_3_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
+        BBSampleNoFlush<RATE_3_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
+        BBSampleNoFlush<RATE_3_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
+        BBSampleNoFlush<RATE_3_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
+    },
+    {   BBSampleNoFlush<RATE_4_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
+        BBSampleNoFlush<RATE_4_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
+        BBSampleNoFlush<RATE_4_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
+        BBSampleNoFlush<RATE_4_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
+        BBSampleNoFlush<RATE_4_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
+    },
+    {   BBSampleNoFlush<RATE_5_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
+        BBSampleNoFlush<RATE_5_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
+        BBSampleNoFlush<RATE_5_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
+        BBSampleNoFlush<RATE_5_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
+        BBSampleNoFlush<RATE_5_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
+    },
+};
+void (*BBSampleNoFlush_target)(uint);
+
 static dr_emit_flags_t
 event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, bool translating, OUT void **user_data)
 {
@@ -565,16 +713,16 @@ event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, b
     }
     /* insert clean call */
     if(op_no_flush.get_value()) {
-        dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSampleNoFlush::update_per_bb, false, 1, 
+        dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSampleNoFlush_target, false, 1, 
                             OPND_CREATE_INT32(num_instructions));
     } else {
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
         if(pt->sampleFlag) {
-            dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSample<true>::update_per_bb, false, 2, 
+            dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSample_target[1], false, 2, 
                             OPND_CREATE_INT32(num_instructions), 
                             OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
         } else {
-            dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSample<false>::update_per_bb, false, 2, 
+            dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSample_target[0], false, 2, 
                             OPND_CREATE_INT32(num_instructions), 
                             OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
         }
@@ -1413,6 +1561,15 @@ ClientInit(int argc, const char *argv[])
             dr_fprintf(STDOUT, "[ZEROSPY INFO] Code flush is disabled.\n");
             dr_fprintf(gFile,  "[ZEROSPY INFO] Code flush is disabled.\n");
         }
+        dr_fprintf(STDOUT, "[ZEROSPU INFO] Sampling Rate: %.3f, Window Size: %ld\n", conf2rate[op_rate.get_value()], conf2window[op_window.get_value()]);
+        dr_fprintf(gFile,  "[ZEROSPU INFO] Sampling Rate: %.3f, Window Size: %ld\n", conf2rate[op_rate.get_value()], conf2window[op_window.get_value()]);
+        BBSample_target[0] = BBSampleTable[op_rate.get_value()][op_window.get_value()][0];
+        BBSample_target[1] = BBSampleTable[op_rate.get_value()][op_window.get_value()][1];
+        BBSampleNoFlush_target = BBSampleNoFlushTable[op_rate.get_value()][op_window.get_value()];
+    }
+    if (op_help.get_value()) {
+        dr_fprintf(STDOUT, "%s\n", droption_parser_t::usage_long(DROPTION_SCOPE_CLIENT).c_str());
+        exit(1);
     }
 #ifndef _WERROR
     sprintf(name+strlen(name), ".warn");
