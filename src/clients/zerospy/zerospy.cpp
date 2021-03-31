@@ -31,6 +31,10 @@ static droption_t<bool> op_enable_sampling
 (DROPTION_SCOPE_CLIENT, "enable_sampling", 0, 0, 64, "Enable Bursty Sampling",
  "Enable bursty sampling for lower overhead with less profiling accuracy.");
 
+static droption_t<bool> op_no_flush
+(DROPTION_SCOPE_CLIENT, "no_flush", 0, 0, 64, "Disable code flushing of Bursty Sampling",
+ "Disable code flushing of Bursty Sampling.");
+
 using namespace std;
 
 #define ZEROSPY_PRINTF(format, args...) \
@@ -501,25 +505,54 @@ struct UnrolledConjunction<end , end , incr>{
 /*******************************************************************************************/
 
 #ifdef ENABLE_SAMPLING
-static void
-update_per_bb(uint instruction_count)
-{
-    void *drcontext = dr_get_current_drcontext();
-    per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-    if(pt->sampleFlag) {
+template<bool sampleFlag>
+struct BBSample {
+    static void update_per_bb(uint instruction_count, app_pc src)
+    {
+        void *drcontext = dr_get_current_drcontext();
+        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
         pt->numIns += instruction_count;
-        if(pt->numIns > WINDOW_ENABLE) {
-            pt->sampleFlag = false;
-            pt->numIns = 0;
+        if(pt->sampleFlag) {
+            if(pt->numIns > WINDOW_ENABLE) {
+                pt->sampleFlag = false;
+            }
+        } else {
+            if(pt->numIns > WINDOW_DISABLE) {
+                pt->sampleFlag = true;
+                pt->numIns = 0;
+            }
         }
-    } else {
-        pt->numIns += instruction_count;
-        if(pt->numIns > WINDOW_DISABLE) {
-            pt->sampleFlag = true;
-            pt->numIns = 0;
+        // If the sample flag is changed, flush the region and re-instrument
+        if(pt->sampleFlag != sampleFlag) {
+            dr_mcontext_t mcontext;
+            mcontext.size = sizeof(mcontext);
+            mcontext.flags = DR_MC_ALL;
+            dr_flush_region(src, 1);
+            dr_get_mcontext(drcontext, &mcontext);
+            mcontext.pc = src;
+            dr_redirect_execution(&mcontext);
         }
     }
-}
+};
+
+struct BBSampleNoFlush {
+    static void update_per_bb(uint instruction_count)
+    {
+        void *drcontext = dr_get_current_drcontext();
+        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+        pt->numIns += instruction_count;
+        if(pt->sampleFlag) {
+            if(pt->numIns > WINDOW_ENABLE) {
+                pt->sampleFlag = false;
+            }
+        } else {
+            if(pt->numIns > WINDOW_DISABLE) {
+                pt->sampleFlag = true;
+                pt->numIns = 0;
+            }
+        }
+    }
+};
 
 static dr_emit_flags_t
 event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, bool translating, OUT void **user_data)
@@ -530,10 +563,22 @@ event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, b
     for (instr = instrlist_first(bb); instr != NULL; instr = instr_get_next(instr)) {
         num_instructions++;
     }
-    
     /* insert clean call */
-    dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) update_per_bb, false, 1, 
-                        OPND_CREATE_INT32(num_instructions));
+    if(op_no_flush.get_value()) {
+        dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSampleNoFlush::update_per_bb, false, 1, 
+                            OPND_CREATE_INT32(num_instructions));
+    } else {
+        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+        if(pt->sampleFlag) {
+            dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSample<true>::update_per_bb, false, 2, 
+                            OPND_CREATE_INT32(num_instructions), 
+                            OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
+        } else {
+            dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSample<false>::update_per_bb, false, 2, 
+                            OPND_CREATE_INT32(num_instructions), 
+                            OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
+        }
+    }
     return DR_EMIT_DEFAULT;
 }
 #endif
@@ -551,7 +596,7 @@ struct ZeroSpyAnalysis{
 #ifdef ENABLE_SAMPLING
         if(enable_sampling) {
             if(!pt->sampleFlag) {
-                return;
+                return ;
             }
         }
 #endif
@@ -606,7 +651,7 @@ struct ZeroSpyAnalysis{
 #ifdef ENABLE_SAMPLING
         if(enable_sampling) {
             if(!pt->sampleFlag) {
-                return;
+                return ;
             }
         }
 #endif
@@ -652,7 +697,7 @@ static inline void CheckAfterLargeRead(int32_t slot, void* addr, uint32_t access
 #ifdef ENABLE_SAMPLING
     if(enable_sampling) {
         if(!pt->sampleFlag) {
-            return;
+            return ;
         }
     }
 #endif
@@ -733,25 +778,29 @@ static inline void CheckAfterLargeRead(int32_t slot, void* addr, uint32_t access
 /* Check if sampling is enabled */
 #ifdef ZEROSPY_DEBUG
 #define HANDLE_CASE(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) \
-do { if(op_enable_sampling.get_value()) \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg),  OPND_CREATE_INTPTR(ins_clone)); } else \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg),  OPND_CREATE_INTPTR(ins_clone)); } } while(0)
+do { \
+if(op_no_flush.get_value()) \
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_INTPTR(ins_clone)); } else \
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_INTPTR(ins_clone)); } } while(0)
 #else
 #define HANDLE_CASE(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) \
-do { if(op_enable_sampling.get_value()) \
+do { \
+if(op_no_flush.get_value()) \
 { dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg)); } else \
 { dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg)); } } while(0)
 
 #endif
 
 #define HANDLE_LARGE() \
-do { if(op_enable_sampling.get_value()) \
+do { \
+if(op_no_flush.get_value()) \
 { dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead<true/*sample*/>, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize)); } else \
 { dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead<false/* not */>, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize)); } } while(0)
 
 #ifdef X86
 #define HANDLE_VGATHER(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX, ins) \
-do { if(op_enable_sampling.get_value()) \
+do { \
+if(op_no_flush.get_value()) \
 { dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterVGather, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone)); } else\
 { dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterVGather, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone)); } } while (0)
 #endif
@@ -786,9 +835,9 @@ struct ZerospyInstrument{
             return ;
         }
 #ifdef ZEROSPY_DEBUG
-        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+        per_thread_t *pt2 = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
         instr_t* ins_clone = instr_clone(drcontext, ins);
-        pt->instr_clones->push_back(ins_clone);
+        pt2->instr_clones->push_back(ins_clone);
             dr_mutex_lock(gLock);
             dr_fprintf(gDebug, "^^ INFO: Disassembled Instruction ^^^\n");
             dr_fprintf(gDebug, "ins=%p, ins_clone=%p\n", ins, ins_clone);
@@ -798,6 +847,9 @@ struct ZerospyInstrument{
             dr_mutex_unlock(gLock);
 #endif
 #ifdef ARM_CCTLIB
+        // Currently, we cannot identify the difference between floating point operand 
+        // and inter operand from instruction type (both is LD), so just ignore the fp
+        // FIXME i#4: to identify the floating point through data flow analysis.
         if (false)
 #else
         if (instr_is_floating(ins))
@@ -999,6 +1051,14 @@ InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, i
 void
 InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
 {
+    // early return when code flush is enabled and not sampled
+    per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+    if( op_enable_sampling.get_value() && 
+       !op_no_flush.get_value() && 
+       !pt->sampleFlag) {
+           return;
+    }
+    // extract data from drcctprof's given message
     instrlist_t *bb = instrument_msg->bb;
     instr_t *instr = instrument_msg->instr;
     int32_t slot = instrument_msg->slot;
@@ -1349,6 +1409,10 @@ ClientInit(int argc, const char *argv[])
     if (op_enable_sampling.get_value()) {
         dr_fprintf(STDOUT, "[ZEROSPY INFO] Sampling Enabled\n");
         dr_fprintf(gFile, "[ZEROSPY INFO] Sampling Enabled\n");
+        if(op_no_flush.get_value()) {
+            dr_fprintf(STDOUT, "[ZEROSPY INFO] Code flush is disabled.\n");
+            dr_fprintf(gFile,  "[ZEROSPY INFO] Code flush is disabled.\n");
+        }
     }
 #ifndef _WERROR
     sprintf(name+strlen(name), ".warn");
@@ -1390,6 +1454,8 @@ ClientExit(void)
         fflush(stdout);
         exit(-1);
     }
+    drutil_exit();
+    drreg_exit();
     drmgr_exit();
 }
 
