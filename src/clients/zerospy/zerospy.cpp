@@ -31,6 +31,10 @@ static droption_t<bool> op_enable_sampling
 (DROPTION_SCOPE_CLIENT, "enable_sampling", 0, 0, 64, "Enable Bursty Sampling",
  "Enable bursty sampling for lower overhead with less profiling accuracy.");
 
+static droption_t<bool> op_no_flush
+(DROPTION_SCOPE_CLIENT, "no_flush", 0, 0, 64, "Disable code flushing of Bursty Sampling",
+ "Disable code flushing of Bursty Sampling.");
+
 using namespace std;
 
 #define ZEROSPY_PRINTF(format, args...) \
@@ -531,6 +535,25 @@ struct BBSample {
     }
 };
 
+struct BBSampleNoFlush {
+    static void update_per_bb(uint instruction_count)
+    {
+        void *drcontext = dr_get_current_drcontext();
+        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+        pt->numIns += instruction_count;
+        if(pt->sampleFlag) {
+            if(pt->numIns > WINDOW_ENABLE) {
+                pt->sampleFlag = false;
+            }
+        } else {
+            if(pt->numIns > WINDOW_DISABLE) {
+                pt->sampleFlag = true;
+                pt->numIns = 0;
+            }
+        }
+    }
+};
+
 static dr_emit_flags_t
 event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, bool translating, OUT void **user_data)
 {
@@ -540,17 +563,21 @@ event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, b
     for (instr = instrlist_first(bb); instr != NULL; instr = instr_get_next(instr)) {
         num_instructions++;
     }
-    
     /* insert clean call */
-    per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-    if(pt->sampleFlag) {
-        dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSample<true>::update_per_bb, false, 2, 
-                        OPND_CREATE_INT32(num_instructions), 
-                        OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
+    if(op_no_flush.get_value()) {
+        dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSampleNoFlush::update_per_bb, false, 1, 
+                            OPND_CREATE_INT32(num_instructions));
     } else {
-        dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSample<false>::update_per_bb, false, 2, 
-                        OPND_CREATE_INT32(num_instructions), 
-                        OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
+        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+        if(pt->sampleFlag) {
+            dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSample<true>::update_per_bb, false, 2, 
+                            OPND_CREATE_INT32(num_instructions), 
+                            OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
+        } else {
+            dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSample<false>::update_per_bb, false, 2, 
+                            OPND_CREATE_INT32(num_instructions), 
+                            OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
+        }
     }
     return DR_EMIT_DEFAULT;
 }
@@ -558,22 +585,21 @@ event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, b
 
 template<class T, uint32_t AccessLen, uint32_t ElemLen, bool isApprox, bool enable_sampling>
 struct ZeroSpyAnalysis{
-#ifdef ENABLE_SAMPLING
-    #ifdef ZEROSPY_DEBUG
-        static __attribute__((always_inline)) void CheckNByteValueAfterRead(int32_t slot, void* addr, app_pc back, instr_t* instr)
-    #else
-        static __attribute__((always_inline)) void CheckNByteValueAfterRead(int32_t slot, void* addr, app_pc back)
-    #endif
+#ifdef ZEROSPY_DEBUG
+    static __attribute__((always_inline)) void CheckNByteValueAfterRead(int32_t slot, void* addr, instr_t* instr)
 #else
-    #ifdef ZEROSPY_DEBUG
-        static __attribute__((always_inline)) void CheckNByteValueAfterRead(int32_t slot, void* addr, instr_t* instr)
-    #else
-        static __attribute__((always_inline)) void CheckNByteValueAfterRead(int32_t slot, void* addr)
-    #endif
+    static __attribute__((always_inline)) void CheckNByteValueAfterRead(int32_t slot, void* addr)
 #endif
     {
         void *drcontext = dr_get_current_drcontext();
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+#ifdef ENABLE_SAMPLING
+        if(enable_sampling) {
+            if(!pt->sampleFlag) {
+                return ;
+            }
+        }
+#endif
 // #ifdef ZEROSPY_DEBUG
 //         byte* base;
 //         size_t size;
@@ -618,24 +644,14 @@ struct ZeroSpyAnalysis{
         }
     }
 #ifdef X86
-#ifdef ENABLE_SAMPLING
-    static __attribute__((always_inline)) void CheckNByteValueAfterVGather(int32_t slot, instr_t* instr, app_pc back)
-#else
     static __attribute__((always_inline)) void CheckNByteValueAfterVGather(int32_t slot, instr_t* instr)
-#endif
     {
         void *drcontext = dr_get_current_drcontext();
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
 #ifdef ENABLE_SAMPLING
         if(enable_sampling) {
             if(!pt->sampleFlag) {
-                dr_mcontext_t mcontext;
-                mcontext.size = sizeof(mcontext);
-                mcontext.flags = DR_MC_ALL;
-                dr_flush_region(back, 1);
-                dr_get_mcontext(drcontext, &mcontext);
-                mcontext.pc = back;
-                dr_redirect_execution(&mcontext);
+                return ;
             }
         }
 #endif
@@ -674,14 +690,17 @@ struct ZeroSpyAnalysis{
 };
 
 template<bool enable_sampling>
-#ifdef ENABLE_SAMPLING
-    static inline void CheckAfterLargeRead(int32_t slot, void* addr, uint32_t accessLen, app_pc back)
-#else
-    static inline void CheckAfterLargeRead(int32_t slot, void* addr, uint32_t accessLen)
-#endif
+static inline void CheckAfterLargeRead(int32_t slot, void* addr, uint32_t accessLen)
 {
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+#ifdef ENABLE_SAMPLING
+    if(enable_sampling) {
+        if(!pt->sampleFlag) {
+            return ;
+        }
+    }
+#endif
     context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
     uint8_t* bytes = static_cast<uint8_t*>(addr);
     // quick check whether the most significant byte of the read memory is redundant zero or not
@@ -760,30 +779,30 @@ template<bool enable_sampling>
 #ifdef ZEROSPY_DEBUG
 #define HANDLE_CASE(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) \
 do { if(pt2->sampleFlag) \
-{ if(op_enable_sampling.get_value()) \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 4, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_INTPTR(instr_get_app_pc(ins)), OPND_CREATE_INTPTR(ins_clone)); } else \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 4, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_INTPTR(instr_get_app_pc(ins)), OPND_CREATE_INTPTR(ins_clone)); } } } while(0)
+{ if(op_no_flush.get_value()) \
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_INTPTR(ins_clone)); } else \
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_INTPTR(ins_clone)); } } } while(0)
 #else
 #define HANDLE_CASE(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) \
 do { if(pt->sampleFlag) \
-{ if(op_enable_sampling.get_value()) \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_INTPTR(instr_get_app_pc(ins))); } else \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_INTPTR(instr_get_app_pc(ins))); } } } while(0)
+{ if(op_no_flush.get_value()) \
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg)); } else \
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg)); } } } while(0)
 
 #endif
 
 #define HANDLE_LARGE() \
 do { if(pt->sampleFlag) \
-{ if(op_enable_sampling.get_value()) \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead<true/*sample*/>, false, 4, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize), OPND_CREATE_INTPTR(instr_get_app_pc(ins))); } else \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead<false/* not */>, false, 4, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize), OPND_CREATE_INTPTR(instr_get_app_pc(ins))); } } } while(0)
+{ if(op_no_flush.get_value()) \
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead<true/*sample*/>, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize)); } else \
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead<false/* not */>, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize)); } } } while(0)
 
 #ifdef X86
 #define HANDLE_VGATHER(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX, ins) \
 do { if(pt->sampleFlag) \
-{ if(op_enable_sampling.get_value()) \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterVGather, false, 3, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone), OPND_CREATE_INTPTR(instr_get_app_pc(ins))); } else\
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterVGather, false, 3, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone), OPND_CREATE_INTPTR(instr_get_app_pc(ins))); } } } while (0)
+{ if(op_no_flush.get_value()) \
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterVGather, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone)); } else\
+{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterVGather, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone)); } } } while (0)
 #endif
 
 #else
@@ -1027,9 +1046,13 @@ InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, i
 void
 InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
 {
-    // early return when not sampled
+    // early return when code flush is enabled and not sampled
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-    if(op_enable_sampling.get_value() && !pt->sampleFlag) return;
+    if( op_enable_sampling.get_value() && 
+       !op_no_flush.get_value() && 
+       !pt->sampleFlag) {
+           return;
+    }
     // extract data from drcctprof's given message
     instrlist_t *bb = instrument_msg->bb;
     instr_t *instr = instrument_msg->instr;
@@ -1381,6 +1404,10 @@ ClientInit(int argc, const char *argv[])
     if (op_enable_sampling.get_value()) {
         dr_fprintf(STDOUT, "[ZEROSPY INFO] Sampling Enabled\n");
         dr_fprintf(gFile, "[ZEROSPY INFO] Sampling Enabled\n");
+        if(op_no_flush.get_value()) {
+            dr_fprintf(STDOUT, "[ZEROSPY INFO] Code flush is disabled.\n");
+            dr_fprintf(gFile,  "[ZEROSPY INFO] Code flush is disabled.\n");
+        }
     }
 #ifndef _WERROR
     sprintf(name+strlen(name), ".warn");
