@@ -797,7 +797,12 @@ struct ZerospyInstrument{
             dr_fprintf(gDebug, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
             dr_mutex_unlock(gLock);
 #endif
-        if (instr_is_floating(ins)) {
+#ifdef ARM_CCTLIB
+        if (false)
+#else
+        if (instr_is_floating(ins))
+#endif
+        {
             uint32_t operSize = FloatOperandSizeTable(ins, opnd);
             if(operSize>0) {
                 switch(refSize) {

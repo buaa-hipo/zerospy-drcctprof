@@ -2,6 +2,10 @@
 
 // TODO: search for dynamorio interface to obtain element witdh of a SIMD operation
 // As the dynamorio did not provide function to obtain SIMD operation width of each element, Zerospy mannually implements with a lookup table
+#ifdef ARM_CCTLIB
+
+#ifdef ARM
+
 uint32_t
 FloatOperandSizeTable(instr_t *instr, opnd_t opnd)
 {
@@ -13,7 +17,204 @@ FloatOperandSizeTable(instr_t *instr, opnd_t opnd)
     int opc = instr_get_opcode(instr);
 
     switch (opc) {
-    
+
+    /* convert instructions */
+    case OP_vcvt_f32_f16:
+    case OP_vcvtb_f32_f16:
+    case OP_vcvtb_f64_f16:
+    case OP_vcvtt_f32_f16:
+    case OP_vcvtt_f64_f16:
+    /* end of convert instructions */
+    case OP_vrev16_16:  // ?
+    case OP_vrev32_16:  // ?
+    case OP_vrev64_16:  // ?
+    case OP_vtrn_16:  // ?
+    case OP_vtst_16:  // ?
+    case OP_vuzp_16:  // ?
+    case OP_vzip_16:  // ?
+        return 2;
+
+    case OP_vabs_f32:
+    case OP_vacge_f32:
+    case OP_vacgt_f32:
+    case OP_vadd_f32:
+    case OP_vceq_f32:
+    case OP_vcge_f32:
+    case OP_vcgt_f32:
+    case OP_vcle_f32:
+    case OP_vclt_f32:
+    case OP_vcmp_f32:
+    case OP_vcmpe_f32:
+    /* convert instructions */
+    case OP_vcvt_f16_f32:
+    case OP_vcvt_f64_f32:
+    case OP_vcvt_s16_f32:
+    case OP_vcvt_s32_f32:
+    case OP_vcvt_u16_f32:
+    case OP_vcvt_u32_f32:
+    case OP_vcvta_s32_f32:
+    case OP_vcvta_u32_f32:
+    case OP_vcvtb_f16_f32:
+    case OP_vcvtm_s32_f32:
+    case OP_vcvtm_u32_f32:
+    case OP_vcvtn_s32_f32:
+    case OP_vcvtn_u32_f32:
+    case OP_vcvtp_s32_f32:
+    case OP_vcvtp_u32_f32:
+    case OP_vcvtr_s32_f32:
+    case OP_vcvtr_u32_f32:
+    case OP_vcvtt_f16_f32:
+    /* end of convert instructions */
+    case OP_vdiv_f32:
+    case OP_vfma_f32:
+    case OP_vfms_f32:
+    case OP_vfnma_f32:
+    case OP_vfnms_f32:
+    case OP_vmax_f32:
+    case OP_vmaxnm_f32:
+    case OP_vmin_f32:
+    case OP_vminnm_f32:
+    case OP_vmla_f32:
+    case OP_vmls_f32:
+    case OP_vmov_f32:
+    case OP_vmul_f32:
+    case OP_vneg_f32:
+    case OP_vnmla_f32:
+    case OP_vnmls_f32:
+    case OP_vnmul_f32:
+    case OP_vpadd_f32:
+    case OP_vpmax_f32:
+    case OP_vpmin_f32:
+    case OP_vrecpe_f32:
+    case OP_vrecps_f32:
+    case OP_vrev32_32:  // ?
+    case OP_vrev64_32:  // ?
+    case OP_vrinta_f32_f32:  // ?
+    case OP_vrintm_f32_f32:  // ?
+    case OP_vrintn_f32_f32:  // ?
+    case OP_vrintp_f32_f32:  // ?
+    case OP_vrintr_f32:  // ?
+    case OP_vrintx_f32:  // ?
+    case OP_vrintx_f32_f32:  // ?
+    case OP_vrintz_f32:  // ?
+    case OP_vrintz_f32_f32:  // ?
+    case OP_vrsqrte_f32:
+    case OP_vrsqrts_f32:
+    case OP_vsel_eq_f32:
+    case OP_vsel_ge_f32:
+    case OP_vsel_gt_f32:
+    case OP_vsel_vs_f32:
+    case OP_vsqrt_f32:
+    case OP_vsub_f32:
+    case OP_vtrn_32:  // ?
+    case OP_vtst_32:  // ?
+    case OP_vuzp_32:  // ?
+    case OP_vzip_32:  // ?
+        return 4;
+
+    case OP_vabs_f64:
+    case OP_vadd_f64:
+    case OP_vcmp_f64:
+    case OP_vcmpe_f64:
+    /* convert instructions */
+    case OP_vcvt_f32_f64:
+    case OP_vcvt_s16_f64:
+    case OP_vcvt_s32_f64:
+    case OP_vcvt_u16_f64:
+    case OP_vcvt_u32_f64:
+    case OP_vcvta_s32_f64:
+    case OP_vcvta_u32_f64:
+    case OP_vcvtb_f16_f64:
+    case OP_vcvtm_s32_f64:
+    case OP_vcvtm_u32_f64:
+    case OP_vcvtn_s32_f64:
+    case OP_vcvtn_u32_f64:
+    case OP_vcvtp_s32_f64:
+    case OP_vcvtp_u32_f64:
+    case OP_vcvtr_s32_f64:
+    case OP_vcvtr_u32_f64:
+    case OP_vcvtt_f16_f64:
+    /* end of convert instructions */
+    case OP_vdiv_f64:
+    case OP_vfma_f64:
+    case OP_vfms_f64:
+    case OP_vfnma_f64:
+    case OP_vfnms_f64:
+    case OP_vmaxnm_f64:
+    case OP_vminnm_f64:
+    case OP_vmla_f64:
+    case OP_vmls_f64:
+    case OP_vmov_f64:
+    case OP_vmul_f64:
+    case OP_vneg_f64:
+    case OP_vnmla_f64:
+    case OP_vnmls_f64:
+    case OP_vnmul_f64:
+    case OP_vrinta_f64_f64:  // ?
+    case OP_vrintm_f64_f64:  // ?
+    case OP_vrintn_f64_f64:  // ?
+    case OP_vrintp_f64_f64:  // ?
+    case OP_vrintr_f64:  // ?
+    case OP_vrintx_f64:  // ?
+    case OP_vrintz_f64:  // ?
+    case OP_vsel_eq_f64:
+    case OP_vsel_ge_f64:
+    case OP_vsel_gt_f64:
+    case OP_vsel_vs_f64:
+    case OP_vsqrt_f64:
+    case OP_vsub_f64:
+        return 8;
+
+    default: return 0;
+    }
+}
+
+#else
+
+uint32_t
+FloatOperandSizeTable(instr_t *instr, opnd_t opnd)
+{
+    uint size = opnd_size_in_bytes(opnd_get_size(opnd));
+    if(size!=16 && size!=32 && size!=64) {
+        // ignore those non-vectorized instructions (not start with OP_v*)
+        return size;
+    }
+
+    opnd_t width = instr_get_src(instr, instr_num_srcs(instr) - 1);
+    if (!opnd_is_immed_int(width)) return size;
+
+    switch (opnd_get_immed_int(width)) {
+    case VECTOR_ELEM_WIDTH_HALF:
+        return 2;
+    case VECTOR_ELEM_WIDTH_SINGLE:
+        return 4;
+    case VECTOR_ELEM_WIDTH_DOUBLE:
+        return 8;
+    default:
+        return 0;
+    }
+}
+
+#endif
+
+bool instr_is_ignorable(instr_t *ins) {
+    return false;
+}
+
+#else
+
+uint32_t
+FloatOperandSizeTable(instr_t *instr, opnd_t opnd)
+{
+    uint size = opnd_size_in_bytes(opnd_get_size(opnd));
+    if(size!=16 && size!=32 && size!=64) {
+        // ignore those non-vectorized instructions (not start with OP_v*)
+        return size;
+    }
+    int opc = instr_get_opcode(instr);
+
+    switch (opc) {
+
     // TODO: packed 128-bit floating-point, treat them as two double floating points
     case OP_vinsertf128:
     case OP_vextractf128:
@@ -246,3 +447,5 @@ bool instr_is_ignorable(instr_t *ins) {
     }
     return false;
 }
+
+#endif
