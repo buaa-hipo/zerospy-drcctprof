@@ -2300,6 +2300,10 @@ datacentric_dynamic_alloc(void *wrapcxt, void *user_data)
     data_handle_t data_hndl;
     data_hndl.object_type = DYNAMIC_OBJECT;
     data_hndl.path_handle = pt->dmem_alloc_ctxt_hndl;
+#ifdef DRCCTLIB_USE_ADDR
+    data_hndl.beg_addr = ptr;
+    data_hndl.end_addr = (void*)((uint64_t)ptr + pt->dmem_alloc_size);
+#endif
     init_shadow_memory_space(ptr, pt->dmem_alloc_size, data_hndl);
 }
 
@@ -2361,6 +2365,10 @@ datacentric_static_alloc(const module_data_t *info)
             // DRCCTLIB_PRINTF("STATIC_OBJECT %s %d", sym_name,
             // (uint32_t)syms[i].st_size); dr_fprintf(global_debug_file, "STATIC_OBJECT %s
             // %d \n", sym_name, (uint32_t)syms[i].st_size);
+#ifdef DRCCTLIB_USE_ADDR
+            data_hndl.beg_addr = (void *)((uint64_t)(info->start) + syms[i].st_value);
+            data_hndl.end_addr = (void *)((uint64_t)(data_hndl.beg_addr) + (uint32_t)syms[i].st_size);
+#endif
             init_shadow_memory_space((void *)((uint64_t)(info->start) + syms[i].st_value),
                                      (uint32_t)syms[i].st_size, data_hndl);
         }
@@ -2989,6 +2997,7 @@ DR_EXPORT
 context_handle_t
 drcctlib_get_context_handle(void *drcontext, int32_t slot){
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+    IF_CCTLIB_64_CCTLIB(refresh_per_thread_cct_tree(drcontext, pt);)
     if (slot >= pt->cur_bb_node->max_slots) {
         DRCCTLIB_EXIT_PROCESS("slot > cur_bb_node->max_slots");
     }

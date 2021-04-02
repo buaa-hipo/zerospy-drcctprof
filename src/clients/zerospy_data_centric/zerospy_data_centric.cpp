@@ -1,5 +1,6 @@
 #include <unordered_map>
 #include <vector>
+#include <list>
 #include <string>
 #include <sys/stat.h>
 #include <assert.h>
@@ -22,8 +23,11 @@ uint64_t get_miliseconds() {
 #include "drmgr.h"
 #include "drreg.h"
 #include "drutil.h"
+// enable data centric with addr info
+#define DRCCTLIB_USE_ADDR
 #include "drcctlib.h"
 #include "utils.h"
+#include "bitvec.h"
 
 #define ENABLE_SAMPLING 1
 #ifdef ENABLE_SAMPLING
@@ -137,26 +141,43 @@ zerospy_filter_read_mem_access_instr(instr_t *instr)
 static string g_folder_name;
 static int tls_idx;
 
-struct INTRedLogs{
-    uint64_t tot;
-    uint64_t red;
-    uint64_t fred; // full redundancy
-    uint64_t redByteMap;
+struct RedLogs{
+    uint64_t red;  // how many byte zero
+    bitvec_t redmap; // bitmap logging if a byte is redundant
+    bitvec_t accmap; // bitmap logging if a byte is accessed
 };
+
+typedef unordered_map<uint64_t, RedLogs> RedLogSizeMap;
+typedef unordered_map<uint64_t, RedLogSizeMap> RedLogMap;
 
 struct FPRedLogs{
-    uint64_t fred; // full redundancy
-    uint64_t ftot;
-    uint64_t redByteMap;
-    uint8_t AccessLen;
-    uint8_t size;
+    uint64_t red;  // how many byte zero
+    bitvec_t redmap; // bitmap logging if a byte is redundant
+    bitvec_t accmap; // bitmap logging if a byte is accessed
+    uint8_t typesz;
 };
 
+typedef unordered_map<uint64_t, FPRedLogs> FPRedLogSizeMap;
+typedef unordered_map<uint64_t, FPRedLogSizeMap> FPRedLogMap;
+
 #define MINSERT instrlist_meta_preinsert
-#define DECODE_DEAD(data) static_cast<uint8_t>(((data)  & 0xffffffffffffffff) >> 32 )
-#define DECODE_KILL(data) (static_cast<context_handle_t>( (data)  & 0x00000000ffffffff))
-#define MAKE_CONTEXT_PAIR(a, b) (((uint64_t)(a) << 32) | ((uint64_t)(b)))
+#define MAKE_OBJID(a, b) (((uint64_t)(a)<<32) | (b))
+#define DECODE_TYPE(a) (((uint64_t)(a)&(0xffffffffffffffff))>>32)
+#define DECODE_NAME(b) ((uint64_t)(b)&(0x00000000ffffffff))
+
+#define MAKE_CNTXT(a, b, c) (((uint64_t)(a)<<32) | ((uint64_t)(b)<<16) | (uint64_t)(c))
+#define DECODE_CNTXT(a) (static_cast<ContextHandle_t>((((a)&(0xffffffffffffffff))>>32)))
+#define DECODE_ACCLN(b) (((uint64_t)(b)&(0x00000000ffff0000))>>16)
+#define DECODE_TYPSZ(c)  ((uint64_t)(c)&(0x000000000000ffff))
+
+#define MAX_OBJS_TO_LOG 100
+
 #define delta 0.01
+
+#define CACHE_LINE_SIZE (64)
+#ifndef PAGE_SIZE
+#define PAGE_SIZE (4*1024)
+#endif
 #define MAX_REDUNDANT_CONTEXTS_TO_LOG (1000)
 // maximum cct depth to print
 #define MAX_DEPTH 10
@@ -174,15 +195,18 @@ static uint tls_offs;
 // 1M
 #define MAX_CLONE_INS 1048576
 typedef struct _per_thread_t {
-    unordered_map<uint64_t, INTRedLogs> *INTRedMap;
-    unordered_map<uint64_t, FPRedLogs > *FPRedMap;
+    RedLogMap *INTRedMap;
+    FPRedLogMap *FPRedMap;
     file_t output_file;
+    uint64_t bytesLoad;
 #ifdef ENABLE_SAMPLING
     void* numInsBuff;
     // long long numIns;
     // bool sampleFlag;
 #endif
+#ifdef ZEROSPY_DEBUG
     vector<instr_t*> *instr_clones;
+#endif
 } per_thread_t;
 
 #define IS_SAMPLED(pt, WINDOW_ENABLE) ((int64_t)(BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR))<(int64_t)WINDOW_ENABLE)
@@ -203,39 +227,107 @@ uint64_t grandTotBytesRedLoad = 0;
 uint64_t grandTotBytesApproxRedLoad = 0;
 
 /*******************************************************************************************/
-static inline void AddToRedTable(uint64_t key,  uint16_t value, uint64_t byteMap, uint16_t total, per_thread_t *pt) __attribute__((always_inline,flatten));
-static inline void AddToRedTable(uint64_t key,  uint16_t value, uint64_t byteMap, uint16_t total, per_thread_t *pt) {
-    unordered_map<uint64_t, INTRedLogs>::iterator it = pt->INTRedMap->find(key);
-    if ( it  == pt->INTRedMap->end()) {
-        INTRedLogs log;
+// TODO: May be further optimized by combining size and data hndl to avoid one more mapping
+static inline void AddToRedTable(uint64_t addr, data_handle_t data, uint16_t value, uint16_t total, uint32_t redmap, per_thread_t *pt) __attribute__((always_inline,flatten));
+static inline void AddToRedTable(uint64_t addr, data_handle_t data, uint16_t value, uint16_t total, uint32_t redmap, per_thread_t *pt) {
+    assert(addr<=(uint64_t)data.end_addr);
+    size_t offset = addr-(uint64_t)data.beg_addr;
+    uint64_t key = MAKE_OBJID(data.object_type,data.sym_name);
+    RedLogMap::iterator it2 = pt->INTRedMap->find(key);
+    RedLogSizeMap::iterator it;
+    size_t size = (uint64_t)data.end_addr - (uint64_t)data.beg_addr;
+    if ( it2  == pt->INTRedMap->end() || (it = it2->second.find(size)) == it2->second.end()) {
+        RedLogs log;
         log.red = value;
-        log.tot = total;
-        log.fred= (value==total);
-        log.redByteMap = byteMap;
-        (*pt->INTRedMap)[key] = log;
+#ifdef DEBUG_CHECK
+        if(offset+total>size) {
+            printf("AddToRedTable 1: offset=%ld, total=%d, size=%ld\n", offset, total, size);
+            if(data.object_type == DYNAMIC_OBJECT) {
+                printf("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Dynamic Object: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                drcctlib_print_full_cct(STDOUT, data.sym_name, true, true, MAX_DEPTH);
+            } else {
+                printf("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", drcctlib_get_str_from_strpool((uint32_t)data.sym_name));
+            }
+        }
+#endif
+        bitvec_alloc(&log.redmap, size);
+        bitvec_and(&log.redmap, redmap, offset, total);
+        bitvec_alloc(&log.accmap, size);
+        bitvec_and(&log.accmap, 0, offset, total);
+        (*pt->INTRedMap)[key][size] = log;
     } else {
+        assert(it->second.redmap.size==it->second.accmap.size);
+        assert(size == it->second.redmap.size);
+#ifdef DEBUG_CHECK
+        if(offset+total>size) {
+            printf("AddToRedTable 2: offset=%ld, total=%d, size=%ld\n", offset, total, size);
+            if(data.object_type == DYNAMIC_OBJECT) {
+                printf("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Dynamic Object: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                drcctlib_print_full_cct(STDOUT, data.sym_name, true, true, MAX_DEPTH);
+            } else {
+                printf("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", drcctlib_get_str_from_strpool((uint32_t)data.sym_name));
+            }
+        }
+#endif
         it->second.red += value;
-        it->second.tot += total;
-        it->second.fred+= (value==total);
-        it->second.redByteMap &= byteMap;
+        bitvec_and(&(it->second.redmap), redmap, offset, total);
+        bitvec_and(&(it->second.accmap), 0, offset, total);
     }
 }
 
-static inline void AddToApproximateRedTable(uint64_t key, uint64_t byteMap, uint16_t total, uint16_t zeros, uint16_t nums, uint8_t size, per_thread_t *pt) __attribute__((always_inline,flatten));
-static inline void AddToApproximateRedTable(uint64_t key, uint64_t byteMap, uint16_t total, uint16_t zeros, uint16_t nums, uint8_t size, per_thread_t *pt) {
-    unordered_map<uint64_t, FPRedLogs>::iterator it = pt->FPRedMap->find(key);
-    if ( it  == pt->FPRedMap->end()) {
+static inline void AddToApproximateRedTable(uint64_t addr, data_handle_t data, uint16_t value, uint16_t total, uint64_t redmap, uint32_t typesz, per_thread_t *pt) __attribute__((always_inline,flatten));
+static inline void AddToApproximateRedTable(uint64_t addr, data_handle_t data, uint16_t value, uint16_t total, uint64_t redmap, uint32_t typesz, per_thread_t *pt) {
+    // printf("ADDR=%lx, beg_addr=%lx, end_addr=%lx, typesz=%d, index=%ld, size=%ld\n", addr, (uint64_t)data.beg_addr, (uint64_t)data.end_addr, typesz, addr-(uint64_t)data.beg_addr, (uint64_t)data.end_addr - (uint64_t)data.beg_addr);
+    assert(addr<=(uint64_t)data.end_addr);
+    size_t offset = addr-(uint64_t)data.beg_addr;
+    uint64_t key = MAKE_OBJID(data.object_type,data.sym_name);
+    FPRedLogMap::iterator it2 = pt->FPRedMap->find(key);
+    FPRedLogSizeMap::iterator it;
+    // the data size may not aligned with typesz, so use upper bound as the bitvec size
+    // Note: not aligned case : struct/class with floating and int.
+    size_t size = (uint64_t)data.end_addr - (uint64_t)data.beg_addr;
+    if(value > total) {
+        dr_fprintf(STDERR, "** Warning AddToApproximateTable : value %d, total %d **\n", value, total);
+        assert(0 && "** BUG #0 Detected. Existing **");
+    }
+    if ( it2  == pt->FPRedMap->end() || (it = it2->second.find(size)) == it2->second.end()) {
         FPRedLogs log;
-        log.fred= zeros;
-        log.ftot= nums;
-        log.redByteMap = byteMap;
-        log.AccessLen = total;
-        log.size = size;
-        (*pt->FPRedMap)[key] = log;
+        log.red = value;
+        log.typesz = typesz;
+#ifdef DEBUG_CHECK
+        if(offset+total>size) {
+            printf("AddToApproxRedTable 1: offset=%ld, total=%d, size=%ld\n", offset, total, size);
+            if(data.object_type == DYNAMIC_OBJECT) {
+                printf("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Dynamic Object: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                drcctlib_print_full_cct(STDOUT, data.sym_name, true, true, MAX_DEPTH);
+            } else {
+                printf("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", drcctlib_get_str_from_strpool((uint32_t)data.sym_name));
+            }
+        }
+#endif
+        bitvec_alloc(&log.redmap, size);
+        bitvec_and(&log.redmap, redmap, offset, total);
+        bitvec_alloc(&log.accmap, size);
+        bitvec_and(&log.accmap, 0, offset, total);
+        (*pt->FPRedMap)[key][size] = log;
     } else {
-        it->second.fred+= zeros;
-        it->second.ftot+= nums;
-        it->second.redByteMap &= byteMap;
+        assert(it->second.redmap.size==it->second.accmap.size);
+        assert(size == it->second.redmap.size);
+        assert(it->second.typesz == typesz);
+#ifdef DEBUG_CHECK
+        if(offset+total>size) {
+            printf("AddToApproxRedTable 1: offset=%ld, total=%d, size=%ld\n", offset, total, size);
+            if(data.object_type == DYNAMIC_OBJECT) {
+                printf("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Dynamic Object: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                drcctlib_print_full_cct(STDOUT, data.sym_name, true, true, MAX_DEPTH);
+            } else {
+                printf("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", drcctlib_get_str_from_strpool((uint32_t)data.sym_name));
+            }
+        }
+#endif
+        it->second.red += value;
+        bitvec_and(&(it->second.redmap), redmap, offset, total);
+        bitvec_and(&(it->second.accmap), 0, offset, total);
     }
 }
 /*******************************************************************************************/
@@ -718,7 +810,6 @@ struct UnrolledConjunction<end , end , incr>{
 // };
 // void (*BBSampleNoFlush_target)(uint);
 
-
 #ifdef x86_CCTLIB
 #define RESERVE_AFLAGS(dead, bb, ins) do { \
     assert(drreg_are_aflags_dead(drcontext, ins, &dead)==DRREG_SUCCESS); \
@@ -894,25 +985,42 @@ struct ZeroSpyAnalysis{
 //             dr_fprintf(STDERR, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
 //         }
 // #endif
-        context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
+        pt->bytesLoad += AccessLen;
+        data_handle_t data_hndl =
+                    drcctlib_get_data_hndl_ignore_stack_data(drcontext, (app_pc)addr);
+        if(data_hndl.object_type!=DYNAMIC_OBJECT && data_hndl.object_type!=STATIC_OBJECT) {
+            return ;
+        }
+#ifdef DEBUG_CHECK
+        {
+            size_t size   = (uint64_t)data_hndl.end_addr - (uint64_t)data_hndl.beg_addr;
+            size_t offset = (uint64_t)addr - (uint64_t)data_hndl.beg_addr;
+            size_t total  = AccessLen;
+            if(offset + total > size) {
+                context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
+                printf("\n\nWARN: overflow detected: offset=%ld, total=%ld, size=%ld\n", offset, total, size);
+                drcctlib_print_full_cct(STDOUT, curCtxtHandle, true, true, MAX_DEPTH);
+            }
+        }
+#endif
         uint8_t* bytes = static_cast<uint8_t*>(addr);
         if(isApprox) {
             bool hasRedundancy = UnrolledConjunctionApprox<0,AccessLen,sizeof(T)>::BodyHasRedundancy(bytes);
             if(hasRedundancy) {
                 uint64_t map = UnrolledConjunctionApprox<0,AccessLen,sizeof(T)>::BodyRedMap(bytes);
                 uint32_t zeros = UnrolledConjunctionApprox<0,AccessLen,sizeof(T)>::BodyZeros(bytes);        
-                AddToApproximateRedTable((uint64_t)curCtxtHandle, map, AccessLen, zeros, AccessLen/sizeof(T), sizeof(T), pt);
+                AddToApproximateRedTable((uint64_t)addr,data_hndl, zeros, AccessLen/sizeof(T), map, sizeof(T), pt);
             } else {
-                AddToApproximateRedTable((uint64_t)curCtxtHandle, 0, AccessLen, 0, AccessLen/sizeof(T), sizeof(T), pt);
+                AddToApproximateRedTable((uint64_t)addr,data_hndl, 0, AccessLen/sizeof(T), 0, sizeof(T), pt);
             }
         } else {
             bool hasRedundancy = UnrolledConjunction<0,AccessLen,sizeof(T)>::BodyHasRedundancy(bytes);
             if(hasRedundancy) {
                 uint64_t redbyteMap = UnrolledConjunction<0,AccessLen,sizeof(T)>::BodyRedMap(bytes);
                 uint32_t redbyteNum = UnrolledConjunction<0,AccessLen,sizeof(T)>::BodyRedNum(redbyteMap);
-                AddToRedTable((uint64_t)MAKE_CONTEXT_PAIR(AccessLen, curCtxtHandle), redbyteNum, redbyteMap, AccessLen, pt);
+                AddToRedTable((uint64_t)addr, data_hndl, redbyteNum, AccessLen, redbyteMap, pt);
             } else {
-                AddToRedTable((uint64_t)MAKE_CONTEXT_PAIR(AccessLen, curCtxtHandle), 0, 0, AccessLen, pt);
+                AddToRedTable((uint64_t)addr, data_hndl, 0, AccessLen, 0, pt);
             }
         }
     }
@@ -932,7 +1040,6 @@ struct ZeroSpyAnalysis{
         mcontext.size = sizeof(mcontext);
         mcontext.flags= DR_MC_ALL;
         DR_ASSERT(dr_get_mcontext(drcontext, &mcontext));
-        context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
 #ifdef DEBUG_VGATHER
         printf("\n^^ CheckNByteValueAfterVGather: ");
         disassemble(drcontext, instr_get_app_pc(instr), 1/*sdtout file desc*/);
@@ -946,15 +1053,15 @@ struct ZeroSpyAnalysis{
             uint32_t pos;
             for( int index=0; instr_compute_address_ex_pos(instr, &mcontext, index, &addr, &is_write, &pos); ++index ) {
                 DR_ASSERT(!is_write);
-                uint8_t* bytes = reinterpret_cast<uint8_t*>(addr);
-                bool hasRedundancy = (bytes[sizeof(T)-1]==0);
-                if(hasRedundancy) {
-                    if(sizeof(T)==4) { map = map | (UnrolledConjunctionApprox<0,sizeof(T),sizeof(T)>::BodyRedMap(bytes) << (SP_MAP_SIZE * pos) ); }
-                    else if(sizeof(T)==8) { map = map |  (UnrolledConjunctionApprox<0,sizeof(T),sizeof(T)>::BodyRedMap(bytes) << (DP_MAP_SIZE * pos) ); }
-                    zeros = zeros + UnrolledConjunctionApprox<0,sizeof(T),sizeof(T)>::BodyZeros(bytes);
+                pt->bytesLoad += sizeof(T);
+                data_handle_t data_hndl = drcctlib_get_data_hndl_ignore_stack_data(drcontext, addr);
+                if(data_hndl.object_type!=DYNAMIC_OBJECT && data_hndl.object_type!=STATIC_OBJECT) {
+                    continue ;
                 }
+                T* bytes = reinterpret_cast<T*>(addr);
+                uint64_t val = (bytes[0] == 0) ? 1 : 0;
+                AddToApproximateRedTable((uint64_t)addr, data_hndl, val, 1, val, sizeof(T), pt);
             }
-            AddToApproximateRedTable((uint64_t)curCtxtHandle, map, AccessLen, zeros, AccessLen/sizeof(T), sizeof(T), pt);
         } else {
             assert(0 && "VGather should be a floating point operation!");
         }
@@ -974,7 +1081,24 @@ static inline void CheckAfterLargeRead(int32_t slot, void* addr, uint32_t access
 //         }
 //     }
 // #endif
-    context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
+    pt->bytesLoad += accessLen;
+    data_handle_t data_hndl =
+                drcctlib_get_data_hndl_ignore_stack_data(drcontext, (app_pc)addr);
+    if(data_hndl.object_type!=DYNAMIC_OBJECT && data_hndl.object_type!=STATIC_OBJECT) {
+        return ;
+    }
+#ifdef DEBUG_CHECK
+    {
+        size_t size   = (uint64_t)data_hndl.end_addr - (uint64_t)data_hndl.beg_addr;
+        size_t offset = (uint64_t)addr - (uint64_t)data_hndl.beg_addr;
+        size_t total  = accessLen;
+        if(offset + total > size) {
+            context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
+            printf("\n\nWARN: overflow detected: offset=%ld, total=%ld, size=%ld\n", offset, total, size);
+            drcctlib_print_full_cct(STDOUT, curCtxtHandle, true, true, MAX_DEPTH);
+        }
+    }
+#endif
     uint8_t* bytes = static_cast<uint8_t*>(addr);
     // quick check whether the most significant byte of the read memory is redundant zero or not
     bool hasRedundancy = (bytes[accessLen-1]==0);
@@ -1041,10 +1165,10 @@ static inline void CheckAfterLargeRead(int32_t slot, void* addr, uint32_t access
             redbytesNum += t;
         }
         // report in RedTable
-        AddToRedTable((uint64_t)MAKE_CONTEXT_PAIR(accessLen, curCtxtHandle), redbytesNum, redbyteMap, accessLen, pt);
+        AddToRedTable((uint64_t)addr, data_hndl, redbytesNum, accessLen, redbyteMap, pt);
     }
     else {
-        AddToRedTable((uint64_t)MAKE_CONTEXT_PAIR(accessLen, curCtxtHandle), 0, 0, accessLen, pt);
+        AddToRedTable((uint64_t)addr, data_hndl, 0, accessLen, 0, pt);
     }
 }
 #ifdef ENABLE_SAMPLING
@@ -1215,7 +1339,9 @@ struct ZerospyInstrument{
         uint32_t refSize = opnd_size_in_bytes(opnd_get_size(instr_get_dst(ins, 0)));
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
         instr_t* ins_clone = instr_clone(drcontext, ins);
+#ifdef ZEROSPY_DEBUG
         pt->instr_clones->push_back(ins_clone);
+#endif
 #ifdef DEBUG_VGATHER
         printf("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
         printf("^^ refSize = %d, operSize = %d\n", refSize, operSize);
@@ -1389,9 +1515,11 @@ ClientThreadStart(void *drcontext)
     if (pt == NULL) {
         ZEROSPY_EXIT_PROCESS("pt == NULL");
     }
-    pt->INTRedMap = new unordered_map<uint64_t, INTRedLogs>();
-    pt->FPRedMap = new unordered_map<uint64_t, FPRedLogs>();
+    pt->INTRedMap = new RedLogMap();
+    pt->FPRedMap = new FPRedLogMap();
+#ifdef ZEROSPY_DEBUG
     pt->instr_clones = new vector<instr_t*>();
+#endif
     pt->INTRedMap->rehash(10000000);
     pt->FPRedMap->rehash(10000000);
 #ifdef ENABLE_SAMPLING
@@ -1400,220 +1528,292 @@ ClientThreadStart(void *drcontext)
     pt->numInsBuff = dr_get_dr_segment_base(tls_seg);
     BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR) = 0;
 #endif
+    pt->bytesLoad = 0;
     drmgr_set_tls_field(drcontext, tls_idx, (void *)pt);
     ThreadOutputFileInit(pt);
 }
 
 /*******************************************************************/
 /* Output functions */
-struct RedundacyData {
-    context_handle_t cntxt;
-    uint64_t frequency;
-    uint64_t all0freq;
-    uint64_t ltot;
-    uint64_t byteMap;
-    uint8_t accessLen;
-};
-
-struct ApproxRedundacyData {
-    context_handle_t cntxt;
-    uint64_t all0freq;
-    uint64_t ftot;
-    uint64_t byteMap;
-    uint8_t accessLen;
-    uint8_t size;
-};
-
-static inline bool RedundacyCompare(const struct RedundacyData &first, const struct RedundacyData &second) {
-    return first.frequency > second.frequency ? true : false;
-}
-static inline bool ApproxRedundacyCompare(const struct ApproxRedundacyData &first, const struct ApproxRedundacyData &second) {
-    return first.all0freq > second.all0freq ? true : false;
-}
 //#define SKIP_SMALLACCESS
 #ifdef SKIP_SMALLACCESS
 #define LOGGING_THRESHOLD 100
 #endif
 
-#include <omp.h>
+// redundant data for a object
+struct ObjRedundancy {
+    uint64_t objID;
+    uint64_t bytes;
+};
+
+static inline bool ObjRedundancyCompare(const struct ObjRedundancy &first, const struct ObjRedundancy &second) {
+    return first.bytes > second.bytes ? true : false;
+}
+
+static inline void PrintSize(file_t gTraceFile, uint64_t size, const char* unit="B") {
+    if(size >= (1<<20)) {
+        dr_fprintf(gTraceFile, "%lf M%s",(double)size/(double)(1<<20),unit);
+    } else if(size >= (1<<10)) {
+        dr_fprintf(gTraceFile, "%lf K%s",(double)size/(double)(1<<10),unit);
+    } else {
+        dr_fprintf(gTraceFile, "%ld %s",size,unit);
+    }
+}
+
+#define MAX_REDMAP_PRINT_SIZE 128
+// only print top 5 redundancy with full redmap to file
+#define MAX_PRINT_FULL 5
 
 static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad, int threadId) {
-    vector<RedundacyData> tmpList;
-    vector<RedundacyData>::iterator tmpIt;
-
+    printf("[ZEROSPY INFO] PrintRedundancyPairs for INT...\n");
+    vector<ObjRedundancy> tmpList;
     file_t gTraceFile = pt->output_file;
     
     uint64_t grandTotalRedundantBytes = 0;
-    tmpList.reserve(pt->INTRedMap->size());
-    printf("Dumping INTEGER Redundancy Info... Total num : %ld\n",pt->INTRedMap->size());
-    fflush(stdout);
-    dr_fprintf(gTraceFile, "\n--------------- Dumping INTEGER Redundancy Info ----------------\n");
+    dr_fprintf(gTraceFile, "\n--------------- Dumping Data Redundancy Info ----------------\n");
     dr_fprintf(gTraceFile, "\n*************** Dump Data from Thread %d ****************\n", threadId);
-    uint64_t count = 0; uint64_t rep = -1;
-    for (unordered_map<uint64_t, INTRedLogs>::iterator it = pt->INTRedMap->begin(); it != pt->INTRedMap->end(); ++it) {
+
+    int count=0;
+    int rep=-1;
+    int total = pt->INTRedMap->size();
+    tmpList.reserve(total);
+    for(RedLogMap::iterator it = pt->INTRedMap->begin(); it != pt->INTRedMap->end(); ++it) {
         ++count;
-        if(100 * count / pt->INTRedMap->size()!=rep) {
-            rep = 100 * count / pt->INTRedMap->size();
-            printf("\r%ld%%  Finish",rep);
+        if(100 * count / total!=rep) {
+            rep = 100 * count / total;
+            printf("\r[ZEROSPY INFO] Stage 1 : %3d %% Finish",rep);
             fflush(stdout);
         }
-        RedundacyData tmp = { DECODE_KILL((*it).first), (*it).second.red,(*it).second.fred,(*it).second.tot,(*it).second.redByteMap,DECODE_DEAD((*it).first)};
-        tmpList.push_back(tmp);
-        grandTotalRedundantBytes += tmp.frequency;
-    }
-    printf("\r100%%  Finish\n");
-    fflush(stdout);
-    
-    __sync_fetch_and_add(&grandTotBytesRedLoad,grandTotalRedundantBytes);
-    printf("Extracted Raw data, now sorting...\n");
-    fflush(stdout);
-    
-    dr_fprintf(gTraceFile, "\n Total redundant bytes = %f %%\n", grandTotalRedundantBytes * 100.0 / threadBytesLoad);
-    dr_fprintf(gTraceFile, "\n INFO : Total redundant bytes = %f %% (%ld / %ld) \n", grandTotalRedundantBytes * 100.0 / threadBytesLoad, grandTotalRedundantBytes, threadBytesLoad);
-    
-#ifdef ENABLE_FILTER_BEFORE_SORT
-#define FILTER_THESHOLD 1000
-    dr_fprintf(gTraceFile, "\n Filter out small redundancies according to the predefined threshold: %.2lf %%\n", 100.0/(double)FILTER_THESHOLD);
-    vector<RedundacyData> tmpList2;
-    tmpList2 = move(tmpList);
-    tmpList.clear(); // make sure it is empty
-    tmpList.reserve(tmpList2.size());
-    for(tmpIt = tmpList2.begin();tmpIt != tmpList2.end(); ++tmpIt) {
-        if(tmpIt->frequency * FILTER_THESHOLD > tmpIt->ltot) {
-            tmpList.push_back(*tmpIt);
+        ObjRedundancy tmp = {(*it).first, 0};
+        for(RedLogSizeMap::iterator it2 = it->second.begin(); it2 != it->second.end(); ++it2) {
+            tmp.bytes += it2->second.red;
         }
+        if(tmp.bytes==0) continue;
+        grandTotalRedundantBytes += tmp.bytes;
+        tmpList.push_back(tmp); 
     }
-    dr_fprintf(gTraceFile, " Remained Redundancies: %ld (%.2lf %%)\n", tmpList.size(), (double)tmpList.size()/(double)tmpList2.size());
-    tmpList2.clear();
-#undef FILTER_THRESHOLD
-#endif
+    printf("\n[ZEROSPY INFO] Stage 1 finish\n");
 
-    sort(tmpList.begin(), tmpList.end(), RedundacyCompare);
-    printf("Sorted, Now generating reports...\n");
-    fflush(stdout);
-    int cntxtNum = 0;
-    for (vector<RedundacyData>::iterator listIt = tmpList.begin(); listIt != tmpList.end(); ++listIt) {
-        if (cntxtNum < MAX_REDUNDANT_CONTEXTS_TO_LOG) {
-            dr_fprintf(gTraceFile, "\n\n======= (%f) %% of total Redundant, with local redundant %f %% (%ld Bytes / %ld Bytes) ======\n", 
-                (*listIt).frequency * 100.0 / grandTotalRedundantBytes,
-                (*listIt).frequency * 100.0 / (*listIt).ltot,
-                (*listIt).frequency,(*listIt).ltot);
-            dr_fprintf(gTraceFile, "\n\n======= with All Zero Redundant %f %% (%ld / %ld) ======\n", 
-                (*listIt).all0freq * (*listIt).accessLen * 100.0 / (*listIt).ltot,
-                (*listIt).all0freq,(*listIt).ltot/(*listIt).accessLen);
-            dr_fprintf(gTraceFile, "\n======= Redundant byte map : [0] ");
-            for(uint32_t i=0;i<(*listIt).accessLen;++i) {
-                if((*listIt).byteMap & (1<<i)) {
-                    dr_fprintf(gTraceFile, "00 ");
-                }
-                else {
-                    dr_fprintf(gTraceFile, "XX ");
+    __sync_fetch_and_add(&grandTotBytesRedLoad,grandTotalRedundantBytes);
+    dr_fprintf(gTraceFile, "\n Total redundant bytes = %f %%\n", grandTotalRedundantBytes * 100.0 / threadBytesLoad);
+
+    sort(tmpList.begin(), tmpList.end(), ObjRedundancyCompare);
+
+    int objNum = 0;
+    rep = -1;
+    total = tmpList.size()<MAX_OBJS_TO_LOG?tmpList.size():MAX_OBJS_TO_LOG;
+    for(vector<ObjRedundancy>::iterator listIt = tmpList.begin(); listIt != tmpList.end(); ++listIt) {
+        if(objNum++ >= MAX_OBJS_TO_LOG) break;
+        if(100 * objNum / total!=rep) {
+            rep = 100 * objNum / total;
+            printf("\r[ZEROSPY INFO] Stage 2 : %3d %% Finish",rep);
+            fflush(stdout);
+        }
+        if((uint8_t)DECODE_TYPE((*listIt).objID) == DYNAMIC_OBJECT) {
+            dr_fprintf(gTraceFile, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Dynamic Object: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+            drcctlib_print_full_cct(gTraceFile, DECODE_NAME((*listIt).objID), true, true, MAX_DEPTH);
+        } else { 
+            dr_fprintf(gTraceFile, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", drcctlib_get_str_from_strpool((uint32_t)DECODE_NAME((*listIt).objID)));
+        }
+
+        dr_fprintf(gTraceFile, "\n==========================================\n");
+        dr_fprintf(gTraceFile, "Redundancy Ratio = %f %% (%ld Bytes)\n", (*listIt).bytes * 100.0 / grandTotalRedundantBytes, (*listIt).bytes);
+
+        for(RedLogSizeMap::iterator it2 = (*pt->INTRedMap)[(*listIt).objID].begin(); it2 != (*pt->INTRedMap)[(*listIt).objID].end(); ++it2) {
+            uint64_t dfreq = 0;
+            uint64_t dread = 0;
+            uint64_t dsize = it2->first;
+            bitref_t accmap = &(it2->second.accmap);
+            bitref_t redmap = &(it2->second.redmap);
+
+            assert(accmap->size==dsize);
+            assert(accmap->size==redmap->size);
+
+            for(size_t i=0;i<accmap->size;++i) {
+                if(!bitvec_at(accmap, i)) {
+                    ++dread;
+                    if(bitvec_at(redmap, i)) ++dfreq;
                 }
             }
-            dr_fprintf(gTraceFile, " [AccessLen=%d] =======\n", (*listIt).accessLen);
-            dr_fprintf(gTraceFile, "\n---------------------Redundant load with---------------------------\n");
-            drcctlib_print_full_cct(gTraceFile, (*listIt).cntxt, true, true, MAX_DEPTH);
+                
+            dr_fprintf(gTraceFile, "\n\n======= DATA SIZE : ");
+            PrintSize(gTraceFile, dsize);
+            dr_fprintf(gTraceFile, "( Not Accessed Data %f %% (%ld Bytes), Redundant Data %f %% (%ld Bytes) )", 
+                    (dsize-dread) * 100.0 / dsize, dsize-dread, 
+                    dfreq * 100.0 / dsize, dfreq);
+
+            dr_fprintf(gTraceFile, "\n======= Redundant byte map : [0] ");
+            uint32_t num=0;
+            for(size_t i=0;i<accmap->size;++i) {
+                if(!bitvec_at(accmap, i)) {
+                    if(bitvec_at(redmap, i)) {
+                        dr_fprintf(gTraceFile, "00 ");
+                    } else {
+                        dr_fprintf(gTraceFile, "XX ");
+                    }
+                } else {
+                    dr_fprintf(gTraceFile, "?? ");
+                }
+                ++num;
+                if(num>MAX_REDMAP_PRINT_SIZE) {
+                    dr_fprintf(gTraceFile, "... ");
+                    break;
+                }
+            }
         }
-        else {
-            break;
+#if 0
+        if(objNum<=MAX_PRINT_FULL) {
+            char fn[50] = {};
+            sprintf(fn,"%lx.redmap",(*listIt).objID);
+            file_t fp = dr_open(fn,"w");
+            if((uint8_t)DECODE_TYPE((*listIt).objID) == DYNAMIC_OBJECT) {
+                dr_fprintf(fp, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Dynamic Object: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                PrintFullCallingContext(DECODE_NAME((*listIt).objID)); // segfault might happen if the shadow memory based data centric is used
+            } else  
+                dr_fprintf(fp, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", GetStringFromStringPool((uint32_t)DECODE_NAME((*listIt).objID)));
+            for(size_t i=0;i<accmap->size;++i) {
+                if(!bitvec_at(accmap, i)) {
+                    if(bitvec_at(redmap, i)) {
+                        dr_fprintf(fp, "00 ");
+                    } else {
+                        dr_fprintf(fp, "XX ");
+                    }
+                } else {
+                    dr_fprintf(fp, "?? ");
+                }
+            }
         }
-        cntxtNum++;
+#endif
     }
-    dr_fprintf(gTraceFile, "\n------------ Dumping INTEGER Redundancy Info Finish -------------\n");
-    printf("INTEGER Report dumped\n");
-    fflush(stdout);
+    printf("\n[ZEROSPY INFO] Stage 2 Finish\n");
+    dr_fprintf(gTraceFile, "\n------------ Dumping Redundancy Info Finish -------------\n");
     return grandTotalRedundantBytes;
 }
 
 static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad, int threadId) {
-    vector<ApproxRedundacyData> tmpList;
-    vector<ApproxRedundacyData>::iterator tmpIt;
-    tmpList.reserve(pt->FPRedMap->size());
-    
+    printf("[ZEROSPY INFO] PrintRedundancyPairs for FP...\n");
+    vector<ObjRedundancy> tmpList;
     file_t gTraceFile = pt->output_file;
-
+    
     uint64_t grandTotalRedundantBytes = 0;
-    uint64_t grandTotalRedundantIns = 0;
-    dr_fprintf(gTraceFile, "\n--------------- Dumping Approximation Redundancy Info ----------------\n");
+    dr_fprintf(gTraceFile, "\n--------------- Dumping Data Approximation Redundancy Info ----------------\n");
     dr_fprintf(gTraceFile, "\n*************** Dump Data(delta=%.2f%%) from Thread %d ****************\n", delta*100,threadId);
 
-    printf("Dumping INTEGER Redundancy Info... Total num : %ld\n",pt->FPRedMap->size());
-    uint64_t count = 0; uint64_t rep = -1;
-    for (unordered_map<uint64_t, FPRedLogs>::iterator it = pt->FPRedMap->begin(); it != pt->FPRedMap->end(); ++it) {
+    int count=0;
+    int rep=-1;
+    int total = pt->FPRedMap->size();
+    tmpList.reserve(total);
+    for(FPRedLogMap::iterator it = pt->FPRedMap->begin(); it != pt->FPRedMap->end(); ++it) {
         ++count;
-        if(100 * count / pt->INTRedMap->size()!=rep) {
-            rep = 100 * count / pt->INTRedMap->size();
-            printf("\r%ld%%  Finish",rep);
+        if(100 * count / total!=rep) {
+            rep = 100 * count / total;
+            printf("\r[ZEROSPY INFO] Stage 1 : %3d %% Finish",rep);
             fflush(stdout);
         }
-        ApproxRedundacyData tmp = { static_cast<context_handle_t>((*it).first), (*it).second.fred,(*it).second.ftot, (*it).second.redByteMap,(*it).second.AccessLen, (*it).second.size};
-        tmpList.push_back(tmp);
-        grandTotalRedundantBytes += (*it).second.fred * (*it).second.AccessLen;
-    }
-    printf("\r100%%  Finish\n");
-    fflush(stdout);
-    
-    __sync_fetch_and_add(&grandTotBytesApproxRedLoad,grandTotalRedundantBytes);
-    
-    dr_fprintf(gTraceFile, "\n Total redundant bytes = %f %%\n", grandTotalRedundantBytes * 100.0 / threadBytesLoad);
-    dr_fprintf(gTraceFile, "\n INFO : Total redundant bytes = %f %% (%ld / %ld) \n", grandTotalRedundantBytes * 100.0 / threadBytesLoad, grandTotalRedundantBytes, threadBytesLoad);
-    
-#ifdef ENABLE_FILTER_BEFORE_SORT
-#define FILTER_THESHOLD 1000
-    dr_fprintf(gTraceFile, "\n Filter out small redundancies according to the predefined threshold: %.2lf %%\n", 100.0/(double)FILTER_THESHOLD);
-    // pt->FPRedMap->clear();
-    vector<ApproxRedundacyData> tmpList2;
-    tmpList2 = move(tmpList);
-    tmpList.clear(); // make sure it is empty
-    tmpList.reserve(tmpList2.size());
-    for(tmpIt = tmpList2.begin();tmpIt != tmpList2.end(); ++tmpIt) {
-        if(tmpIt->all0freq * FILTER_THESHOLD > tmpIt->ftot) {
-            tmpList.push_back(*tmpIt);
+        ObjRedundancy tmp = {(*it).first, 0};
+        for(FPRedLogSizeMap::iterator it2 = it->second.begin(); it2 != it->second.end(); ++it2) {
+            tmp.bytes += it2->second.red;
         }
+        if(tmp.bytes==0) continue;
+        grandTotalRedundantBytes += tmp.bytes;
+        tmpList.push_back(tmp); 
     }
-    dr_fprintf(gTraceFile, " Remained Redundancies: %ld (%.2lf %%)\n", tmpList.size(), (double)tmpList.size()/(double)tmpList2.size());
-    tmpList2.clear();
-#undef FILTER_THRESHOLD
-#endif
+    printf("\n[ZEROSPY INFO] Stage 1 Finish\n");
 
-    sort(tmpList.begin(), tmpList.end(), ApproxRedundacyCompare);
-    int cntxtNum = 0;
-    for (vector<ApproxRedundacyData>::iterator listIt = tmpList.begin(); listIt != tmpList.end(); ++listIt) {
-        if (cntxtNum < MAX_REDUNDANT_CONTEXTS_TO_LOG) {
-            dr_fprintf(gTraceFile, "\n======= (%f) %% of total Redundant, with local redundant %f %% (%ld Zeros / %ld Reads) ======\n",
-                (*listIt).all0freq * 100.0 / grandTotalRedundantBytes,
-                (*listIt).all0freq * 100.0 / (*listIt).ftot,
-                (*listIt).all0freq,(*listIt).ftot); 
-            dr_fprintf(gTraceFile, "\n======= Redundant byte map : [mantiss | exponent | sign] ========\n");
-            if((*listIt).size==4) {
-                dr_fprintf(gTraceFile, "%s", getFpRedMapString_SP((*listIt).byteMap, (*listIt).accessLen/4).c_str());
-            } else {
-                dr_fprintf(gTraceFile, "%s", getFpRedMapString_DP((*listIt).byteMap, (*listIt).accessLen/8).c_str());
+    __sync_fetch_and_add(&grandTotBytesApproxRedLoad,grandTotalRedundantBytes);
+
+    dr_fprintf(gTraceFile, "\n Total redundant bytes = %f %%\n", grandTotalRedundantBytes * 100.0 / threadBytesLoad);
+    sort(tmpList.begin(), tmpList.end(), ObjRedundancyCompare);
+
+    int objNum = 0;
+    vector<uint8_t> state;
+    for(vector<ObjRedundancy>::iterator listIt = tmpList.begin(); listIt != tmpList.end(); ++listIt) {
+        if(objNum++ >= MAX_OBJS_TO_LOG) break;
+        if(100 * objNum / total!=rep) {
+            rep = 100 * objNum / total;
+            printf("\r[ZEROSPY INFO] Stage 2 : %3d %% Finish",rep);
+            fflush(stdout);
+        }
+        if((uint8_t)DECODE_TYPE((*listIt).objID) == DYNAMIC_OBJECT) {
+            dr_fprintf(gTraceFile, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Dynamic Object: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+            drcctlib_print_full_cct(gTraceFile, DECODE_NAME((*listIt).objID), true, true, MAX_DEPTH);
+        } else {
+            dr_fprintf(gTraceFile, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", drcctlib_get_str_from_strpool((uint32_t)DECODE_NAME((*listIt).objID)));
+        }
+        dr_fprintf(gTraceFile, "\n==========================================\n");
+        dr_fprintf(gTraceFile, "Redundancy Ratio = %f %% (%ld Bytes)\n", (*listIt).bytes * 100.0 / grandTotalRedundantBytes, (*listIt).bytes);
+
+        for(FPRedLogSizeMap::iterator it2 = (*pt->FPRedMap)[(*listIt).objID].begin(); it2 != (*pt->FPRedMap)[(*listIt).objID].end(); ++it2) {
+            uint64_t dfreq = 0;
+            uint64_t dread = 0;
+            uint64_t dsize = it2->first;
+            uint8_t  dtype = it2->second.typesz;
+            bitref_t accmap = &(it2->second.accmap);
+            bitref_t redmap = &(it2->second.redmap);
+
+            assert(accmap->size==dsize);
+            assert(accmap->size==redmap->size);
+
+            for(size_t i=0;i<accmap->size;++i) {
+                if(!bitvec_at(accmap, i)) {
+                    ++dread;
+                    if(bitvec_at(redmap, i)) ++dfreq;
+                    i += dtype-1; // each loop will increament 1
+                }
             }
-            dr_fprintf(gTraceFile, "\n===== [AccessLen=%d, typesize=%d] =======\n", (*listIt).accessLen, (*listIt).size);
-            dr_fprintf(gTraceFile, "\n---------------------Redundant load with---------------------------\n");
-            drcctlib_print_full_cct(gTraceFile, (*listIt).cntxt, true, true, MAX_DEPTH);
+                
+            dr_fprintf(gTraceFile, "\n\n======= DATA SIZE : ");
+            PrintSize(gTraceFile, dsize, " Elements");
+            dr_fprintf(gTraceFile, "( Not Accessed Data %f %% (%ld Reads), Redundant Data %f %% (%ld Reads) )", 
+                    (dsize-dread) * 100.0 / dsize, dsize-dread, 
+                    dfreq * 100.0 / dsize, dfreq);
+
+            dr_fprintf(gTraceFile, "\n======= Redundant byte map : [0] ");
+            uint32_t num=0;
+            for(size_t i=0;i<accmap->size;++i) {
+                if(!bitvec_at(accmap, i)) {
+                    if(bitvec_at(redmap, i)) {
+                        dr_fprintf(gTraceFile, "00 ");
+                    } else {
+                        dr_fprintf(gTraceFile, "XX ");
+                    }
+                } else {
+                    dr_fprintf(gTraceFile, "?? ");
+                }
+                ++num;
+                if(num>MAX_REDMAP_PRINT_SIZE) {
+                    dr_fprintf(gTraceFile, "... ");
+                    break;
+                }
+            }
         }
-        else {
-            break;
+#if 0
+        if(objNum<=MAX_PRINT_FULL) {
+            char fn[50] = {};
+            sprintf(fn,"%lx.redmap",(*listIt).objID);
+            file_t fp = dr_open(fn,"w");
+            if((uint8_t)DECODE_TYPE((*listIt).objID) == DYNAMIC_OBJECT) {
+                dr_fprintf(fp, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Dynamic Object: %lx^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n",(*listIt).objID);
+            } else  
+                dr_fprintf(fp, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s, %lx ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", GetStringFromStringPool((uint32_t)DECODE_NAME((*listIt).objID)),(*listIt).objID);
+            for(size_t i=0;i<accmap->size;++i) {
+                if(!bitvec_at(accmap, i)) {
+                    if(bitvec_at(redmap, i)) {
+                        dr_fprintf(fp, "00 ");
+                    } else {
+                        dr_fprintf(fp, "XX ");
+                    }
+                } else {
+                    dr_fprintf(fp, "?? ");
+                }
+            }
         }
-        cntxtNum++;
+#endif
     }
-    dr_fprintf(gTraceFile, "\n------------ Dumping Approximation Redundancy Info Finish -------------\n");
-    printf("Floating Point Report dumped\n");
-    fflush(stdout);
+    printf("\n[ZEROSPY INFO] Stage 2 Finish\n");
+
+    dr_fprintf(gTraceFile, "\n------------ Dumping Approx Redundancy Info Finish -------------\n");
     return grandTotalRedundantBytes;
-}
-/*******************************************************************/
-static uint64_t getThreadByteLoad(per_thread_t *pt) {
-    register uint64_t x = 0;
-    for (unordered_map<uint64_t, INTRedLogs>::iterator it = pt->INTRedMap->begin(); it != pt->INTRedMap->end(); ++it) {
-        x += (*it).second.tot;
-    }
-    for (unordered_map<uint64_t, FPRedLogs>::iterator it = pt->FPRedMap->begin(); it != pt->FPRedMap->end(); ++it) {
-        x += (*it).second.ftot * (*it).second.AccessLen;
-    }
-    return x;
 }
 /*******************************************************************/
 static void
@@ -1624,7 +1824,7 @@ ClientThreadEnd(void *drcontext)
 #endif
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
     if (pt->INTRedMap->empty() && pt->FPRedMap->empty()) return;
-    uint64_t threadByteLoad = getThreadByteLoad(pt);
+    uint64_t threadByteLoad = pt->bytesLoad;
     __sync_fetch_and_add(&grandTotBytesLoad,threadByteLoad);
     int threadId = drcctlib_get_thread_id();
     uint64_t threadRedByteLoadINT = PrintRedundancyPairs(pt, threadByteLoad, threadId);
@@ -1644,10 +1844,12 @@ ClientThreadEnd(void *drcontext)
     dr_close_file(pt->output_file);
     delete pt->INTRedMap;
     delete pt->FPRedMap;
+#ifdef ZEROSPY_DEBUG
     for(size_t i=0;i<pt->instr_clones->size();++i) {
         instr_destroy(drcontext, (*pt->instr_clones)[i]);
     }
     delete pt->instr_clones;
+#endif
 #ifdef DEBUG_REUSE
     dr_close_file(pt->log_file);
 #endif
@@ -1672,10 +1874,11 @@ ClientInit(int argc, const char *argv[])
     char name[MAXIMUM_PATH] = "x86-";
 #endif
     gethostname(name + strlen(name), MAXIMUM_PATH - strlen(name));
-    sprintf(name + strlen(name), "-%d-zerospy", pid);
+    sprintf(name + strlen(name), "-%d-zerospy-datacentric", pid);
     g_folder_name.assign(name, strlen(name));
     mkdir(g_folder_name.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
 
+    dr_fprintf(STDOUT, "[ZEROSPY INFO] Using Data Centric Zerospy\n");
     dr_fprintf(STDOUT, "[ZEROSPY INFO] Profiling result directory: %s\n", g_folder_name.c_str());
 
     sprintf(name+strlen(name), "/zerospy.log");
@@ -1727,13 +1930,13 @@ ClientExit(void)
     }
 #endif
     dr_close_file(gFile);
+    dr_mutex_destroy(gLock);
 #ifdef ENABLE_SAMPLING
     if (!dr_raw_tls_cfree(tls_offs, INSTRACE_TLS_COUNT)) {
         ZEROSPY_EXIT_PROCESS(
             "ERROR: zerospy dr_raw_tls_calloc fail");
     }
 #endif
-    dr_mutex_destroy(gLock);
     drcctlib_exit();
     if (!drmgr_unregister_thread_init_event(ClientThreadStart) ||
         !drmgr_unregister_thread_exit_event(ClientThreadEnd) ||
@@ -1800,8 +2003,9 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
 #endif
     gLock = dr_mutex_create();
 
-    // drcctlib_init(ZEROSPY_FILTER_READ_MEM_ACCESS_INSTR, INVALID_FILE, InstrumentInsCallback, false/*do data centric*/);
-    drcctlib_init_ex(ZEROSPY_FILTER_READ_MEM_ACCESS_INSTR, INVALID_FILE, InstrumentInsCallback, NULL, NULL, DRCCTLIB_CACHE_MODE);
+    // drcctlib_init(ZEROSPY_FILTER_READ_MEM_ACCESS_INSTR, INVALID_FILE, InstrumentInsCallback, true/*do data centric*/);
+    drcctlib_init_ex(ZEROSPY_FILTER_READ_MEM_ACCESS_INSTR, INVALID_FILE, InstrumentInsCallback, NULL, NULL,
+                     DRCCTLIB_COLLECT_DATA_CENTRIC_MESSAGE | DRCCTLIB_CACHE_MODE);
     dr_register_exit_event(ClientExit);
 }
 
