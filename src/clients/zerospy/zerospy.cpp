@@ -50,11 +50,14 @@ uint64_t get_miliseconds() {
 #define RATE_5_WIN(WINDOW) ((int64_t)(RATE_5*WINDOW))
 // Enumuration of WINDOWs
 #define WINDOW_NUM 5
-#define WINDOW_0 (1000000)
-#define WINDOW_1 (10000000)
-#define WINDOW_2 (100000000)
-#define WINDOW_3 (1000000000)
-#define WINDOW_4 (10000000000)
+#define WINDOW_0 (100000)
+#define WINDOW_1 (1000000)
+#define WINDOW_2 (10000000)
+#define WINDOW_3 (100000000)
+#define WINDOW_4 (1000000000)
+
+int window_enable;
+int window_disable;
 #endif
 
 // Client Options
@@ -92,14 +95,14 @@ const float conf2rate[RATE_NUM] = {
 };
 
 static droption_t<int> op_window
-(DROPTION_SCOPE_CLIENT, "window", 2, 0, WINDOW_NUM, "Window size configuration of sampling",
+(DROPTION_SCOPE_CLIENT, "window", 3, 0, WINDOW_NUM, "Window size configuration of sampling",
  "Window size of sampling. Only available when sampling is enabled."
  "Only the following configurations are valid:\n"
- "\t0: 1000000\n"
- "\t1: 10000000\n"
- "\t2: 100000000\n"
- "\t3: 1000000000\n"
- "\t4: 10000000000\n");
+ "\t0: 100000\n"
+ "\t1: 1000000\n"
+ "\t2: 10000000\n"
+ "\t3: 100000000\n"
+ "\t4: 1000000000\n");
 
 const uint64_t conf2window[WINDOW_NUM] = {
     WINDOW_0,
@@ -158,6 +161,16 @@ struct FPRedLogs{
 // maximum cct depth to print
 #define MAX_DEPTH 10
 
+enum {
+    INSTRACE_TLS_OFFS_BUF_PTR,
+    INSTRACE_TLS_COUNT, /* total number of TLS slots allocated */
+};
+
+static reg_id_t tls_seg;
+static uint tls_offs;
+#define TLS_SLOT(tls_base, enum_val) (void **)((byte *)(tls_base) + tls_offs + (enum_val))
+#define BUF_PTR(tls_base, type, offs) *(type **)TLS_SLOT(tls_base, offs)
+
 // 1M
 #define MAX_CLONE_INS 1048576
 typedef struct _per_thread_t {
@@ -165,11 +178,14 @@ typedef struct _per_thread_t {
     unordered_map<uint64_t, FPRedLogs > *FPRedMap;
     file_t output_file;
 #ifdef ENABLE_SAMPLING
-    long long numIns;
-    bool sampleFlag;
+    void* numInsBuff;
+    // long long numIns;
+    // bool sampleFlag;
 #endif
     vector<instr_t*> *instr_clones;
 } per_thread_t;
+
+#define IS_SAMPLED(pt, WINDOW_ENABLE) ((int64_t)(BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR))<(int64_t)WINDOW_ENABLE)
 
 file_t gFile;
 static void *gLock;
@@ -572,160 +588,269 @@ struct UnrolledConjunction<end , end , incr>{
 /*******************************************************************************************/
 
 #ifdef ENABLE_SAMPLING
-template<int64_t WINDOW_ENABLE, int64_t WINDOW_DISABLE, bool sampleFlag>
-struct BBSample {
-    static void update_per_bb(uint instruction_count, app_pc src)
-    {
+// template<int64_t WINDOW_ENABLE, int64_t WINDOW_DISABLE, bool sampleFlag>
+// struct BBSample {
+//     static void update_per_bb(uint instruction_count, app_pc src)
+//     {
+//         void *drcontext = dr_get_current_drcontext();
+//         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+//         pt->numIns += instruction_count;
+//         if(pt->sampleFlag) {
+//             if(pt->numIns > WINDOW_ENABLE) {
+//                 pt->sampleFlag = false;
+//             }
+//         } else {
+//             if(pt->numIns > WINDOW_DISABLE) {
+//                 pt->sampleFlag = true;
+//                 pt->numIns = 0;
+//             }
+//         }
+//         // If the sample flag is changed, flush the region and re-instrument
+//         if(pt->sampleFlag != sampleFlag) {
+//             dr_mcontext_t mcontext;
+//             mcontext.size = sizeof(mcontext);
+//             mcontext.flags = DR_MC_ALL;
+//             dr_flush_region(src, 1);
+//             dr_get_mcontext(drcontext, &mcontext);
+//             mcontext.pc = src;
+//             dr_redirect_execution(&mcontext);
+//         }
+//     }
+// };
+
+// void (*BBSampleTable[RATE_NUM][WINDOW_NUM][2])(uint, app_pc) = {
+//     {   {BBSample<RATE_0_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
+//         {BBSample<RATE_0_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
+//         {BBSample<RATE_0_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
+//         {BBSample<RATE_0_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
+//         {BBSample<RATE_0_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
+//     },
+//     {   {BBSample<RATE_1_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
+//         {BBSample<RATE_1_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
+//         {BBSample<RATE_1_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
+//         {BBSample<RATE_1_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
+//         {BBSample<RATE_1_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
+//     },
+//     {   {BBSample<RATE_2_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
+//         {BBSample<RATE_2_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
+//         {BBSample<RATE_2_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
+//         {BBSample<RATE_2_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
+//         {BBSample<RATE_2_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
+//     },
+//     {   {BBSample<RATE_3_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
+//         {BBSample<RATE_3_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
+//         {BBSample<RATE_3_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
+//         {BBSample<RATE_3_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
+//         {BBSample<RATE_3_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
+//     },
+//     {   {BBSample<RATE_4_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
+//         {BBSample<RATE_4_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
+//         {BBSample<RATE_4_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
+//         {BBSample<RATE_4_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
+//         {BBSample<RATE_4_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
+//     },
+//     {   {BBSample<RATE_5_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
+//         {BBSample<RATE_5_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
+//         {BBSample<RATE_5_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
+//         {BBSample<RATE_5_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
+//         {BBSample<RATE_5_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
+//     },
+// };
+// void (*BBSample_target[2])(uint, app_pc);
+
+// template<int64_t WINDOW_ENABLE, int64_t WINDOW_DISABLE>
+// struct BBSampleNoFlush {
+//     static void update_per_bb(uint instruction_count)
+//     {
+//         void *drcontext = dr_get_current_drcontext();
+//         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+//         pt->numIns += instruction_count;
+//         if(pt->sampleFlag) {
+//             if(pt->numIns > WINDOW_ENABLE) {
+//                 pt->sampleFlag = false;
+//             }
+//         } else {
+//             if(pt->numIns > WINDOW_DISABLE) {
+//                 pt->sampleFlag = true;
+//                 pt->numIns = 0;
+//             }
+//         }
+//     }
+// };
+
+// void (*BBSampleNoFlushTable[RATE_NUM][WINDOW_NUM])(uint) {
+//     {   BBSampleNoFlush<RATE_0_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
+//         BBSampleNoFlush<RATE_0_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
+//         BBSampleNoFlush<RATE_0_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
+//         BBSampleNoFlush<RATE_0_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
+//         BBSampleNoFlush<RATE_0_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
+//     },
+//     {   BBSampleNoFlush<RATE_1_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
+//         BBSampleNoFlush<RATE_1_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
+//         BBSampleNoFlush<RATE_1_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
+//         BBSampleNoFlush<RATE_1_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
+//         BBSampleNoFlush<RATE_1_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
+//     },
+//     {   BBSampleNoFlush<RATE_2_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
+//         BBSampleNoFlush<RATE_2_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
+//         BBSampleNoFlush<RATE_2_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
+//         BBSampleNoFlush<RATE_2_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
+//         BBSampleNoFlush<RATE_2_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
+//     },
+//     {   BBSampleNoFlush<RATE_3_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
+//         BBSampleNoFlush<RATE_3_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
+//         BBSampleNoFlush<RATE_3_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
+//         BBSampleNoFlush<RATE_3_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
+//         BBSampleNoFlush<RATE_3_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
+//     },
+//     {   BBSampleNoFlush<RATE_4_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
+//         BBSampleNoFlush<RATE_4_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
+//         BBSampleNoFlush<RATE_4_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
+//         BBSampleNoFlush<RATE_4_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
+//         BBSampleNoFlush<RATE_4_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
+//     },
+//     {   BBSampleNoFlush<RATE_5_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
+//         BBSampleNoFlush<RATE_5_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
+//         BBSampleNoFlush<RATE_5_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
+//         BBSampleNoFlush<RATE_5_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
+//         BBSampleNoFlush<RATE_5_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
+//     },
+// };
+// void (*BBSampleNoFlush_target)(uint);
+
+
+#ifdef x86_CCTLIB
+#define RESERVE_AFLAGS(dead, bb, ins) do { \
+    assert(drreg_are_aflags_dead(drcontext, ins, &dead)==DRREG_SUCCESS); \
+    if(!dead) assert(drreg_reserve_aflags (drcontext, bb, ins)==DRREG_SUCCESS); \
+} while(0)
+#define UNRESERVE_AFLAGS(dead, bb, ins) do {if(!dead)  assert(drreg_unreserve_aflags (drcontext, bb, ins)==DRREG_SUCCESS);} while(0)
+#else
+#define RESERVE_AFLAGS(dead, bb, ins)
+#define UNRESERVE_AFLAGS(dead, bb, ins)
+#endif
+
+// sample wrapper for sampling without code flush
+#define SAMPLED_CLEAN_CALL(insert_clean_call) do { \
+    bool dead; \
+    reg_id_t reg_ptr; \
+    RESERVE_AFLAGS(dead, bb, ins); \
+    assert(drreg_reserve_register(drcontext, bb, ins, NULL, &reg_ptr)==DRREG_SUCCESS); \
+    dr_insert_read_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);\
+    MINSERT(bb, ins, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_INT32(window_enable))); \
+    instr_t* restore = INSTR_CREATE_label(drcontext); \
+    MINSERT(bb, ins, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(restore))); \
+    { insert_clean_call; } \
+    MINSERT(bb, ins, restore); \
+    assert(drreg_unreserve_register(drcontext, bb, ins, reg_ptr)==DRREG_SUCCESS); \
+    UNRESERVE_AFLAGS(dead, bb, ins); \
+} while(0)
+
+// static int cnt = 0;
+
+struct BBSampleInstrument {
+    static void bb_flush_code(app_pc src) {
+        // printf("%d Flushed!\n", cnt++); fflush(stdout);
         void *drcontext = dr_get_current_drcontext();
+        dr_mcontext_t mcontext;
+        mcontext.size = sizeof(mcontext);
+        mcontext.flags = DR_MC_ALL;
+        // flush all fragments in code cache
+        dr_flush_region(0, ~((ptr_uint_t)0));
+        dr_get_mcontext(drcontext, &mcontext);
+        mcontext.pc = src;
+        dr_redirect_execution(&mcontext);
+    }
+
+    static void insertBBSample(void* drcontext, instrlist_t *ilist, instr_t *where, int insCnt) {
+        static_assert(sizeof(void*)==8);
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-        pt->numIns += instruction_count;
-        if(pt->sampleFlag) {
-            if(pt->numIns > WINDOW_ENABLE) {
-                pt->sampleFlag = false;
-            }
+        bool af_dead, reg_dead; 
+        reg_id_t reg_ptr;
+        RESERVE_AFLAGS(af_dead, ilist, where);
+        assert(drreg_reserve_register(drcontext, ilist, where, NULL, &reg_ptr)==DRREG_SUCCESS);
+        assert(drreg_is_register_dead(drcontext, reg_ptr, where, &reg_dead)==DRREG_SUCCESS);
+        dr_insert_read_raw_tls(drcontext, ilist, where, tls_seg,
+                            tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
+        MINSERT(ilist, where, XINST_CREATE_add(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_INT32(insCnt)));
+        MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_INT32(window_disable)));
+        // Clear insCnt when insCnt > WINDOW_DISABLE
+        instr_t* skipclear = INSTR_CREATE_label(drcontext);
+        MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(skipclear)));
+        MINSERT(ilist, where, INSTR_CREATE_xor(drcontext, opnd_create_reg(reg_ptr), opnd_create_reg(reg_ptr)));
+        MINSERT(ilist, where, skipclear);
+        dr_insert_write_raw_tls(drcontext, ilist, where, tls_seg,
+                            tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
+        instr_t* restore = INSTR_CREATE_label(drcontext);
+        // printf("%ld: %d\n", (int64_t)(BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR)), IS_SAMPLED(pt, window_enable));
+        if(IS_SAMPLED(pt, window_enable)) {
+            // fall to code flush when insCnt > WINDOW_ENABLE
+            MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_INT32(window_enable)));
+            MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(restore)));
         } else {
-            if(pt->numIns > WINDOW_DISABLE) {
-                pt->sampleFlag = true;
-                pt->numIns = 0;
-            }
+            // fall to code flush when insCnt > WINDOW_DISABLE (check if cleared)
+            MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_INT32(0)));
+            MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_NZ, opnd_create_instr(restore)));
         }
-        // If the sample flag is changed, flush the region and re-instrument
-        if(pt->sampleFlag != sampleFlag) {
-            dr_mcontext_t mcontext;
-            mcontext.size = sizeof(mcontext);
-            mcontext.flags = DR_MC_ALL;
-            dr_flush_region(src, 1);
-            dr_get_mcontext(drcontext, &mcontext);
-            mcontext.pc = src;
-            dr_redirect_execution(&mcontext);
-        }
+        if(!af_dead ) assert(drreg_restore_app_aflags(drcontext, ilist, where)==DRREG_SUCCESS);
+        if(!reg_dead) assert(drreg_get_app_value(drcontext, ilist, where, reg_ptr, reg_ptr)==DRREG_SUCCESS);
+        dr_insert_clean_call(drcontext, ilist, where, (void *)BBSampleInstrument::bb_flush_code, false, 1, OPND_CREATE_INTPTR(instr_get_app_pc(where)));
+        MINSERT(ilist, where, restore);
+        assert(drreg_unreserve_register(drcontext, ilist, where, reg_ptr)==DRREG_SUCCESS);
+        UNRESERVE_AFLAGS(af_dead, ilist, where);
+    }
+
+    static void insertBBSampleNoFlush(void* drcontext, instrlist_t *ilist, instr_t *where, int insCnt) {
+        static_assert(sizeof(void*)==8);
+        bool dead; 
+        reg_id_t reg_ptr; 
+        RESERVE_AFLAGS(dead, ilist, where);
+        assert(drreg_reserve_register(drcontext, ilist, where, NULL, &reg_ptr)==DRREG_SUCCESS);
+        dr_insert_read_raw_tls(drcontext, ilist, where, tls_seg,
+                            tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
+        MINSERT(ilist, where, XINST_CREATE_add(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_INT32(insCnt)));
+        MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_INT32(window_disable)));
+        instr_t* skipclear = INSTR_CREATE_label(drcontext);
+        MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(skipclear)));
+        MINSERT(ilist, where, INSTR_CREATE_xor(drcontext, opnd_create_reg(reg_ptr), opnd_create_reg(reg_ptr)));
+        MINSERT(ilist, where, skipclear);
+        dr_insert_write_raw_tls(drcontext, ilist, where, tls_seg,
+                            tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
+        assert(drreg_unreserve_register(drcontext, ilist, where, reg_ptr)==DRREG_SUCCESS);
+        UNRESERVE_AFLAGS(dead, ilist, where);
     }
 };
-
-void (*BBSampleTable[RATE_NUM][WINDOW_NUM][2])(uint, app_pc) = {
-    {   {BBSample<RATE_0_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
-        {BBSample<RATE_0_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
-        {BBSample<RATE_0_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
-        {BBSample<RATE_0_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
-        {BBSample<RATE_0_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
-    },
-    {   {BBSample<RATE_1_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
-        {BBSample<RATE_1_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
-        {BBSample<RATE_1_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
-        {BBSample<RATE_1_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
-        {BBSample<RATE_1_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
-    },
-    {   {BBSample<RATE_2_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
-        {BBSample<RATE_2_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
-        {BBSample<RATE_2_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
-        {BBSample<RATE_2_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
-        {BBSample<RATE_2_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
-    },
-    {   {BBSample<RATE_3_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
-        {BBSample<RATE_3_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
-        {BBSample<RATE_3_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
-        {BBSample<RATE_3_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
-        {BBSample<RATE_3_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
-    },
-    {   {BBSample<RATE_4_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
-        {BBSample<RATE_4_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
-        {BBSample<RATE_4_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
-        {BBSample<RATE_4_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
-        {BBSample<RATE_4_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
-    },
-    {   {BBSample<RATE_5_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
-        {BBSample<RATE_5_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
-        {BBSample<RATE_5_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
-        {BBSample<RATE_5_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
-        {BBSample<RATE_5_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
-    },
-};
-void (*BBSample_target[2])(uint, app_pc);
-
-template<int64_t WINDOW_ENABLE, int64_t WINDOW_DISABLE>
-struct BBSampleNoFlush {
-    static void update_per_bb(uint instruction_count)
-    {
-        void *drcontext = dr_get_current_drcontext();
-        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-        pt->numIns += instruction_count;
-        if(pt->sampleFlag) {
-            if(pt->numIns > WINDOW_ENABLE) {
-                pt->sampleFlag = false;
-            }
-        } else {
-            if(pt->numIns > WINDOW_DISABLE) {
-                pt->sampleFlag = true;
-                pt->numIns = 0;
-            }
-        }
-    }
-};
-
-void (*BBSampleNoFlushTable[RATE_NUM][WINDOW_NUM])(uint) {
-    {   BBSampleNoFlush<RATE_0_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
-        BBSampleNoFlush<RATE_0_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
-        BBSampleNoFlush<RATE_0_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
-        BBSampleNoFlush<RATE_0_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
-        BBSampleNoFlush<RATE_0_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
-    },
-    {   BBSampleNoFlush<RATE_1_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
-        BBSampleNoFlush<RATE_1_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
-        BBSampleNoFlush<RATE_1_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
-        BBSampleNoFlush<RATE_1_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
-        BBSampleNoFlush<RATE_1_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
-    },
-    {   BBSampleNoFlush<RATE_2_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
-        BBSampleNoFlush<RATE_2_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
-        BBSampleNoFlush<RATE_2_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
-        BBSampleNoFlush<RATE_2_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
-        BBSampleNoFlush<RATE_2_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
-    },
-    {   BBSampleNoFlush<RATE_3_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
-        BBSampleNoFlush<RATE_3_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
-        BBSampleNoFlush<RATE_3_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
-        BBSampleNoFlush<RATE_3_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
-        BBSampleNoFlush<RATE_3_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
-    },
-    {   BBSampleNoFlush<RATE_4_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
-        BBSampleNoFlush<RATE_4_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
-        BBSampleNoFlush<RATE_4_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
-        BBSampleNoFlush<RATE_4_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
-        BBSampleNoFlush<RATE_4_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
-    },
-    {   BBSampleNoFlush<RATE_5_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
-        BBSampleNoFlush<RATE_5_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
-        BBSampleNoFlush<RATE_5_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
-        BBSampleNoFlush<RATE_5_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
-        BBSampleNoFlush<RATE_5_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
-    },
-};
-void (*BBSampleNoFlush_target)(uint);
 
 static dr_emit_flags_t
 event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, bool translating, OUT void **user_data)
 {
-    uint num_instructions = 0;
+    int num_instructions = 0;
     instr_t *instr;
     /* count the number of instructions in this block */
     for (instr = instrlist_first(bb); instr != NULL; instr = instr_get_next(instr)) {
         num_instructions++;
     }
+    assert(num_instructions>=0);
+    if(num_instructions==0) {
+        return DR_EMIT_DEFAULT;
+    }
     /* insert clean call */
     if(op_no_flush.get_value()) {
-        dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSampleNoFlush_target, false, 1, 
-                            OPND_CREATE_INT32(num_instructions));
+        BBSampleInstrument::insertBBSampleNoFlush(drcontext, bb, instrlist_first(bb), num_instructions);
+        // dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSampleNoFlush_target, false, 1, 
+        //                     OPND_CREATE_INT32(num_instructions));
     } else {
-        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-        if(pt->sampleFlag) {
-            dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSample_target[1], false, 2, 
-                            OPND_CREATE_INT32(num_instructions), 
-                            OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
-        } else {
-            dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSample_target[0], false, 2, 
-                            OPND_CREATE_INT32(num_instructions), 
-                            OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
-        }
+        BBSampleInstrument::insertBBSample(drcontext, bb, instrlist_first(bb), num_instructions);
+        // per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+        // if(pt->sampleFlag) {
+        //     dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSample_target[1], false, 2, 
+        //                     OPND_CREATE_INT32(num_instructions), 
+        //                     OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
+        // } else {
+        //     dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSample_target[0], false, 2, 
+        //                     OPND_CREATE_INT32(num_instructions), 
+        //                     OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
+        // }
     }
     return DR_EMIT_DEFAULT;
 }
@@ -741,13 +866,13 @@ struct ZeroSpyAnalysis{
     {
         void *drcontext = dr_get_current_drcontext();
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-#ifdef ENABLE_SAMPLING
-        if(enable_sampling) {
-            if(!pt->sampleFlag) {
-                return ;
-            }
-        }
-#endif
+// #ifdef ENABLE_SAMPLING
+//         if(enable_sampling) {
+//             if(!pt->sampleFlag) {
+//                 return ;
+//             }
+//         }
+// #endif
 // #ifdef ZEROSPY_DEBUG
 //         byte* base;
 //         size_t size;
@@ -796,13 +921,13 @@ struct ZeroSpyAnalysis{
     {
         void *drcontext = dr_get_current_drcontext();
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-#ifdef ENABLE_SAMPLING
-        if(enable_sampling) {
-            if(!pt->sampleFlag) {
-                return ;
-            }
-        }
-#endif
+// #ifdef ENABLE_SAMPLING
+//         if(enable_sampling) {
+//             if(!pt->sampleFlag) {
+//                 return ;
+//             }
+//         }
+// #endif
         dr_mcontext_t mcontext;
         mcontext.size = sizeof(mcontext);
         mcontext.flags= DR_MC_ALL;
@@ -842,13 +967,13 @@ static inline void CheckAfterLargeRead(int32_t slot, void* addr, uint32_t access
 {
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-#ifdef ENABLE_SAMPLING
-    if(enable_sampling) {
-        if(!pt->sampleFlag) {
-            return ;
-        }
-    }
-#endif
+// #ifdef ENABLE_SAMPLING
+//     if(enable_sampling) {
+//         if(!pt->sampleFlag) {
+//             return ;
+//         }
+//     }
+// #endif
     context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
     uint8_t* bytes = static_cast<uint8_t*>(addr);
     // quick check whether the most significant byte of the read memory is redundant zero or not
@@ -928,13 +1053,13 @@ static inline void CheckAfterLargeRead(int32_t slot, void* addr, uint32_t access
 #define HANDLE_CASE(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) \
 do { \
 if(op_no_flush.get_value()) \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_INTPTR(ins_clone)); } else \
+{ SAMPLED_CLEAN_CALL(dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_INTPTR(ins_clone))); } else \
 { dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_INTPTR(ins_clone)); } } while(0)
 #else
 #define HANDLE_CASE(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) \
 do { \
 if(op_no_flush.get_value()) \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg)); } else \
+{ SAMPLED_CLEAN_CALL(dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg))); } else \
 { dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg)); } } while(0)
 
 #endif
@@ -942,14 +1067,14 @@ if(op_no_flush.get_value()) \
 #define HANDLE_LARGE() \
 do { \
 if(op_no_flush.get_value()) \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead<true/*sample*/>, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize)); } else \
+{ SAMPLED_CLEAN_CALL(dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead<true/*sample*/>, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize))); } else \
 { dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead<false/* not */>, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize)); } } while(0)
 
 #ifdef X86
 #define HANDLE_VGATHER(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX, ins) \
 do { \
 if(op_no_flush.get_value()) \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterVGather, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone)); } else\
+{ SAMPLED_CLEAN_CALL(dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterVGather, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone))); } else\
 { dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterVGather, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone)); } } while (0)
 #endif
 
@@ -1203,7 +1328,7 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
     if( op_enable_sampling.get_value() && 
        !op_no_flush.get_value() && 
-       !pt->sampleFlag) {
+       !IS_SAMPLED(pt, window_enable)) {
            return;
     }
     // extract data from drcctprof's given message
@@ -1270,8 +1395,10 @@ ClientThreadStart(void *drcontext)
     pt->INTRedMap->rehash(10000000);
     pt->FPRedMap->rehash(10000000);
 #ifdef ENABLE_SAMPLING
-    pt->numIns = 0;
-    pt->sampleFlag = true;
+    // pt->numIns = 0;
+    // pt->sampleFlag = true;
+    pt->numInsBuff = dr_get_dr_segment_base(tls_seg);
+    BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR) = 0;
 #endif
     drmgr_set_tls_field(drcontext, tls_idx, (void *)pt);
     ThreadOutputFileInit(pt);
@@ -1563,9 +1690,11 @@ ClientInit(int argc, const char *argv[])
         }
         dr_fprintf(STDOUT, "[ZEROSPU INFO] Sampling Rate: %.3f, Window Size: %ld\n", conf2rate[op_rate.get_value()], conf2window[op_window.get_value()]);
         dr_fprintf(gFile,  "[ZEROSPU INFO] Sampling Rate: %.3f, Window Size: %ld\n", conf2rate[op_rate.get_value()], conf2window[op_window.get_value()]);
-        BBSample_target[0] = BBSampleTable[op_rate.get_value()][op_window.get_value()][0];
-        BBSample_target[1] = BBSampleTable[op_rate.get_value()][op_window.get_value()][1];
-        BBSampleNoFlush_target = BBSampleNoFlushTable[op_rate.get_value()][op_window.get_value()];
+        window_enable = conf2rate[op_rate.get_value()] * conf2window[op_window.get_value()];
+        window_disable= conf2window[op_window.get_value()];
+        // BBSample_target[0] = BBSampleTable[op_rate.get_value()][op_window.get_value()][0];
+        // BBSample_target[1] = BBSampleTable[op_rate.get_value()][op_window.get_value()][1];
+        // BBSampleNoFlush_target = BBSampleNoFlushTable[op_rate.get_value()][op_window.get_value()];
     }
     if (op_help.get_value()) {
         dr_fprintf(STDOUT, "%s\n", droption_parser_t::usage_long(DROPTION_SCOPE_CLIENT).c_str());
@@ -1598,6 +1727,12 @@ ClientExit(void)
     }
 #endif
     dr_close_file(gFile);
+#ifdef ENABLE_SAMPLING
+    if (!dr_raw_tls_cfree(tls_offs, INSTRACE_TLS_COUNT)) {
+        ZEROSPY_EXIT_PROCESS(
+            "ERROR: zerospy dr_raw_tls_calloc fail");
+    }
+#endif
     dr_mutex_destroy(gLock);
     drcctlib_exit();
     if (!drmgr_unregister_thread_init_event(ClientThreadStart) ||
@@ -1657,10 +1792,16 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     if (tls_idx == -1) {
         ZEROSPY_EXIT_PROCESS("ERROR: zerospy drmgr_register_tls_field fail");
     }
-
+#ifdef ENABLE_SAMPLING
+    if (!dr_raw_tls_calloc(&tls_seg, &tls_offs, INSTRACE_TLS_COUNT, 0)) {
+        ZEROSPY_EXIT_PROCESS(
+            "ERROR: zerospy dr_raw_tls_calloc fail");
+    }
+#endif
     gLock = dr_mutex_create();
 
-    drcctlib_init(ZEROSPY_FILTER_READ_MEM_ACCESS_INSTR, INVALID_FILE, InstrumentInsCallback, false/*do data centric*/);
+    // drcctlib_init(ZEROSPY_FILTER_READ_MEM_ACCESS_INSTR, INVALID_FILE, InstrumentInsCallback, false/*do data centric*/);
+    drcctlib_init_ex(ZEROSPY_FILTER_READ_MEM_ACCESS_INSTR, INVALID_FILE, InstrumentInsCallback, NULL, NULL, DRCCTLIB_CACHE_MODE);
     dr_register_exit_event(ClientExit);
 }
 

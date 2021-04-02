@@ -2997,6 +2997,7 @@ DR_EXPORT
 context_handle_t
 drcctlib_get_context_handle(void *drcontext, int32_t slot){
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+    IF_CCTLIB_64_CCTLIB(refresh_per_thread_cct_tree(drcontext, pt);)
     if (slot >= pt->cur_bb_node->max_slots) {
         DRCCTLIB_EXIT_PROCESS("slot > cur_bb_node->max_slots");
     }
