@@ -746,11 +746,8 @@ struct UnrolledConjunction<end , end , incr>{
     UNRESERVE_AFLAGS(dead, bb, ins); \
 } while(0)
 
-// static int cnt = 0;
-
 struct BBSampleInstrument {
     static void bb_flush_code(app_pc src) {
-        // printf("%d Flushed!\n", cnt++); fflush(stdout);
         void *drcontext = dr_get_current_drcontext();
         dr_mcontext_t mcontext;
         mcontext.size = sizeof(mcontext);
@@ -765,32 +762,48 @@ struct BBSampleInstrument {
     static void insertBBSample(void* drcontext, instrlist_t *ilist, instr_t *where, int insCnt) {
         static_assert(sizeof(void*)==8);
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-        bool af_dead, reg_dead; 
+        bool af_dead=false, reg_dead=false; 
         reg_id_t reg_ptr;
         RESERVE_AFLAGS(af_dead, ilist, where);
         assert(drreg_reserve_register(drcontext, ilist, where, NULL, &reg_ptr)==DRREG_SUCCESS);
         assert(drreg_is_register_dead(drcontext, reg_ptr, where, &reg_dead)==DRREG_SUCCESS);
         dr_insert_read_raw_tls(drcontext, ilist, where, tls_seg,
                             tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
-        MINSERT(ilist, where, XINST_CREATE_add(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_INT32(insCnt)));
-        MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_INT32(window_disable)));
+        MINSERT(ilist, where, XINST_CREATE_add(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(insCnt)));
+        MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(window_disable)));
         // Clear insCnt when insCnt > WINDOW_DISABLE
+#ifdef ARM_CCTLIB
+    #ifdef USE_CMOV
+        // MOVLE $reg_ptr, #0
+        INSTR_PRED(instr_create_1dst_1src((drcontext), (OP_mov), (opnd_create_reg(reg_ptr)), (OPND_CREATE_CCT_INT(0))), DR_PRED_LE);
+    #else
+        instr_t* skipclear = INSTR_CREATE_label(drcontext);
+        MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(skipclear)));
+        MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(0)));
+        MINSERT(ilist, where, skipclear);
+    #endif
+#else
         instr_t* skipclear = INSTR_CREATE_label(drcontext);
         MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(skipclear)));
         MINSERT(ilist, where, INSTR_CREATE_xor(drcontext, opnd_create_reg(reg_ptr), opnd_create_reg(reg_ptr)));
         MINSERT(ilist, where, skipclear);
+#endif
         dr_insert_write_raw_tls(drcontext, ilist, where, tls_seg,
                             tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
         instr_t* restore = INSTR_CREATE_label(drcontext);
         // printf("%ld: %d\n", (int64_t)(BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR)), IS_SAMPLED(pt, window_enable));
         if(IS_SAMPLED(pt, window_enable)) {
             // fall to code flush when insCnt > WINDOW_ENABLE
-            MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_INT32(window_enable)));
+            MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(window_enable)));
             MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(restore)));
         } else {
             // fall to code flush when insCnt > WINDOW_DISABLE (check if cleared)
-            MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_INT32(0)));
+            MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(0)));
+#ifdef ARM_CCTLIB
+            MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_NE, opnd_create_instr(restore)));
+#else
             MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_NZ, opnd_create_instr(restore)));
+#endif
         }
         if(!af_dead ) assert(drreg_restore_app_aflags(drcontext, ilist, where)==DRREG_SUCCESS);
         if(!reg_dead) assert(drreg_get_app_value(drcontext, ilist, where, reg_ptr, reg_ptr)==DRREG_SUCCESS);
@@ -808,11 +821,15 @@ struct BBSampleInstrument {
         assert(drreg_reserve_register(drcontext, ilist, where, NULL, &reg_ptr)==DRREG_SUCCESS);
         dr_insert_read_raw_tls(drcontext, ilist, where, tls_seg,
                             tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
-        MINSERT(ilist, where, XINST_CREATE_add(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_INT32(insCnt)));
-        MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_INT32(window_disable)));
+        MINSERT(ilist, where, XINST_CREATE_add(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(insCnt)));
+        MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(window_disable)));
         instr_t* skipclear = INSTR_CREATE_label(drcontext);
         MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(skipclear)));
+#ifdef ARM_CCTLIB
+        MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(0)));
+#else
         MINSERT(ilist, where, INSTR_CREATE_xor(drcontext, opnd_create_reg(reg_ptr), opnd_create_reg(reg_ptr)));
+#endif
         MINSERT(ilist, where, skipclear);
         dr_insert_write_raw_tls(drcontext, ilist, where, tls_seg,
                             tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
