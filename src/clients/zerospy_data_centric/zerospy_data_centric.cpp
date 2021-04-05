@@ -1,10 +1,13 @@
 #include <unordered_map>
 #include <vector>
+#include <list>
 #include <string>
 #include <sys/stat.h>
 #include <assert.h>
 #include <algorithm>
 
+#define ARM_CCTLIB
+#define ARM64_CCTLIB
 // #define ZEROSPY_DEBUG
 #define _WERROR
 
@@ -22,10 +25,14 @@ uint64_t get_miliseconds() {
 #include "drmgr.h"
 #include "drreg.h"
 #include "drutil.h"
+// enable data centric with addr info
+#define DRCCTLIB_USE_ADDR
 #include "drcctlib.h"
 #include "utils.h"
+#include "bitvec.h"
 
 #define ENABLE_SAMPLING 1
+//#define USE_CLEANCALL
 #ifdef ENABLE_SAMPLING
 // different frequency configurations:
 //      Rate:   1/10, 1/100, 1/1000, 5/10, 5/100, 5/1000
@@ -55,9 +62,10 @@ uint64_t get_miliseconds() {
 #define WINDOW_2 (10000000)
 #define WINDOW_3 (100000000)
 #define WINDOW_4 (1000000000)
-
-int window_enable;
-int window_disable;
+#ifndef USE_CLEANCALL
+    int window_enable;
+    int window_disable;
+#endif
 #endif
 
 // Client Options
@@ -125,6 +133,16 @@ using namespace std;
 #    define OPND_CREATE_CCT_INT OPND_CREATE_INT32
 #endif
 
+#ifdef ARM_CCTLIB
+#    define OPND_CREATE_IMMEDIATE_INT OPND_CREATE_INT
+#else
+#    ifdef CCTLIB_64
+#        define OPND_CREATE_IMMEDIATE_INT OPND_CREATE_INT64
+#    else
+#        define OPND_CREATE_IMMEDIATE_INT OPND_CREATE_INT32
+#    endif
+#endif
+
 // We only interest in memory loads
 bool
 zerospy_filter_read_mem_access_instr(instr_t *instr)
@@ -137,26 +155,43 @@ zerospy_filter_read_mem_access_instr(instr_t *instr)
 static string g_folder_name;
 static int tls_idx;
 
-struct INTRedLogs{
-    uint64_t tot;
-    uint64_t red;
-    uint64_t fred; // full redundancy
-    uint64_t redByteMap;
+struct RedLogs{
+    uint64_t red;  // how many byte zero
+    bitvec_t redmap; // bitmap logging if a byte is redundant
+    bitvec_t accmap; // bitmap logging if a byte is accessed
 };
+
+typedef unordered_map<uint64_t, RedLogs> RedLogSizeMap;
+typedef unordered_map<uint64_t, RedLogSizeMap> RedLogMap;
 
 struct FPRedLogs{
-    uint64_t fred; // full redundancy
-    uint64_t ftot;
-    uint64_t redByteMap;
-    uint8_t AccessLen;
-    uint8_t size;
+    uint64_t red;  // how many byte zero
+    bitvec_t redmap; // bitmap logging if a byte is redundant
+    bitvec_t accmap; // bitmap logging if a byte is accessed
+    uint8_t typesz;
 };
 
+typedef unordered_map<uint64_t, FPRedLogs> FPRedLogSizeMap;
+typedef unordered_map<uint64_t, FPRedLogSizeMap> FPRedLogMap;
+
 #define MINSERT instrlist_meta_preinsert
-#define DECODE_DEAD(data) static_cast<uint8_t>(((data)  & 0xffffffffffffffff) >> 32 )
-#define DECODE_KILL(data) (static_cast<context_handle_t>( (data)  & 0x00000000ffffffff))
-#define MAKE_CONTEXT_PAIR(a, b) (((uint64_t)(a) << 32) | ((uint64_t)(b)))
+#define MAKE_OBJID(a, b) (((uint64_t)(a)<<32) | (b))
+#define DECODE_TYPE(a) (((uint64_t)(a)&(0xffffffffffffffff))>>32)
+#define DECODE_NAME(b) ((uint64_t)(b)&(0x00000000ffffffff))
+
+#define MAKE_CNTXT(a, b, c) (((uint64_t)(a)<<32) | ((uint64_t)(b)<<16) | (uint64_t)(c))
+#define DECODE_CNTXT(a) (static_cast<ContextHandle_t>((((a)&(0xffffffffffffffff))>>32)))
+#define DECODE_ACCLN(b) (((uint64_t)(b)&(0x00000000ffff0000))>>16)
+#define DECODE_TYPSZ(c)  ((uint64_t)(c)&(0x000000000000ffff))
+
+#define MAX_OBJS_TO_LOG 100
+
 #define delta 0.01
+
+#define CACHE_LINE_SIZE (64)
+#ifndef PAGE_SIZE
+#define PAGE_SIZE (4*1024)
+#endif
 #define MAX_REDUNDANT_CONTEXTS_TO_LOG (1000)
 // maximum cct depth to print
 #define MAX_DEPTH 10
@@ -174,18 +209,28 @@ static uint tls_offs;
 // 1M
 #define MAX_CLONE_INS 1048576
 typedef struct _per_thread_t {
-    unordered_map<uint64_t, INTRedLogs> *INTRedMap;
-    unordered_map<uint64_t, FPRedLogs > *FPRedMap;
+    RedLogMap *INTRedMap;
+    FPRedLogMap *FPRedMap;
     file_t output_file;
+    uint64_t bytesLoad;
 #ifdef ENABLE_SAMPLING
-    void* numInsBuff;
-    // long long numIns;
-    // bool sampleFlag;
+    #ifdef USE_CLEANCALL
+        long long numIns;
+        bool sampleFlag;
+    #else
+        void* numInsBuff;
+    #endif
 #endif
+#ifdef ZEROSPY_DEBUG
     vector<instr_t*> *instr_clones;
+#endif
 } per_thread_t;
 
+#ifdef USE_CLEANCALL
+#define IS_SAMPLED(pt, WINDOW_ENABLE) (pt->sampleFlag)
+#else
 #define IS_SAMPLED(pt, WINDOW_ENABLE) ((int64_t)(BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR))<(int64_t)WINDOW_ENABLE)
+#endif
 
 file_t gFile;
 static void *gLock;
@@ -203,39 +248,107 @@ uint64_t grandTotBytesRedLoad = 0;
 uint64_t grandTotBytesApproxRedLoad = 0;
 
 /*******************************************************************************************/
-static inline void AddToRedTable(uint64_t key,  uint16_t value, uint64_t byteMap, uint16_t total, per_thread_t *pt) __attribute__((always_inline,flatten));
-static inline void AddToRedTable(uint64_t key,  uint16_t value, uint64_t byteMap, uint16_t total, per_thread_t *pt) {
-    unordered_map<uint64_t, INTRedLogs>::iterator it = pt->INTRedMap->find(key);
-    if ( it  == pt->INTRedMap->end()) {
-        INTRedLogs log;
+// TODO: May be further optimized by combining size and data hndl to avoid one more mapping
+static inline void AddToRedTable(uint64_t addr, data_handle_t data, uint16_t value, uint16_t total, uint32_t redmap, per_thread_t *pt) __attribute__((always_inline,flatten));
+static inline void AddToRedTable(uint64_t addr, data_handle_t data, uint16_t value, uint16_t total, uint32_t redmap, per_thread_t *pt) {
+    assert(addr<=(uint64_t)data.end_addr);
+    size_t offset = addr-(uint64_t)data.beg_addr;
+    uint64_t key = MAKE_OBJID(data.object_type,data.sym_name);
+    RedLogMap::iterator it2 = pt->INTRedMap->find(key);
+    RedLogSizeMap::iterator it;
+    size_t size = (uint64_t)data.end_addr - (uint64_t)data.beg_addr;
+    if ( it2  == pt->INTRedMap->end() || (it = it2->second.find(size)) == it2->second.end()) {
+        RedLogs log;
         log.red = value;
-        log.tot = total;
-        log.fred= (value==total);
-        log.redByteMap = byteMap;
-        (*pt->INTRedMap)[key] = log;
+#ifdef DEBUG_CHECK
+        if(offset+total>size) {
+            printf("AddToRedTable 1: offset=%ld, total=%d, size=%ld\n", offset, total, size);
+            if(data.object_type == DYNAMIC_OBJECT) {
+                printf("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Dynamic Object: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                drcctlib_print_full_cct(STDOUT, data.sym_name, true, true, MAX_DEPTH);
+            } else {
+                printf("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", drcctlib_get_str_from_strpool((uint32_t)data.sym_name));
+            }
+        }
+#endif
+        bitvec_alloc(&log.redmap, size);
+        bitvec_and(&log.redmap, redmap, offset, total);
+        bitvec_alloc(&log.accmap, size);
+        bitvec_and(&log.accmap, 0, offset, total);
+        (*pt->INTRedMap)[key][size] = log;
     } else {
+        assert(it->second.redmap.size==it->second.accmap.size);
+        assert(size == it->second.redmap.size);
+#ifdef DEBUG_CHECK
+        if(offset+total>size) {
+            printf("AddToRedTable 2: offset=%ld, total=%d, size=%ld\n", offset, total, size);
+            if(data.object_type == DYNAMIC_OBJECT) {
+                printf("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Dynamic Object: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                drcctlib_print_full_cct(STDOUT, data.sym_name, true, true, MAX_DEPTH);
+            } else {
+                printf("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", drcctlib_get_str_from_strpool((uint32_t)data.sym_name));
+            }
+        }
+#endif
         it->second.red += value;
-        it->second.tot += total;
-        it->second.fred+= (value==total);
-        it->second.redByteMap &= byteMap;
+        bitvec_and(&(it->second.redmap), redmap, offset, total);
+        bitvec_and(&(it->second.accmap), 0, offset, total);
     }
 }
 
-static inline void AddToApproximateRedTable(uint64_t key, uint64_t byteMap, uint16_t total, uint16_t zeros, uint16_t nums, uint8_t size, per_thread_t *pt) __attribute__((always_inline,flatten));
-static inline void AddToApproximateRedTable(uint64_t key, uint64_t byteMap, uint16_t total, uint16_t zeros, uint16_t nums, uint8_t size, per_thread_t *pt) {
-    unordered_map<uint64_t, FPRedLogs>::iterator it = pt->FPRedMap->find(key);
-    if ( it  == pt->FPRedMap->end()) {
+static inline void AddToApproximateRedTable(uint64_t addr, data_handle_t data, uint16_t value, uint16_t total, uint64_t redmap, uint32_t typesz, per_thread_t *pt) __attribute__((always_inline,flatten));
+static inline void AddToApproximateRedTable(uint64_t addr, data_handle_t data, uint16_t value, uint16_t total, uint64_t redmap, uint32_t typesz, per_thread_t *pt) {
+    // printf("ADDR=%lx, beg_addr=%lx, end_addr=%lx, typesz=%d, index=%ld, size=%ld\n", addr, (uint64_t)data.beg_addr, (uint64_t)data.end_addr, typesz, addr-(uint64_t)data.beg_addr, (uint64_t)data.end_addr - (uint64_t)data.beg_addr);
+    assert(addr<=(uint64_t)data.end_addr);
+    size_t offset = addr-(uint64_t)data.beg_addr;
+    uint64_t key = MAKE_OBJID(data.object_type,data.sym_name);
+    FPRedLogMap::iterator it2 = pt->FPRedMap->find(key);
+    FPRedLogSizeMap::iterator it;
+    // the data size may not aligned with typesz, so use upper bound as the bitvec size
+    // Note: not aligned case : struct/class with floating and int.
+    size_t size = (uint64_t)data.end_addr - (uint64_t)data.beg_addr;
+    if(value > total) {
+        dr_fprintf(STDERR, "** Warning AddToApproximateTable : value %d, total %d **\n", value, total);
+        assert(0 && "** BUG #0 Detected. Existing **");
+    }
+    if ( it2  == pt->FPRedMap->end() || (it = it2->second.find(size)) == it2->second.end()) {
         FPRedLogs log;
-        log.fred= zeros;
-        log.ftot= nums;
-        log.redByteMap = byteMap;
-        log.AccessLen = total;
-        log.size = size;
-        (*pt->FPRedMap)[key] = log;
+        log.red = value;
+        log.typesz = typesz;
+#ifdef DEBUG_CHECK
+        if(offset+total>size) {
+            printf("AddToApproxRedTable 1: offset=%ld, total=%d, size=%ld\n", offset, total, size);
+            if(data.object_type == DYNAMIC_OBJECT) {
+                printf("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Dynamic Object: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                drcctlib_print_full_cct(STDOUT, data.sym_name, true, true, MAX_DEPTH);
+            } else {
+                printf("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", drcctlib_get_str_from_strpool((uint32_t)data.sym_name));
+            }
+        }
+#endif
+        bitvec_alloc(&log.redmap, size);
+        bitvec_and(&log.redmap, redmap, offset, total);
+        bitvec_alloc(&log.accmap, size);
+        bitvec_and(&log.accmap, 0, offset, total);
+        (*pt->FPRedMap)[key][size] = log;
     } else {
-        it->second.fred+= zeros;
-        it->second.ftot+= nums;
-        it->second.redByteMap &= byteMap;
+        assert(it->second.redmap.size==it->second.accmap.size);
+        assert(size == it->second.redmap.size);
+        assert(it->second.typesz == typesz);
+#ifdef DEBUG_CHECK
+        if(offset+total>size) {
+            printf("AddToApproxRedTable 1: offset=%ld, total=%d, size=%ld\n", offset, total, size);
+            if(data.object_type == DYNAMIC_OBJECT) {
+                printf("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Dynamic Object: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                drcctlib_print_full_cct(STDOUT, data.sym_name, true, true, MAX_DEPTH);
+            } else {
+                printf("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", drcctlib_get_str_from_strpool((uint32_t)data.sym_name));
+            }
+        }
+#endif
+        it->second.red += value;
+        bitvec_and(&(it->second.redmap), redmap, offset, total);
+        bitvec_and(&(it->second.accmap), 0, offset, total);
     }
 }
 /*******************************************************************************************/
@@ -586,157 +699,213 @@ struct UnrolledConjunction<end , end , incr>{
     }
 };
 /*******************************************************************************************/
-
 #ifdef ENABLE_SAMPLING
-// template<int64_t WINDOW_ENABLE, int64_t WINDOW_DISABLE, bool sampleFlag>
-// struct BBSample {
-//     static void update_per_bb(uint instruction_count, app_pc src)
-//     {
-//         void *drcontext = dr_get_current_drcontext();
-//         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-//         pt->numIns += instruction_count;
-//         if(pt->sampleFlag) {
-//             if(pt->numIns > WINDOW_ENABLE) {
-//                 pt->sampleFlag = false;
-//             }
-//         } else {
-//             if(pt->numIns > WINDOW_DISABLE) {
-//                 pt->sampleFlag = true;
-//                 pt->numIns = 0;
-//             }
-//         }
-//         // If the sample flag is changed, flush the region and re-instrument
-//         if(pt->sampleFlag != sampleFlag) {
-//             dr_mcontext_t mcontext;
-//             mcontext.size = sizeof(mcontext);
-//             mcontext.flags = DR_MC_ALL;
-//             dr_flush_region(src, 1);
-//             dr_get_mcontext(drcontext, &mcontext);
-//             mcontext.pc = src;
-//             dr_redirect_execution(&mcontext);
-//         }
-//     }
-// };
+#ifdef USE_CLEANCALL
+template<int64_t WINDOW_ENABLE, int64_t WINDOW_DISABLE, bool sampleFlag>
+struct BBSample {
+    static void update_per_bb(uint instruction_count, app_pc src)
+    {
+        void *drcontext = dr_get_current_drcontext();
+        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+        pt->numIns += instruction_count;
+        if(pt->sampleFlag) {
+            if(pt->numIns > WINDOW_ENABLE) {
+                pt->sampleFlag = false;
+            }
+        } else {
+            if(pt->numIns > WINDOW_DISABLE) {
+                pt->sampleFlag = true;
+                pt->numIns = 0;
+            }
+        }
+        // If the sample flag is changed, flush the region and re-instrument
+        if(pt->sampleFlag != sampleFlag) {
+            dr_mcontext_t mcontext;
+            mcontext.size = sizeof(mcontext);
+            mcontext.flags = DR_MC_ALL;
+            // flush all fragments in code cache
+            dr_flush_region(0, ~((ptr_uint_t)0));
+            dr_get_mcontext(drcontext, &mcontext);
+            mcontext.pc = src;
+            dr_redirect_execution(&mcontext);
+        }
+    }
+};
 
-// void (*BBSampleTable[RATE_NUM][WINDOW_NUM][2])(uint, app_pc) = {
-//     {   {BBSample<RATE_0_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
-//         {BBSample<RATE_0_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
-//         {BBSample<RATE_0_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
-//         {BBSample<RATE_0_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
-//         {BBSample<RATE_0_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
-//     },
-//     {   {BBSample<RATE_1_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
-//         {BBSample<RATE_1_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
-//         {BBSample<RATE_1_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
-//         {BBSample<RATE_1_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
-//         {BBSample<RATE_1_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
-//     },
-//     {   {BBSample<RATE_2_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
-//         {BBSample<RATE_2_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
-//         {BBSample<RATE_2_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
-//         {BBSample<RATE_2_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
-//         {BBSample<RATE_2_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
-//     },
-//     {   {BBSample<RATE_3_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
-//         {BBSample<RATE_3_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
-//         {BBSample<RATE_3_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
-//         {BBSample<RATE_3_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
-//         {BBSample<RATE_3_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
-//     },
-//     {   {BBSample<RATE_4_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
-//         {BBSample<RATE_4_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
-//         {BBSample<RATE_4_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
-//         {BBSample<RATE_4_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
-//         {BBSample<RATE_4_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
-//     },
-//     {   {BBSample<RATE_5_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
-//         {BBSample<RATE_5_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
-//         {BBSample<RATE_5_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
-//         {BBSample<RATE_5_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
-//         {BBSample<RATE_5_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
-//     },
-// };
-// void (*BBSample_target[2])(uint, app_pc);
+void (*BBSampleTable[RATE_NUM][WINDOW_NUM][2])(uint, app_pc) = {
+    {   {BBSample<RATE_0_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
+        {BBSample<RATE_0_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
+        {BBSample<RATE_0_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
+        {BBSample<RATE_0_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
+        {BBSample<RATE_0_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
+    },
+    {   {BBSample<RATE_1_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
+        {BBSample<RATE_1_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
+        {BBSample<RATE_1_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
+        {BBSample<RATE_1_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
+        {BBSample<RATE_1_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
+    },
+    {   {BBSample<RATE_2_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
+        {BBSample<RATE_2_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
+        {BBSample<RATE_2_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
+        {BBSample<RATE_2_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
+        {BBSample<RATE_2_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
+    },
+    {   {BBSample<RATE_3_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
+        {BBSample<RATE_3_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
+        {BBSample<RATE_3_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
+        {BBSample<RATE_3_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
+        {BBSample<RATE_3_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
+    },
+    {   {BBSample<RATE_4_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
+        {BBSample<RATE_4_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
+        {BBSample<RATE_4_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
+        {BBSample<RATE_4_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
+        {BBSample<RATE_4_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
+    },
+    {   {BBSample<RATE_5_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
+        {BBSample<RATE_5_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
+        {BBSample<RATE_5_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
+        {BBSample<RATE_5_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
+        {BBSample<RATE_5_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
+    },
+};
+void (*BBSample_target[2])(uint, app_pc);
 
-// template<int64_t WINDOW_ENABLE, int64_t WINDOW_DISABLE>
-// struct BBSampleNoFlush {
-//     static void update_per_bb(uint instruction_count)
-//     {
-//         void *drcontext = dr_get_current_drcontext();
-//         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-//         pt->numIns += instruction_count;
-//         if(pt->sampleFlag) {
-//             if(pt->numIns > WINDOW_ENABLE) {
-//                 pt->sampleFlag = false;
-//             }
-//         } else {
-//             if(pt->numIns > WINDOW_DISABLE) {
-//                 pt->sampleFlag = true;
-//                 pt->numIns = 0;
-//             }
-//         }
-//     }
-// };
+template<int64_t WINDOW_ENABLE, int64_t WINDOW_DISABLE>
+struct BBSampleNoFlush {
+    static void update_per_bb(uint instruction_count)
+    {
+        void *drcontext = dr_get_current_drcontext();
+        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+        pt->numIns += instruction_count;
+        if(pt->sampleFlag) {
+            if(pt->numIns > WINDOW_ENABLE) {
+                pt->sampleFlag = false;
+            }
+        } else {
+            if(pt->numIns > WINDOW_DISABLE) {
+                pt->sampleFlag = true;
+                pt->numIns = 0;
+            }
+        }
+    }
+};
 
-// void (*BBSampleNoFlushTable[RATE_NUM][WINDOW_NUM])(uint) {
-//     {   BBSampleNoFlush<RATE_0_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
-//         BBSampleNoFlush<RATE_0_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
-//         BBSampleNoFlush<RATE_0_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
-//         BBSampleNoFlush<RATE_0_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
-//         BBSampleNoFlush<RATE_0_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
-//     },
-//     {   BBSampleNoFlush<RATE_1_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
-//         BBSampleNoFlush<RATE_1_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
-//         BBSampleNoFlush<RATE_1_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
-//         BBSampleNoFlush<RATE_1_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
-//         BBSampleNoFlush<RATE_1_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
-//     },
-//     {   BBSampleNoFlush<RATE_2_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
-//         BBSampleNoFlush<RATE_2_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
-//         BBSampleNoFlush<RATE_2_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
-//         BBSampleNoFlush<RATE_2_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
-//         BBSampleNoFlush<RATE_2_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
-//     },
-//     {   BBSampleNoFlush<RATE_3_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
-//         BBSampleNoFlush<RATE_3_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
-//         BBSampleNoFlush<RATE_3_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
-//         BBSampleNoFlush<RATE_3_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
-//         BBSampleNoFlush<RATE_3_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
-//     },
-//     {   BBSampleNoFlush<RATE_4_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
-//         BBSampleNoFlush<RATE_4_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
-//         BBSampleNoFlush<RATE_4_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
-//         BBSampleNoFlush<RATE_4_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
-//         BBSampleNoFlush<RATE_4_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
-//     },
-//     {   BBSampleNoFlush<RATE_5_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
-//         BBSampleNoFlush<RATE_5_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
-//         BBSampleNoFlush<RATE_5_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
-//         BBSampleNoFlush<RATE_5_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
-//         BBSampleNoFlush<RATE_5_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
-//     },
-// };
-// void (*BBSampleNoFlush_target)(uint);
+void (*BBSampleNoFlushTable[RATE_NUM][WINDOW_NUM])(uint) {
+    {   BBSampleNoFlush<RATE_0_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
+        BBSampleNoFlush<RATE_0_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
+        BBSampleNoFlush<RATE_0_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
+        BBSampleNoFlush<RATE_0_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
+        BBSampleNoFlush<RATE_0_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
+    },
+    {   BBSampleNoFlush<RATE_1_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
+        BBSampleNoFlush<RATE_1_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
+        BBSampleNoFlush<RATE_1_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
+        BBSampleNoFlush<RATE_1_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
+        BBSampleNoFlush<RATE_1_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
+    },
+    {   BBSampleNoFlush<RATE_2_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
+        BBSampleNoFlush<RATE_2_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
+        BBSampleNoFlush<RATE_2_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
+        BBSampleNoFlush<RATE_2_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
+        BBSampleNoFlush<RATE_2_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
+    },
+    {   BBSampleNoFlush<RATE_3_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
+        BBSampleNoFlush<RATE_3_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
+        BBSampleNoFlush<RATE_3_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
+        BBSampleNoFlush<RATE_3_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
+        BBSampleNoFlush<RATE_3_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
+    },
+    {   BBSampleNoFlush<RATE_4_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
+        BBSampleNoFlush<RATE_4_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
+        BBSampleNoFlush<RATE_4_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
+        BBSampleNoFlush<RATE_4_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
+        BBSampleNoFlush<RATE_4_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
+    },
+    {   BBSampleNoFlush<RATE_5_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
+        BBSampleNoFlush<RATE_5_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
+        BBSampleNoFlush<RATE_5_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
+        BBSampleNoFlush<RATE_5_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
+        BBSampleNoFlush<RATE_5_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
+    },
+};
+void (*BBSampleNoFlush_target)(uint);
 
+#define SAMPLED_CLEAN_CALL(insert_clean_call) insert_clean_call
 
-#ifdef x86_CCTLIB
+#else
+// use manual inlined updates
+
 #define RESERVE_AFLAGS(dead, bb, ins) do { \
     assert(drreg_are_aflags_dead(drcontext, ins, &dead)==DRREG_SUCCESS); \
     if(!dead) assert(drreg_reserve_aflags (drcontext, bb, ins)==DRREG_SUCCESS); \
 } while(0)
 #define UNRESERVE_AFLAGS(dead, bb, ins) do {if(!dead)  assert(drreg_unreserve_aflags (drcontext, bb, ins)==DRREG_SUCCESS);} while(0)
-#else
-#define RESERVE_AFLAGS(dead, bb, ins)
-#define UNRESERVE_AFLAGS(dead, bb, ins)
+
+#    ifdef ARM_CCTLIB
+#        define DRCCTLIB_LOAD_IMM32_0(dc, Rt, imm) \
+            INSTR_CREATE_movz((dc), (Rt), (imm), OPND_CREATE_INT(0))
+#        define DRCCTLIB_LOAD_IMM32_16(dc, Rt, imm) \
+            INSTR_CREATE_movk((dc), (Rt), (imm), OPND_CREATE_INT(16))
+#        define DRCCTLIB_LOAD_IMM32_32(dc, Rt, imm) \
+            INSTR_CREATE_movk((dc), (Rt), (imm), OPND_CREATE_INT(32))
+#        define DRCCTLIB_LOAD_IMM32_48(dc, Rt, imm) \
+            INSTR_CREATE_movk((dc), (Rt), (imm), OPND_CREATE_INT(48))
+static inline void
+minstr_load_wint_to_reg(void *drcontext, instrlist_t *ilist, instr_t *where, reg_id_t reg,
+                        int32_t wint_num)
+{
+    MINSERT(ilist, where,
+            DRCCTLIB_LOAD_IMM32_0(drcontext, opnd_create_reg(reg),
+                                  OPND_CREATE_IMMEDIATE_INT(wint_num & 0xffff)));
+    wint_num = (wint_num >> 16) & 0xffff;
+    if(wint_num) {
+        MINSERT(ilist, where,
+                DRCCTLIB_LOAD_IMM32_16(drcontext, opnd_create_reg(reg),
+                                    OPND_CREATE_IMMEDIATE_INT(wint_num)));
+    }
+}
+
+#ifdef ARM64_CCTLIB
+static inline void
+minstr_load_wwint_to_reg(void *drcontext, instrlist_t *ilist, instr_t *where,
+                         reg_id_t reg, uint64_t wwint_num)
+{
+    MINSERT(ilist, where,
+            DRCCTLIB_LOAD_IMM32_0(drcontext, opnd_create_reg(reg),
+                                  OPND_CREATE_IMMEDIATE_INT(wwint_num & 0xffff)));
+    uint64_t tmp = (wwint_num >> 16) & 0xffff;
+    if(tmp) {
+        MINSERT(ilist, where,
+            DRCCTLIB_LOAD_IMM32_16(drcontext, opnd_create_reg(reg),
+                                OPND_CREATE_IMMEDIATE_INT(tmp)));
+    }
+    tmp = (wwint_num >> 32) & 0xffff;
+    if(tmp) {
+        MINSERT(ilist, where,
+            DRCCTLIB_LOAD_IMM32_32(drcontext, opnd_create_reg(reg),
+                                OPND_CREATE_IMMEDIATE_INT(tmp)));
+    }
+    tmp = (wwint_num >> 48) & 0xffff;
+    if(tmp) {
+        MINSERT(ilist, where,
+            DRCCTLIB_LOAD_IMM32_48(drcontext, opnd_create_reg(reg),
+                                OPND_CREATE_IMMEDIATE_INT(tmp)));
+    }
+}
 #endif
+#    endif
 
 // sample wrapper for sampling without code flush
+#if 0
 #define SAMPLED_CLEAN_CALL(insert_clean_call) do { \
     bool dead; \
     reg_id_t reg_ptr; \
     RESERVE_AFLAGS(dead, bb, ins); \
     assert(drreg_reserve_register(drcontext, bb, ins, NULL, &reg_ptr)==DRREG_SUCCESS); \
     dr_insert_read_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);\
+    minstr_load_wint_to_reg(drcontext, ilist, where, reg_val, window_disable);\
     MINSERT(bb, ins, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_INT32(window_enable))); \
     instr_t* restore = INSTR_CREATE_label(drcontext); \
     MINSERT(bb, ins, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(restore))); \
@@ -745,6 +914,8 @@ struct UnrolledConjunction<end , end , incr>{
     assert(drreg_unreserve_register(drcontext, bb, ins, reg_ptr)==DRREG_SUCCESS); \
     UNRESERVE_AFLAGS(dead, bb, ins); \
 } while(0)
+#endif
+#define SAMPLED_CLEAN_CALL(insert_clean_call) insert_clean_call
 
 struct BBSampleInstrument {
     static void bb_flush_code(app_pc src) {
@@ -759,6 +930,76 @@ struct BBSampleInstrument {
         dr_redirect_execution(&mcontext);
     }
 
+#ifdef ARM_CCTLIB
+    static void insertBBUpdate(void* drcontext, instrlist_t *ilist, instr_t *where, int insCnt, reg_id_t reg_ptr, reg_id_t reg_val) {
+        dr_insert_read_raw_tls(drcontext, ilist, where, tls_seg,
+                            tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
+        MINSERT(ilist, where, XINST_CREATE_add(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(insCnt)));
+        // Clear insCnt when insCnt > WINDOW_DISABLE
+        minstr_load_wint_to_reg(drcontext, ilist, where, reg_val, window_disable);
+        MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), opnd_create_reg(reg_val)));
+        instr_t* skipclear = INSTR_CREATE_label(drcontext);
+        MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(skipclear)));
+        MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(0)));
+        MINSERT(ilist, where, skipclear);
+        dr_insert_write_raw_tls(drcontext, ilist, where, tls_seg,
+                            tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
+    }
+    static void insertBBSample(void* drcontext, instrlist_t *ilist, instr_t *where, int insCnt) {
+        static_assert(sizeof(void*)==8);
+        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+        bool af_dead=false, reg_dead=false; 
+        reg_id_t reg_ptr;
+        RESERVE_AFLAGS(af_dead, ilist, where);
+        assert(drreg_reserve_register(drcontext, ilist, where, NULL, &reg_ptr)==DRREG_SUCCESS);
+        reg_id_t reg_val;
+        bool regVal_dead = false;
+        assert(drreg_reserve_register(drcontext, ilist, where, NULL, &reg_val)==DRREG_SUCCESS);
+        assert(drreg_is_register_dead(drcontext, reg_val, where, &regVal_dead)==DRREG_SUCCESS);
+        assert(drreg_is_register_dead(drcontext, reg_ptr, where, &reg_dead)==DRREG_SUCCESS);
+
+        insertBBUpdate(drcontext, ilist, where, insCnt, reg_ptr, reg_val);
+
+        instr_t* restore = INSTR_CREATE_label(drcontext);
+        // printf("%ld: %d\n", (int64_t)(BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR)), IS_SAMPLED(pt, window_enable));
+        if(IS_SAMPLED(pt, window_enable)) {
+            // fall to code flush when insCnt > WINDOW_ENABLE
+            minstr_load_wint_to_reg(drcontext, ilist, where, reg_val, window_enable);
+            MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), opnd_create_reg(reg_val)));
+            MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(restore)));
+        } else {
+            // fall to code flush when insCnt > WINDOW_DISABLE (check if cleared)
+            MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_IMMEDIATE_INT(0)));
+            MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_NE, opnd_create_instr(restore)));
+        }
+        if(!regVal_dead) assert(drreg_get_app_value(drcontext, ilist, where, reg_val, reg_val)==DRREG_SUCCESS);
+        if(!reg_dead) assert(drreg_get_app_value(drcontext, ilist, where, reg_ptr, reg_ptr)==DRREG_SUCCESS);
+        if(!af_dead ) assert(drreg_restore_app_aflags(drcontext, ilist, where)==DRREG_SUCCESS);
+        dr_insert_clean_call(drcontext, ilist, where, (void *)BBSampleInstrument::bb_flush_code, false, 1, OPND_CREATE_INTPTR(instr_get_app_pc(where)));
+        MINSERT(ilist, where, restore);
+        assert(drreg_unreserve_register(drcontext, ilist, where, reg_ptr)==DRREG_SUCCESS);
+        assert(drreg_unreserve_register(drcontext, ilist, where, reg_val)==DRREG_SUCCESS);
+        UNRESERVE_AFLAGS(af_dead, ilist, where);
+    }
+
+    static void insertBBSampleNoFlush(void* drcontext, instrlist_t *ilist, instr_t *where, int insCnt) {
+        static_assert(sizeof(void*)==8);
+        bool dead; 
+        reg_id_t reg_ptr; 
+        RESERVE_AFLAGS(dead, ilist, where);
+        reg_id_t reg_val;
+        bool regVal_dead = false;
+        assert(drreg_reserve_register(drcontext, ilist, where, NULL, &reg_val)==DRREG_SUCCESS);
+        assert(drreg_is_register_dead(drcontext, reg_val, where, &regVal_dead)==DRREG_SUCCESS);
+        assert(drreg_reserve_register(drcontext, ilist, where, NULL, &reg_ptr)==DRREG_SUCCESS);
+
+        insertBBUpdate(drcontext, ilist, where, insCnt, reg_ptr, reg_val);
+
+        assert(drreg_unreserve_register(drcontext, ilist, where, reg_ptr)==DRREG_SUCCESS);
+        assert(drreg_unreserve_register(drcontext, ilist, where, reg_val)==DRREG_SUCCESS);
+        UNRESERVE_AFLAGS(dead, ilist, where);
+    }
+#else
     static void insertBBSample(void* drcontext, instrlist_t *ilist, instr_t *where, int insCnt) {
         static_assert(sizeof(void*)==8);
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
@@ -770,24 +1011,12 @@ struct BBSampleInstrument {
         dr_insert_read_raw_tls(drcontext, ilist, where, tls_seg,
                             tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
         MINSERT(ilist, where, XINST_CREATE_add(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(insCnt)));
-        MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(window_disable)));
         // Clear insCnt when insCnt > WINDOW_DISABLE
-#ifdef ARM_CCTLIB
-    #ifdef USE_CMOV
-        // MOVLE $reg_ptr, #0
-        INSTR_PRED(instr_create_1dst_1src((drcontext), (OP_mov), (opnd_create_reg(reg_ptr)), (OPND_CREATE_CCT_INT(0))), DR_PRED_LE);
-    #else
-        instr_t* skipclear = INSTR_CREATE_label(drcontext);
-        MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(skipclear)));
-        MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(0)));
-        MINSERT(ilist, where, skipclear);
-    #endif
-#else
+        MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(window_disable)));
         instr_t* skipclear = INSTR_CREATE_label(drcontext);
         MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(skipclear)));
         MINSERT(ilist, where, INSTR_CREATE_xor(drcontext, opnd_create_reg(reg_ptr), opnd_create_reg(reg_ptr)));
         MINSERT(ilist, where, skipclear);
-#endif
         dr_insert_write_raw_tls(drcontext, ilist, where, tls_seg,
                             tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
         instr_t* restore = INSTR_CREATE_label(drcontext);
@@ -799,11 +1028,7 @@ struct BBSampleInstrument {
         } else {
             // fall to code flush when insCnt > WINDOW_DISABLE (check if cleared)
             MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(0)));
-#ifdef ARM_CCTLIB
-            MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_NE, opnd_create_instr(restore)));
-#else
             MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_NZ, opnd_create_instr(restore)));
-#endif
         }
         if(!af_dead ) assert(drreg_restore_app_aflags(drcontext, ilist, where)==DRREG_SUCCESS);
         if(!reg_dead) assert(drreg_get_app_value(drcontext, ilist, where, reg_ptr, reg_ptr)==DRREG_SUCCESS);
@@ -825,18 +1050,17 @@ struct BBSampleInstrument {
         MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(window_disable)));
         instr_t* skipclear = INSTR_CREATE_label(drcontext);
         MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(skipclear)));
-#ifdef ARM_CCTLIB
-        MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(0)));
-#else
         MINSERT(ilist, where, INSTR_CREATE_xor(drcontext, opnd_create_reg(reg_ptr), opnd_create_reg(reg_ptr)));
-#endif
         MINSERT(ilist, where, skipclear);
         dr_insert_write_raw_tls(drcontext, ilist, where, tls_seg,
                             tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
         assert(drreg_unreserve_register(drcontext, ilist, where, reg_ptr)==DRREG_SUCCESS);
         UNRESERVE_AFLAGS(dead, ilist, where);
     }
+#endif
 };
+// endif USE_CLEANCALL
+#endif
 
 static dr_emit_flags_t
 event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, bool translating, OUT void **user_data)
@@ -852,25 +1076,32 @@ event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, b
         return DR_EMIT_DEFAULT;
     }
     /* insert clean call */
+#ifdef USE_CLEANCALL
+    if(op_no_flush.get_value()) {
+        dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSampleNoFlush_target, false, 1, 
+                            OPND_CREATE_INT32(num_instructions));
+    } else {
+        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+        if(pt->sampleFlag) {
+            dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSample_target[1], false, 2, 
+                            OPND_CREATE_INT32(num_instructions), 
+                            OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
+        } else {
+            dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSample_target[0], false, 2, 
+                            OPND_CREATE_INT32(num_instructions), 
+                            OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
+        }
+    }
+#else
     if(op_no_flush.get_value()) {
         BBSampleInstrument::insertBBSampleNoFlush(drcontext, bb, instrlist_first(bb), num_instructions);
-        // dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSampleNoFlush_target, false, 1, 
-        //                     OPND_CREATE_INT32(num_instructions));
     } else {
         BBSampleInstrument::insertBBSample(drcontext, bb, instrlist_first(bb), num_instructions);
-        // per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-        // if(pt->sampleFlag) {
-        //     dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSample_target[1], false, 2, 
-        //                     OPND_CREATE_INT32(num_instructions), 
-        //                     OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
-        // } else {
-        //     dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSample_target[0], false, 2, 
-        //                     OPND_CREATE_INT32(num_instructions), 
-        //                     OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
-        // }
     }
+#endif
     return DR_EMIT_DEFAULT;
 }
+// endif ENABLE_SAMPLING
 #endif
 
 template<class T, uint32_t AccessLen, uint32_t ElemLen, bool isApprox, bool enable_sampling>
@@ -883,13 +1114,15 @@ struct ZeroSpyAnalysis{
     {
         void *drcontext = dr_get_current_drcontext();
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-// #ifdef ENABLE_SAMPLING
-//         if(enable_sampling) {
-//             if(!pt->sampleFlag) {
-//                 return ;
-//             }
-//         }
-// #endif
+#ifdef ENABLE_SAMPLING
+#ifdef USE_CLEANCALL
+        if(enable_sampling) {
+            if(!pt->sampleFlag) {
+                return ;
+            }
+        }
+#endif
+#endif
 // #ifdef ZEROSPY_DEBUG
 //         byte* base;
 //         size_t size;
@@ -911,25 +1144,42 @@ struct ZeroSpyAnalysis{
 //             dr_fprintf(STDERR, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
 //         }
 // #endif
-        context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
+        pt->bytesLoad += AccessLen;
+        data_handle_t data_hndl =
+                    drcctlib_get_data_hndl_ignore_stack_data(drcontext, (app_pc)addr);
+        if(data_hndl.object_type!=DYNAMIC_OBJECT && data_hndl.object_type!=STATIC_OBJECT) {
+            return ;
+        }
+#ifdef DEBUG_CHECK
+        {
+            size_t size   = (uint64_t)data_hndl.end_addr - (uint64_t)data_hndl.beg_addr;
+            size_t offset = (uint64_t)addr - (uint64_t)data_hndl.beg_addr;
+            size_t total  = AccessLen;
+            if(offset + total > size) {
+                context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
+                printf("\n\nWARN: overflow detected: offset=%ld, total=%ld, size=%ld\n", offset, total, size);
+                drcctlib_print_full_cct(STDOUT, curCtxtHandle, true, true, MAX_DEPTH);
+            }
+        }
+#endif
         uint8_t* bytes = static_cast<uint8_t*>(addr);
         if(isApprox) {
             bool hasRedundancy = UnrolledConjunctionApprox<0,AccessLen,sizeof(T)>::BodyHasRedundancy(bytes);
             if(hasRedundancy) {
                 uint64_t map = UnrolledConjunctionApprox<0,AccessLen,sizeof(T)>::BodyRedMap(bytes);
                 uint32_t zeros = UnrolledConjunctionApprox<0,AccessLen,sizeof(T)>::BodyZeros(bytes);        
-                AddToApproximateRedTable((uint64_t)curCtxtHandle, map, AccessLen, zeros, AccessLen/sizeof(T), sizeof(T), pt);
+                AddToApproximateRedTable((uint64_t)addr,data_hndl, zeros, AccessLen/sizeof(T), map, sizeof(T), pt);
             } else {
-                AddToApproximateRedTable((uint64_t)curCtxtHandle, 0, AccessLen, 0, AccessLen/sizeof(T), sizeof(T), pt);
+                AddToApproximateRedTable((uint64_t)addr,data_hndl, 0, AccessLen/sizeof(T), 0, sizeof(T), pt);
             }
         } else {
             bool hasRedundancy = UnrolledConjunction<0,AccessLen,sizeof(T)>::BodyHasRedundancy(bytes);
             if(hasRedundancy) {
                 uint64_t redbyteMap = UnrolledConjunction<0,AccessLen,sizeof(T)>::BodyRedMap(bytes);
                 uint32_t redbyteNum = UnrolledConjunction<0,AccessLen,sizeof(T)>::BodyRedNum(redbyteMap);
-                AddToRedTable((uint64_t)MAKE_CONTEXT_PAIR(AccessLen, curCtxtHandle), redbyteNum, redbyteMap, AccessLen, pt);
+                AddToRedTable((uint64_t)addr, data_hndl, redbyteNum, AccessLen, redbyteMap, pt);
             } else {
-                AddToRedTable((uint64_t)MAKE_CONTEXT_PAIR(AccessLen, curCtxtHandle), 0, 0, AccessLen, pt);
+                AddToRedTable((uint64_t)addr, data_hndl, 0, AccessLen, 0, pt);
             }
         }
     }
@@ -938,18 +1188,19 @@ struct ZeroSpyAnalysis{
     {
         void *drcontext = dr_get_current_drcontext();
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-// #ifdef ENABLE_SAMPLING
-//         if(enable_sampling) {
-//             if(!pt->sampleFlag) {
-//                 return ;
-//             }
-//         }
-// #endif
+#ifdef ENABLE_SAMPLING
+#ifdef USE_CLEANCALL
+        if(enable_sampling) {
+            if(!pt->sampleFlag) {
+                return ;
+            }
+        }
+#endif
+#endif
         dr_mcontext_t mcontext;
         mcontext.size = sizeof(mcontext);
         mcontext.flags= DR_MC_ALL;
         DR_ASSERT(dr_get_mcontext(drcontext, &mcontext));
-        context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
 #ifdef DEBUG_VGATHER
         printf("\n^^ CheckNByteValueAfterVGather: ");
         disassemble(drcontext, instr_get_app_pc(instr), 1/*sdtout file desc*/);
@@ -963,15 +1214,15 @@ struct ZeroSpyAnalysis{
             uint32_t pos;
             for( int index=0; instr_compute_address_ex_pos(instr, &mcontext, index, &addr, &is_write, &pos); ++index ) {
                 DR_ASSERT(!is_write);
-                uint8_t* bytes = reinterpret_cast<uint8_t*>(addr);
-                bool hasRedundancy = (bytes[sizeof(T)-1]==0);
-                if(hasRedundancy) {
-                    if(sizeof(T)==4) { map = map | (UnrolledConjunctionApprox<0,sizeof(T),sizeof(T)>::BodyRedMap(bytes) << (SP_MAP_SIZE * pos) ); }
-                    else if(sizeof(T)==8) { map = map |  (UnrolledConjunctionApprox<0,sizeof(T),sizeof(T)>::BodyRedMap(bytes) << (DP_MAP_SIZE * pos) ); }
-                    zeros = zeros + UnrolledConjunctionApprox<0,sizeof(T),sizeof(T)>::BodyZeros(bytes);
+                pt->bytesLoad += sizeof(T);
+                data_handle_t data_hndl = drcctlib_get_data_hndl_ignore_stack_data(drcontext, addr);
+                if(data_hndl.object_type!=DYNAMIC_OBJECT && data_hndl.object_type!=STATIC_OBJECT) {
+                    continue ;
                 }
+                T* bytes = reinterpret_cast<T*>(addr);
+                uint64_t val = (bytes[0] == 0) ? 1 : 0;
+                AddToApproximateRedTable((uint64_t)addr, data_hndl, val, 1, val, sizeof(T), pt);
             }
-            AddToApproximateRedTable((uint64_t)curCtxtHandle, map, AccessLen, zeros, AccessLen/sizeof(T), sizeof(T), pt);
         } else {
             assert(0 && "VGather should be a floating point operation!");
         }
@@ -984,14 +1235,33 @@ static inline void CheckAfterLargeRead(int32_t slot, void* addr, uint32_t access
 {
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-// #ifdef ENABLE_SAMPLING
-//     if(enable_sampling) {
-//         if(!pt->sampleFlag) {
-//             return ;
-//         }
-//     }
-// #endif
-    context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
+#ifdef ENABLE_SAMPLING
+#ifdef USE_CLEANCALL
+    if(enable_sampling) {
+        if(!pt->sampleFlag) {
+            return ;
+        }
+    }
+#endif
+#endif
+    pt->bytesLoad += accessLen;
+    data_handle_t data_hndl =
+                drcctlib_get_data_hndl_ignore_stack_data(drcontext, (app_pc)addr);
+    if(data_hndl.object_type!=DYNAMIC_OBJECT && data_hndl.object_type!=STATIC_OBJECT) {
+        return ;
+    }
+#ifdef DEBUG_CHECK
+    {
+        size_t size   = (uint64_t)data_hndl.end_addr - (uint64_t)data_hndl.beg_addr;
+        size_t offset = (uint64_t)addr - (uint64_t)data_hndl.beg_addr;
+        size_t total  = accessLen;
+        if(offset + total > size) {
+            context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
+            printf("\n\nWARN: overflow detected: offset=%ld, total=%ld, size=%ld\n", offset, total, size);
+            drcctlib_print_full_cct(STDOUT, curCtxtHandle, true, true, MAX_DEPTH);
+        }
+    }
+#endif
     uint8_t* bytes = static_cast<uint8_t*>(addr);
     // quick check whether the most significant byte of the read memory is redundant zero or not
     bool hasRedundancy = (bytes[accessLen-1]==0);
@@ -1058,10 +1328,10 @@ static inline void CheckAfterLargeRead(int32_t slot, void* addr, uint32_t access
             redbytesNum += t;
         }
         // report in RedTable
-        AddToRedTable((uint64_t)MAKE_CONTEXT_PAIR(accessLen, curCtxtHandle), redbytesNum, redbyteMap, accessLen, pt);
+        AddToRedTable((uint64_t)addr, data_hndl, redbytesNum, accessLen, redbyteMap, pt);
     }
     else {
-        AddToRedTable((uint64_t)MAKE_CONTEXT_PAIR(accessLen, curCtxtHandle), 0, 0, accessLen, pt);
+        AddToRedTable((uint64_t)addr, data_hndl, 0, accessLen, 0, pt);
     }
 }
 #ifdef ENABLE_SAMPLING
@@ -1122,6 +1392,7 @@ struct ZerospyInstrument{
         uint32_t refSize = opnd_size_in_bytes(opnd_get_size(opnd));
         if (refSize==0) {
             // Something strange happened, so ignore it
+            assert(0 && "Something strange happened! refSize==0.\n");
             return ;
         }
 #ifdef ZEROSPY_DEBUG
@@ -1232,7 +1503,9 @@ struct ZerospyInstrument{
         uint32_t refSize = opnd_size_in_bytes(opnd_get_size(instr_get_dst(ins, 0)));
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
         instr_t* ins_clone = instr_clone(drcontext, ins);
+#ifdef ZEROSPY_DEBUG
         pt->instr_clones->push_back(ins_clone);
+#endif
 #ifdef DEBUG_VGATHER
         printf("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
         printf("^^ refSize = %d, operSize = %d\n", refSize, operSize);
@@ -1303,14 +1576,8 @@ struct ZerospyInstrument{
 };
 
 static void
-InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, int32_t slot)
+InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, int32_t slot, reg_id_t reg1, reg_id_t reg2)
 {
-    /* We need two scratch registers */
-    reg_id_t reg1, reg2;
-    if (drreg_reserve_register(drcontext, ilist, where, NULL, &reg1) != DRREG_SUCCESS ||
-        drreg_reserve_register(drcontext, ilist, where, NULL, &reg2) != DRREG_SUCCESS) {
-        ZEROSPY_EXIT_PROCESS("InstrumentMem drreg_reserve_register != DRREG_SUCCESS");
-    }
     if (!drutil_insert_get_mem_addr(drcontext, ilist, where, ref, reg1/*addr*/,
                                     reg2/*scratch*/)) {
 #ifdef _WERROR
@@ -1330,11 +1597,6 @@ InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, i
 #endif
     } else {
         ZerospyInstrument::InstrumentReadValueBeforeAndAfterLoading(drcontext, ilist, where, ref, reg1, slot);
-    }
-    /* Restore scratch registers */
-    if (drreg_unreserve_register(drcontext, ilist, where, reg1) != DRREG_SUCCESS ||
-        drreg_unreserve_register(drcontext, ilist, where, reg2) != DRREG_SUCCESS) {
-        ZEROSPY_EXIT_PROCESS("InstrumentMem drreg_unreserve_register != DRREG_SUCCESS");
     }
 }
 
@@ -1358,8 +1620,40 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
     // Besides, prefetch instructions are not the actual memory access instructions, so we also ignore them
     if(instr_is_prefetch(instr)) return;
 
+    // Currently, we mark x87 control instructions handling FPU states are ignorable (not insterested)
+    if(instr_is_ignorable(instr)) {
+        return ;
+    }
+
     // store cct in tls filed
     // InstrumentIns(drcontext, bb, instr, slot);
+#ifndef USE_CLEANCALL
+    /* We need two scratch registers to get the value */
+    reg_id_t reg1, reg2;
+    if (drreg_reserve_register(drcontext, bb, instr, NULL, &reg1) != DRREG_SUCCESS 
+#ifdef ARM_CCTLIB
+        || drreg_reserve_register(drcontext, bb, instr, NULL, &reg2) != DRREG_SUCCESS
+#endif
+        ) {
+        ZEROSPY_EXIT_PROCESS("InstrumentMem drreg_reserve_register != DRREG_SUCCESS");
+    }
+    instr_t* skipcall = NULL;
+    bool dead = false;
+    if(op_no_flush.get_value()) {
+        RESERVE_AFLAGS(dead, bb, instr);
+        dr_insert_read_raw_tls(drcontext, bb, instr, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg1);
+        // Clear insCnt when insCnt > WINDOW_DISABLE
+#ifdef ARM_CCTLIB
+        minstr_load_wint_to_reg(drcontext, bb, instr, reg2, window_enable);
+        MINSERT(bb, instr, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg1), opnd_create_reg(reg2)));
+#else
+        MINSERT(bb, instr, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg1), OPND_CREATE_CCT_INT(window_enable)));
+#endif
+        skipcall = INSTR_CREATE_label(drcontext);
+        MINSERT(bb, instr, XINST_CREATE_jump_cond(drcontext, DR_PRED_GT, opnd_create_instr(skipcall)));
+    }
+#endif
+
 #ifdef X86
     // gather may result in failure, need special care
     if(instr_is_gather(instr)) {
@@ -1368,22 +1662,41 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
         printf("INFO: HANDLE vgather\n");
 #endif
         ZerospyInstrument::InstrumentReadValueBeforeVGather(drcontext, bb, instr, slot);
-        return ;
+    } else
+#endif
+    {
+#ifndef ARM_CCTLIB
+        if (drreg_reserve_register(drcontext, ilist, where, NULL, &reg2) != DRREG_SUCCESS) {
+            ZEROSPY_EXIT_PROCESS("InstrumentMem drreg_reserve_register != DRREG_SUCCESS");
+        }
+#endif
+        int num_srcs = instr_num_srcs(instr);
+        for(int i=0; i<num_srcs; ++i) {
+            opnd_t opnd = instr_get_src(instr, i);
+            if(opnd_is_memory_reference(opnd)) {
+                InstrumentMem(drcontext, bb, instr, opnd, slot, reg1, reg2);
+            }
+        }
+#ifndef ARM_CCTLIB
+        if (drreg_unreserve_register(drcontext, ilist, where, reg2) != DRREG_SUCCESS) {
+            ZEROSPY_EXIT_PROCESS("InstrumentMem drreg_unreserve_register != DRREG_SUCCESS");
+        }
+#endif
+    }
+#ifndef USE_CLEANCALL
+    if(op_no_flush.get_value()) {
+        assert(skipcall!=NULL);
+        MINSERT(bb, instr, skipcall);
+        UNRESERVE_AFLAGS(dead, bb, instr);
+    }
+    if (drreg_unreserve_register(drcontext, bb, instr, reg1) != DRREG_SUCCESS 
+#ifdef ARM_CCTLIB
+        || drreg_unreserve_register(drcontext, bb, instr, reg2) != DRREG_SUCCESS
+#endif
+        ) {
+        ZEROSPY_EXIT_PROCESS("InstrumentMem drreg_unreserve_register != DRREG_SUCCESS");
     }
 #endif
-
-    // Currently, we mark x87 control instructions handling FPU states are ignorable (not insterested)
-    if(instr_is_ignorable(instr)) {
-        return ;
-    }
-    
-    int num_srcs = instr_num_srcs(instr);
-    for(int i=0; i<num_srcs; ++i) {
-        opnd_t opnd = instr_get_src(instr, i);
-        if(opnd_is_memory_reference(opnd)) {
-            InstrumentMem(drcontext, bb, instr, opnd, slot);
-        }
-    }
 }
 
 static void
@@ -1406,231 +1719,308 @@ ClientThreadStart(void *drcontext)
     if (pt == NULL) {
         ZEROSPY_EXIT_PROCESS("pt == NULL");
     }
-    pt->INTRedMap = new unordered_map<uint64_t, INTRedLogs>();
-    pt->FPRedMap = new unordered_map<uint64_t, FPRedLogs>();
+    pt->INTRedMap = new RedLogMap();
+    pt->FPRedMap = new FPRedLogMap();
+#ifdef ZEROSPY_DEBUG
     pt->instr_clones = new vector<instr_t*>();
+#endif
     pt->INTRedMap->rehash(10000000);
     pt->FPRedMap->rehash(10000000);
 #ifdef ENABLE_SAMPLING
-    // pt->numIns = 0;
-    // pt->sampleFlag = true;
+#ifdef USE_CLEANCALL
+    pt->numIns = 0;
+    pt->sampleFlag = true;
+#else
     pt->numInsBuff = dr_get_dr_segment_base(tls_seg);
     BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR) = 0;
 #endif
+#endif
+    pt->bytesLoad = 0;
     drmgr_set_tls_field(drcontext, tls_idx, (void *)pt);
     ThreadOutputFileInit(pt);
 }
 
 /*******************************************************************/
 /* Output functions */
-struct RedundacyData {
-    context_handle_t cntxt;
-    uint64_t frequency;
-    uint64_t all0freq;
-    uint64_t ltot;
-    uint64_t byteMap;
-    uint8_t accessLen;
-};
-
-struct ApproxRedundacyData {
-    context_handle_t cntxt;
-    uint64_t all0freq;
-    uint64_t ftot;
-    uint64_t byteMap;
-    uint8_t accessLen;
-    uint8_t size;
-};
-
-static inline bool RedundacyCompare(const struct RedundacyData &first, const struct RedundacyData &second) {
-    return first.frequency > second.frequency ? true : false;
-}
-static inline bool ApproxRedundacyCompare(const struct ApproxRedundacyData &first, const struct ApproxRedundacyData &second) {
-    return first.all0freq > second.all0freq ? true : false;
-}
 //#define SKIP_SMALLACCESS
 #ifdef SKIP_SMALLACCESS
 #define LOGGING_THRESHOLD 100
 #endif
 
-#include <omp.h>
+// redundant data for a object
+struct ObjRedundancy {
+    uint64_t objID;
+    uint64_t bytes;
+};
+
+static inline bool ObjRedundancyCompare(const struct ObjRedundancy &first, const struct ObjRedundancy &second) {
+    return first.bytes > second.bytes ? true : false;
+}
+
+static inline void PrintSize(file_t gTraceFile, uint64_t size, const char* unit="B") {
+    if(size >= (1<<20)) {
+        dr_fprintf(gTraceFile, "%lf M%s",(double)size/(double)(1<<20),unit);
+    } else if(size >= (1<<10)) {
+        dr_fprintf(gTraceFile, "%lf K%s",(double)size/(double)(1<<10),unit);
+    } else {
+        dr_fprintf(gTraceFile, "%ld %s",size,unit);
+    }
+}
+
+#define MAX_REDMAP_PRINT_SIZE 128
+// only print top 5 redundancy with full redmap to file
+#define MAX_PRINT_FULL 5
 
 static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad, int threadId) {
-    vector<RedundacyData> tmpList;
-    vector<RedundacyData>::iterator tmpIt;
-
+    printf("[ZEROSPY INFO] PrintRedundancyPairs for INT...\n");
+    vector<ObjRedundancy> tmpList;
     file_t gTraceFile = pt->output_file;
     
     uint64_t grandTotalRedundantBytes = 0;
-    tmpList.reserve(pt->INTRedMap->size());
-    printf("Dumping INTEGER Redundancy Info... Total num : %ld\n",pt->INTRedMap->size());
-    fflush(stdout);
-    dr_fprintf(gTraceFile, "\n--------------- Dumping INTEGER Redundancy Info ----------------\n");
+    dr_fprintf(gTraceFile, "\n--------------- Dumping Data Redundancy Info ----------------\n");
     dr_fprintf(gTraceFile, "\n*************** Dump Data from Thread %d ****************\n", threadId);
-    uint64_t count = 0; uint64_t rep = -1;
-    for (unordered_map<uint64_t, INTRedLogs>::iterator it = pt->INTRedMap->begin(); it != pt->INTRedMap->end(); ++it) {
+
+    int count=0;
+    int rep=-1;
+    int total = pt->INTRedMap->size();
+    tmpList.reserve(total);
+    for(RedLogMap::iterator it = pt->INTRedMap->begin(); it != pt->INTRedMap->end(); ++it) {
         ++count;
-        if(100 * count / pt->INTRedMap->size()!=rep) {
-            rep = 100 * count / pt->INTRedMap->size();
-            printf("\r%ld%%  Finish",rep);
+        if(100 * count / total!=rep) {
+            rep = 100 * count / total;
+            printf("\r[ZEROSPY INFO] Stage 1 : %3d %% Finish",rep);
             fflush(stdout);
         }
-        RedundacyData tmp = { DECODE_KILL((*it).first), (*it).second.red,(*it).second.fred,(*it).second.tot,(*it).second.redByteMap,DECODE_DEAD((*it).first)};
-        tmpList.push_back(tmp);
-        grandTotalRedundantBytes += tmp.frequency;
-    }
-    printf("\r100%%  Finish\n");
-    fflush(stdout);
-    
-    __sync_fetch_and_add(&grandTotBytesRedLoad,grandTotalRedundantBytes);
-    printf("Extracted Raw data, now sorting...\n");
-    fflush(stdout);
-    
-    dr_fprintf(gTraceFile, "\n Total redundant bytes = %f %%\n", grandTotalRedundantBytes * 100.0 / threadBytesLoad);
-    dr_fprintf(gTraceFile, "\n INFO : Total redundant bytes = %f %% (%ld / %ld) \n", grandTotalRedundantBytes * 100.0 / threadBytesLoad, grandTotalRedundantBytes, threadBytesLoad);
-    
-#ifdef ENABLE_FILTER_BEFORE_SORT
-#define FILTER_THESHOLD 1000
-    dr_fprintf(gTraceFile, "\n Filter out small redundancies according to the predefined threshold: %.2lf %%\n", 100.0/(double)FILTER_THESHOLD);
-    vector<RedundacyData> tmpList2;
-    tmpList2 = move(tmpList);
-    tmpList.clear(); // make sure it is empty
-    tmpList.reserve(tmpList2.size());
-    for(tmpIt = tmpList2.begin();tmpIt != tmpList2.end(); ++tmpIt) {
-        if(tmpIt->frequency * FILTER_THESHOLD > tmpIt->ltot) {
-            tmpList.push_back(*tmpIt);
+        ObjRedundancy tmp = {(*it).first, 0};
+        for(RedLogSizeMap::iterator it2 = it->second.begin(); it2 != it->second.end(); ++it2) {
+            tmp.bytes += it2->second.red;
         }
+        if(tmp.bytes==0) continue;
+        grandTotalRedundantBytes += tmp.bytes;
+        tmpList.push_back(tmp); 
     }
-    dr_fprintf(gTraceFile, " Remained Redundancies: %ld (%.2lf %%)\n", tmpList.size(), (double)tmpList.size()/(double)tmpList2.size());
-    tmpList2.clear();
-#undef FILTER_THRESHOLD
-#endif
+    printf("\n[ZEROSPY INFO] Stage 1 finish\n");
 
-    sort(tmpList.begin(), tmpList.end(), RedundacyCompare);
-    printf("Sorted, Now generating reports...\n");
-    fflush(stdout);
-    int cntxtNum = 0;
-    for (vector<RedundacyData>::iterator listIt = tmpList.begin(); listIt != tmpList.end(); ++listIt) {
-        if (cntxtNum < MAX_REDUNDANT_CONTEXTS_TO_LOG) {
-            dr_fprintf(gTraceFile, "\n\n======= (%f) %% of total Redundant, with local redundant %f %% (%ld Bytes / %ld Bytes) ======\n", 
-                (*listIt).frequency * 100.0 / grandTotalRedundantBytes,
-                (*listIt).frequency * 100.0 / (*listIt).ltot,
-                (*listIt).frequency,(*listIt).ltot);
-            dr_fprintf(gTraceFile, "\n\n======= with All Zero Redundant %f %% (%ld / %ld) ======\n", 
-                (*listIt).all0freq * (*listIt).accessLen * 100.0 / (*listIt).ltot,
-                (*listIt).all0freq,(*listIt).ltot/(*listIt).accessLen);
-            dr_fprintf(gTraceFile, "\n======= Redundant byte map : [0] ");
-            for(uint32_t i=0;i<(*listIt).accessLen;++i) {
-                if((*listIt).byteMap & (1<<i)) {
-                    dr_fprintf(gTraceFile, "00 ");
-                }
-                else {
-                    dr_fprintf(gTraceFile, "XX ");
+    __sync_fetch_and_add(&grandTotBytesRedLoad,grandTotalRedundantBytes);
+    dr_fprintf(gTraceFile, "\n Total redundant bytes = %f %%\n", grandTotalRedundantBytes * 100.0 / threadBytesLoad);
+
+    sort(tmpList.begin(), tmpList.end(), ObjRedundancyCompare);
+
+    int objNum = 0;
+    rep = -1;
+    total = tmpList.size()<MAX_OBJS_TO_LOG?tmpList.size():MAX_OBJS_TO_LOG;
+    for(vector<ObjRedundancy>::iterator listIt = tmpList.begin(); listIt != tmpList.end(); ++listIt) {
+        if(objNum++ >= MAX_OBJS_TO_LOG) break;
+        if(100 * objNum / total!=rep) {
+            rep = 100 * objNum / total;
+            printf("\r[ZEROSPY INFO] Stage 2 : %3d %% Finish",rep);
+            fflush(stdout);
+        }
+        if((uint8_t)DECODE_TYPE((*listIt).objID) == DYNAMIC_OBJECT) {
+            dr_fprintf(gTraceFile, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Dynamic Object: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+            drcctlib_print_full_cct(gTraceFile, DECODE_NAME((*listIt).objID), true, true, MAX_DEPTH);
+        } else { 
+            dr_fprintf(gTraceFile, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", drcctlib_get_str_from_strpool((uint32_t)DECODE_NAME((*listIt).objID)));
+        }
+
+        dr_fprintf(gTraceFile, "\n==========================================\n");
+        dr_fprintf(gTraceFile, "Redundancy Ratio = %f %% (%ld Bytes)\n", (*listIt).bytes * 100.0 / grandTotalRedundantBytes, (*listIt).bytes);
+
+        for(RedLogSizeMap::iterator it2 = (*pt->INTRedMap)[(*listIt).objID].begin(); it2 != (*pt->INTRedMap)[(*listIt).objID].end(); ++it2) {
+            uint64_t dfreq = 0;
+            uint64_t dread = 0;
+            uint64_t dsize = it2->first;
+            bitref_t accmap = &(it2->second.accmap);
+            bitref_t redmap = &(it2->second.redmap);
+
+            assert(accmap->size==dsize);
+            assert(accmap->size==redmap->size);
+
+            for(size_t i=0;i<accmap->size;++i) {
+                if(!bitvec_at(accmap, i)) {
+                    ++dread;
+                    if(bitvec_at(redmap, i)) ++dfreq;
                 }
             }
-            dr_fprintf(gTraceFile, " [AccessLen=%d] =======\n", (*listIt).accessLen);
-            dr_fprintf(gTraceFile, "\n---------------------Redundant load with---------------------------\n");
-            drcctlib_print_full_cct(gTraceFile, (*listIt).cntxt, true, true, MAX_DEPTH);
+                
+            dr_fprintf(gTraceFile, "\n\n======= DATA SIZE : ");
+            PrintSize(gTraceFile, dsize);
+            dr_fprintf(gTraceFile, "( Not Accessed Data %f %% (%ld Bytes), Redundant Data %f %% (%ld Bytes) )", 
+                    (dsize-dread) * 100.0 / dsize, dsize-dread, 
+                    dfreq * 100.0 / dsize, dfreq);
+
+            dr_fprintf(gTraceFile, "\n======= Redundant byte map : [0] ");
+            uint32_t num=0;
+            for(size_t i=0;i<accmap->size;++i) {
+                if(!bitvec_at(accmap, i)) {
+                    if(bitvec_at(redmap, i)) {
+                        dr_fprintf(gTraceFile, "00 ");
+                    } else {
+                        dr_fprintf(gTraceFile, "XX ");
+                    }
+                } else {
+                    dr_fprintf(gTraceFile, "?? ");
+                }
+                ++num;
+                if(num>MAX_REDMAP_PRINT_SIZE) {
+                    dr_fprintf(gTraceFile, "... ");
+                    break;
+                }
+            }
         }
-        else {
-            break;
+#if 0
+        if(objNum<=MAX_PRINT_FULL) {
+            char fn[50] = {};
+            sprintf(fn,"%lx.redmap",(*listIt).objID);
+            file_t fp = dr_open(fn,"w");
+            if((uint8_t)DECODE_TYPE((*listIt).objID) == DYNAMIC_OBJECT) {
+                dr_fprintf(fp, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Dynamic Object: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                PrintFullCallingContext(DECODE_NAME((*listIt).objID)); // segfault might happen if the shadow memory based data centric is used
+            } else  
+                dr_fprintf(fp, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", GetStringFromStringPool((uint32_t)DECODE_NAME((*listIt).objID)));
+            for(size_t i=0;i<accmap->size;++i) {
+                if(!bitvec_at(accmap, i)) {
+                    if(bitvec_at(redmap, i)) {
+                        dr_fprintf(fp, "00 ");
+                    } else {
+                        dr_fprintf(fp, "XX ");
+                    }
+                } else {
+                    dr_fprintf(fp, "?? ");
+                }
+            }
         }
-        cntxtNum++;
+#endif
     }
-    dr_fprintf(gTraceFile, "\n------------ Dumping INTEGER Redundancy Info Finish -------------\n");
-    printf("INTEGER Report dumped\n");
-    fflush(stdout);
+    printf("\n[ZEROSPY INFO] Stage 2 Finish\n");
+    dr_fprintf(gTraceFile, "\n------------ Dumping Redundancy Info Finish -------------\n");
     return grandTotalRedundantBytes;
 }
 
 static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad, int threadId) {
-    vector<ApproxRedundacyData> tmpList;
-    vector<ApproxRedundacyData>::iterator tmpIt;
-    tmpList.reserve(pt->FPRedMap->size());
-    
+    printf("[ZEROSPY INFO] PrintRedundancyPairs for FP...\n");
+    vector<ObjRedundancy> tmpList;
     file_t gTraceFile = pt->output_file;
-
+    
     uint64_t grandTotalRedundantBytes = 0;
-    uint64_t grandTotalRedundantIns = 0;
-    dr_fprintf(gTraceFile, "\n--------------- Dumping Approximation Redundancy Info ----------------\n");
+    dr_fprintf(gTraceFile, "\n--------------- Dumping Data Approximation Redundancy Info ----------------\n");
     dr_fprintf(gTraceFile, "\n*************** Dump Data(delta=%.2f%%) from Thread %d ****************\n", delta*100,threadId);
 
-    printf("Dumping INTEGER Redundancy Info... Total num : %ld\n",pt->FPRedMap->size());
-    uint64_t count = 0; uint64_t rep = -1;
-    for (unordered_map<uint64_t, FPRedLogs>::iterator it = pt->FPRedMap->begin(); it != pt->FPRedMap->end(); ++it) {
+    int count=0;
+    int rep=-1;
+    int total = pt->FPRedMap->size();
+    tmpList.reserve(total);
+    for(FPRedLogMap::iterator it = pt->FPRedMap->begin(); it != pt->FPRedMap->end(); ++it) {
         ++count;
-        if(100 * count / pt->INTRedMap->size()!=rep) {
-            rep = 100 * count / pt->INTRedMap->size();
-            printf("\r%ld%%  Finish",rep);
+        if(100 * count / total!=rep) {
+            rep = 100 * count / total;
+            printf("\r[ZEROSPY INFO] Stage 1 : %3d %% Finish",rep);
             fflush(stdout);
         }
-        ApproxRedundacyData tmp = { static_cast<context_handle_t>((*it).first), (*it).second.fred,(*it).second.ftot, (*it).second.redByteMap,(*it).second.AccessLen, (*it).second.size};
-        tmpList.push_back(tmp);
-        grandTotalRedundantBytes += (*it).second.fred * (*it).second.AccessLen;
-    }
-    printf("\r100%%  Finish\n");
-    fflush(stdout);
-    
-    __sync_fetch_and_add(&grandTotBytesApproxRedLoad,grandTotalRedundantBytes);
-    
-    dr_fprintf(gTraceFile, "\n Total redundant bytes = %f %%\n", grandTotalRedundantBytes * 100.0 / threadBytesLoad);
-    dr_fprintf(gTraceFile, "\n INFO : Total redundant bytes = %f %% (%ld / %ld) \n", grandTotalRedundantBytes * 100.0 / threadBytesLoad, grandTotalRedundantBytes, threadBytesLoad);
-    
-#ifdef ENABLE_FILTER_BEFORE_SORT
-#define FILTER_THESHOLD 1000
-    dr_fprintf(gTraceFile, "\n Filter out small redundancies according to the predefined threshold: %.2lf %%\n", 100.0/(double)FILTER_THESHOLD);
-    // pt->FPRedMap->clear();
-    vector<ApproxRedundacyData> tmpList2;
-    tmpList2 = move(tmpList);
-    tmpList.clear(); // make sure it is empty
-    tmpList.reserve(tmpList2.size());
-    for(tmpIt = tmpList2.begin();tmpIt != tmpList2.end(); ++tmpIt) {
-        if(tmpIt->all0freq * FILTER_THESHOLD > tmpIt->ftot) {
-            tmpList.push_back(*tmpIt);
+        ObjRedundancy tmp = {(*it).first, 0};
+        for(FPRedLogSizeMap::iterator it2 = it->second.begin(); it2 != it->second.end(); ++it2) {
+            tmp.bytes += it2->second.red;
         }
+        if(tmp.bytes==0) continue;
+        grandTotalRedundantBytes += tmp.bytes;
+        tmpList.push_back(tmp); 
     }
-    dr_fprintf(gTraceFile, " Remained Redundancies: %ld (%.2lf %%)\n", tmpList.size(), (double)tmpList.size()/(double)tmpList2.size());
-    tmpList2.clear();
-#undef FILTER_THRESHOLD
-#endif
+    printf("\n[ZEROSPY INFO] Stage 1 Finish\n");
 
-    sort(tmpList.begin(), tmpList.end(), ApproxRedundacyCompare);
-    int cntxtNum = 0;
-    for (vector<ApproxRedundacyData>::iterator listIt = tmpList.begin(); listIt != tmpList.end(); ++listIt) {
-        if (cntxtNum < MAX_REDUNDANT_CONTEXTS_TO_LOG) {
-            dr_fprintf(gTraceFile, "\n======= (%f) %% of total Redundant, with local redundant %f %% (%ld Zeros / %ld Reads) ======\n",
-                (*listIt).all0freq * 100.0 / grandTotalRedundantBytes,
-                (*listIt).all0freq * 100.0 / (*listIt).ftot,
-                (*listIt).all0freq,(*listIt).ftot); 
-            dr_fprintf(gTraceFile, "\n======= Redundant byte map : [mantiss | exponent | sign] ========\n");
-            if((*listIt).size==4) {
-                dr_fprintf(gTraceFile, "%s", getFpRedMapString_SP((*listIt).byteMap, (*listIt).accessLen/4).c_str());
-            } else {
-                dr_fprintf(gTraceFile, "%s", getFpRedMapString_DP((*listIt).byteMap, (*listIt).accessLen/8).c_str());
+    __sync_fetch_and_add(&grandTotBytesApproxRedLoad,grandTotalRedundantBytes);
+
+    dr_fprintf(gTraceFile, "\n Total redundant bytes = %f %%\n", grandTotalRedundantBytes * 100.0 / threadBytesLoad);
+    sort(tmpList.begin(), tmpList.end(), ObjRedundancyCompare);
+
+    int objNum = 0;
+    vector<uint8_t> state;
+    for(vector<ObjRedundancy>::iterator listIt = tmpList.begin(); listIt != tmpList.end(); ++listIt) {
+        if(objNum++ >= MAX_OBJS_TO_LOG) break;
+        if(100 * objNum / total!=rep) {
+            rep = 100 * objNum / total;
+            printf("\r[ZEROSPY INFO] Stage 2 : %3d %% Finish",rep);
+            fflush(stdout);
+        }
+        if((uint8_t)DECODE_TYPE((*listIt).objID) == DYNAMIC_OBJECT) {
+            dr_fprintf(gTraceFile, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Dynamic Object: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+            drcctlib_print_full_cct(gTraceFile, DECODE_NAME((*listIt).objID), true, true, MAX_DEPTH);
+        } else {
+            dr_fprintf(gTraceFile, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", drcctlib_get_str_from_strpool((uint32_t)DECODE_NAME((*listIt).objID)));
+        }
+        dr_fprintf(gTraceFile, "\n==========================================\n");
+        dr_fprintf(gTraceFile, "Redundancy Ratio = %f %% (%ld Bytes)\n", (*listIt).bytes * 100.0 / grandTotalRedundantBytes, (*listIt).bytes);
+
+        for(FPRedLogSizeMap::iterator it2 = (*pt->FPRedMap)[(*listIt).objID].begin(); it2 != (*pt->FPRedMap)[(*listIt).objID].end(); ++it2) {
+            uint64_t dfreq = 0;
+            uint64_t dread = 0;
+            uint64_t dsize = it2->first;
+            uint8_t  dtype = it2->second.typesz;
+            bitref_t accmap = &(it2->second.accmap);
+            bitref_t redmap = &(it2->second.redmap);
+
+            assert(accmap->size==dsize);
+            assert(accmap->size==redmap->size);
+
+            for(size_t i=0;i<accmap->size;++i) {
+                if(!bitvec_at(accmap, i)) {
+                    ++dread;
+                    if(bitvec_at(redmap, i)) ++dfreq;
+                    i += dtype-1; // each loop will increament 1
+                }
             }
-            dr_fprintf(gTraceFile, "\n===== [AccessLen=%d, typesize=%d] =======\n", (*listIt).accessLen, (*listIt).size);
-            dr_fprintf(gTraceFile, "\n---------------------Redundant load with---------------------------\n");
-            drcctlib_print_full_cct(gTraceFile, (*listIt).cntxt, true, true, MAX_DEPTH);
+                
+            dr_fprintf(gTraceFile, "\n\n======= DATA SIZE : ");
+            PrintSize(gTraceFile, dsize, " Elements");
+            dr_fprintf(gTraceFile, "( Not Accessed Data %f %% (%ld Reads), Redundant Data %f %% (%ld Reads) )", 
+                    (dsize-dread) * 100.0 / dsize, dsize-dread, 
+                    dfreq * 100.0 / dsize, dfreq);
+
+            dr_fprintf(gTraceFile, "\n======= Redundant byte map : [0] ");
+            uint32_t num=0;
+            for(size_t i=0;i<accmap->size;++i) {
+                if(!bitvec_at(accmap, i)) {
+                    if(bitvec_at(redmap, i)) {
+                        dr_fprintf(gTraceFile, "00 ");
+                    } else {
+                        dr_fprintf(gTraceFile, "XX ");
+                    }
+                } else {
+                    dr_fprintf(gTraceFile, "?? ");
+                }
+                ++num;
+                if(num>MAX_REDMAP_PRINT_SIZE) {
+                    dr_fprintf(gTraceFile, "... ");
+                    break;
+                }
+            }
         }
-        else {
-            break;
+#if 0
+        if(objNum<=MAX_PRINT_FULL) {
+            char fn[50] = {};
+            sprintf(fn,"%lx.redmap",(*listIt).objID);
+            file_t fp = dr_open(fn,"w");
+            if((uint8_t)DECODE_TYPE((*listIt).objID) == DYNAMIC_OBJECT) {
+                dr_fprintf(fp, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Dynamic Object: %lx^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n",(*listIt).objID);
+            } else  
+                dr_fprintf(fp, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s, %lx ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", GetStringFromStringPool((uint32_t)DECODE_NAME((*listIt).objID)),(*listIt).objID);
+            for(size_t i=0;i<accmap->size;++i) {
+                if(!bitvec_at(accmap, i)) {
+                    if(bitvec_at(redmap, i)) {
+                        dr_fprintf(fp, "00 ");
+                    } else {
+                        dr_fprintf(fp, "XX ");
+                    }
+                } else {
+                    dr_fprintf(fp, "?? ");
+                }
+            }
         }
-        cntxtNum++;
+#endif
     }
-    dr_fprintf(gTraceFile, "\n------------ Dumping Approximation Redundancy Info Finish -------------\n");
-    printf("Floating Point Report dumped\n");
-    fflush(stdout);
+    printf("\n[ZEROSPY INFO] Stage 2 Finish\n");
+
+    dr_fprintf(gTraceFile, "\n------------ Dumping Approx Redundancy Info Finish -------------\n");
     return grandTotalRedundantBytes;
-}
-/*******************************************************************/
-static uint64_t getThreadByteLoad(per_thread_t *pt) {
-    register uint64_t x = 0;
-    for (unordered_map<uint64_t, INTRedLogs>::iterator it = pt->INTRedMap->begin(); it != pt->INTRedMap->end(); ++it) {
-        x += (*it).second.tot;
-    }
-    for (unordered_map<uint64_t, FPRedLogs>::iterator it = pt->FPRedMap->begin(); it != pt->FPRedMap->end(); ++it) {
-        x += (*it).second.ftot * (*it).second.AccessLen;
-    }
-    return x;
 }
 /*******************************************************************/
 static void
@@ -1641,7 +2031,7 @@ ClientThreadEnd(void *drcontext)
 #endif
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
     if (pt->INTRedMap->empty() && pt->FPRedMap->empty()) return;
-    uint64_t threadByteLoad = getThreadByteLoad(pt);
+    uint64_t threadByteLoad = pt->bytesLoad;
     __sync_fetch_and_add(&grandTotBytesLoad,threadByteLoad);
     int threadId = drcctlib_get_thread_id();
     uint64_t threadRedByteLoadINT = PrintRedundancyPairs(pt, threadByteLoad, threadId);
@@ -1661,10 +2051,12 @@ ClientThreadEnd(void *drcontext)
     dr_close_file(pt->output_file);
     delete pt->INTRedMap;
     delete pt->FPRedMap;
+#ifdef ZEROSPY_DEBUG
     for(size_t i=0;i<pt->instr_clones->size();++i) {
         instr_destroy(drcontext, (*pt->instr_clones)[i]);
     }
     delete pt->instr_clones;
+#endif
 #ifdef DEBUG_REUSE
     dr_close_file(pt->log_file);
 #endif
@@ -1689,10 +2081,11 @@ ClientInit(int argc, const char *argv[])
     char name[MAXIMUM_PATH] = "x86-";
 #endif
     gethostname(name + strlen(name), MAXIMUM_PATH - strlen(name));
-    sprintf(name + strlen(name), "-%d-zerospy", pid);
+    sprintf(name + strlen(name), "-%d-zerospy-datacentric", pid);
     g_folder_name.assign(name, strlen(name));
     mkdir(g_folder_name.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
 
+    dr_fprintf(STDOUT, "[ZEROSPY INFO] Using Data Centric Zerospy\n");
     dr_fprintf(STDOUT, "[ZEROSPY INFO] Profiling result directory: %s\n", g_folder_name.c_str());
 
     sprintf(name+strlen(name), "/zerospy.log");
@@ -1707,11 +2100,14 @@ ClientInit(int argc, const char *argv[])
         }
         dr_fprintf(STDOUT, "[ZEROSPU INFO] Sampling Rate: %.3f, Window Size: %ld\n", conf2rate[op_rate.get_value()], conf2window[op_window.get_value()]);
         dr_fprintf(gFile,  "[ZEROSPU INFO] Sampling Rate: %.3f, Window Size: %ld\n", conf2rate[op_rate.get_value()], conf2window[op_window.get_value()]);
+#ifdef USE_CLEANCALL
+        BBSample_target[0] = BBSampleTable[op_rate.get_value()][op_window.get_value()][0];
+        BBSample_target[1] = BBSampleTable[op_rate.get_value()][op_window.get_value()][1];
+        BBSampleNoFlush_target = BBSampleNoFlushTable[op_rate.get_value()][op_window.get_value()];
+#else
         window_enable = conf2rate[op_rate.get_value()] * conf2window[op_window.get_value()];
         window_disable= conf2window[op_window.get_value()];
-        // BBSample_target[0] = BBSampleTable[op_rate.get_value()][op_window.get_value()][0];
-        // BBSample_target[1] = BBSampleTable[op_rate.get_value()][op_window.get_value()][1];
-        // BBSampleNoFlush_target = BBSampleNoFlushTable[op_rate.get_value()][op_window.get_value()];
+#endif
     }
     if (op_help.get_value()) {
         dr_fprintf(STDOUT, "%s\n", droption_parser_t::usage_long(DROPTION_SCOPE_CLIENT).c_str());
@@ -1744,13 +2140,15 @@ ClientExit(void)
     }
 #endif
     dr_close_file(gFile);
+    dr_mutex_destroy(gLock);
 #ifdef ENABLE_SAMPLING
+#ifndef USE_CLEANCALL
     if (!dr_raw_tls_cfree(tls_offs, INSTRACE_TLS_COUNT)) {
         ZEROSPY_EXIT_PROCESS(
             "ERROR: zerospy dr_raw_tls_calloc fail");
     }
 #endif
-    dr_mutex_destroy(gLock);
+#endif
     drcctlib_exit();
     if (!drmgr_unregister_thread_init_event(ClientThreadStart) ||
         !drmgr_unregister_thread_exit_event(ClientThreadEnd) ||
@@ -1810,15 +2208,18 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
         ZEROSPY_EXIT_PROCESS("ERROR: zerospy drmgr_register_tls_field fail");
     }
 #ifdef ENABLE_SAMPLING
+#ifndef USE_CLEANCALL
     if (!dr_raw_tls_calloc(&tls_seg, &tls_offs, INSTRACE_TLS_COUNT, 0)) {
         ZEROSPY_EXIT_PROCESS(
             "ERROR: zerospy dr_raw_tls_calloc fail");
     }
 #endif
+#endif
     gLock = dr_mutex_create();
 
-    // drcctlib_init(ZEROSPY_FILTER_READ_MEM_ACCESS_INSTR, INVALID_FILE, InstrumentInsCallback, false/*do data centric*/);
-    drcctlib_init_ex(ZEROSPY_FILTER_READ_MEM_ACCESS_INSTR, INVALID_FILE, InstrumentInsCallback, NULL, NULL, DRCCTLIB_CACHE_MODE);
+    // drcctlib_init(ZEROSPY_FILTER_READ_MEM_ACCESS_INSTR, INVALID_FILE, InstrumentInsCallback, true/*do data centric*/);
+    drcctlib_init_ex(ZEROSPY_FILTER_READ_MEM_ACCESS_INSTR, INVALID_FILE, InstrumentInsCallback, NULL, NULL,
+                     DRCCTLIB_COLLECT_DATA_CENTRIC_MESSAGE | DRCCTLIB_CACHE_MODE);
     dr_register_exit_event(ClientExit);
 }
 
