@@ -24,6 +24,7 @@ uint64_t get_miliseconds() {
 #include "drutil.h"
 #include "drcctlib.h"
 #include "utils.h"
+#include "drcctlib_hpcviewer_format.h"
 
 #define ENABLE_SAMPLING 1
 #ifdef ENABLE_SAMPLING
@@ -196,6 +197,11 @@ bool warned=false;
 #ifdef ZEROSPY_DEBUG
 file_t gDebug;
 #endif
+
+// for metric logging
+int redfreqltot_metric_id = 0;
+int redzero_metric_id = 0;
+int redltot_metric_id = 0;
 
 // global metrics
 uint64_t grandTotBytesLoad = 0;
@@ -1621,6 +1627,41 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
     fflush(stdout);
     return grandTotalRedundantBytes;
 }
+
+static void HPCRunRedundancyPairs(per_thread_t *pt, void *drcontext) {    
+    vector<RedundacyData> tmpList;
+    vector<RedundacyData>::iterator tmpIt;
+
+    tmpList.reserve(pt->INTRedMap->size());
+
+    for (unordered_map<uint64_t, INTRedLogs>::iterator it = pt->INTRedMap->begin(); it != pt->INTRedMap->end(); ++it) {
+        RedundacyData tmp = { DECODE_KILL((*it).first), (*it).second.red,(*it).second.fred,(*it).second.tot,(*it).second.redByteMap,DECODE_DEAD((*it).first)};
+        tmpList.push_back(tmp);
+    }
+
+    sort(tmpList.begin(), tmpList.end(), RedundacyCompare);
+    vector<HPCRunCCT_t*> HPCRunNodes;
+    int cntxtNum = 0;
+    for (vector<RedundacyData>::iterator listIt = tmpList.begin(); listIt != tmpList.end(); ++listIt) {
+        if (cntxtNum < MAX_REDUNDANT_CONTEXTS_TO_LOG) {
+            HPCRunCCT_t *HPCRunNode = new HPCRunCCT_t();
+            HPCRunNode->ctxt_hndl_list.push_back((*listIt).cntxt);
+            //HPCRunNode->ctxt_hndl_list.push_back((*listIt).cntxt);
+            //HPCRunNode->ctxt_hndl_list.push_back((*listIt).cntxt);
+            HPCRunNode->metric_list.push_back((*listIt).frequency);
+            HPCRunNode->metric_list.push_back((*listIt).ltot);
+            HPCRunNode->metric_list.push_back((*listIt).frequency / (*listIt).ltot);
+            HPCRunNodes.push_back(HPCRunNode);
+        }
+        else {
+            break;
+        }
+        cntxtNum++;
+    }
+    build_thread_custom_cct_hpurun_format(HPCRunNodes, drcontext);
+    write_thread_custom_cct_hpurun_format(drcontext);
+}
+
 /*******************************************************************/
 static uint64_t getThreadByteLoad(per_thread_t *pt) {
     register uint64_t x = 0;
@@ -1642,6 +1683,7 @@ ClientThreadEnd(void *drcontext)
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
     if (pt->INTRedMap->empty() && pt->FPRedMap->empty()) return;
     uint64_t threadByteLoad = getThreadByteLoad(pt);
+    HPCRunRedundancyPairs(pt, drcontext);
     __sync_fetch_and_add(&grandTotBytesLoad,threadByteLoad);
     int threadId = drcctlib_get_thread_id();
     uint64_t threadRedByteLoadINT = PrintRedundancyPairs(pt, threadByteLoad, threadId);
@@ -1744,6 +1786,7 @@ ClientExit(void)
     }
 #endif
     dr_close_file(gFile);
+    hpcrun_format_exit();
 #ifdef ENABLE_SAMPLING
     if (!dr_raw_tls_cfree(tls_offs, INSTRACE_TLS_COUNT)) {
         ZEROSPY_EXIT_PROCESS(
@@ -1778,6 +1821,11 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     dr_set_client_name("DynamoRIO Client 'zerospy'",
                        "http://dynamorio.org/issues");
     ClientInit(argc, argv);
+
+    hpcrun_format_init(dr_get_application_name(), false);
+    redzero_metric_id = hpcrun_create_metric("Redzero");                                                              //change!
+    redltot_metric_id = hpcrun_create_metric("Load Bytes");                                                              //change!
+    redfreqltot_metric_id = hpcrun_create_metric("freq/ltot");
 
     if (!drmgr_init()) {
         ZEROSPY_EXIT_PROCESS("ERROR: zerospy unable to initialize drmgr");
