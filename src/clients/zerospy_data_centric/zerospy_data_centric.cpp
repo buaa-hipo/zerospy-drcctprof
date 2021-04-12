@@ -1664,7 +1664,7 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
 #endif
     {
 #ifndef ARM_CCTLIB
-        if (drreg_reserve_register(drcontext, ilist, where, NULL, &reg2) != DRREG_SUCCESS) {
+        if (drreg_reserve_register(drcontext, bb, instr, NULL, &reg2) != DRREG_SUCCESS) {
             ZEROSPY_EXIT_PROCESS("InstrumentMem drreg_reserve_register != DRREG_SUCCESS");
         }
 #endif
@@ -1676,7 +1676,7 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
             }
         }
 #ifndef ARM_CCTLIB
-        if (drreg_unreserve_register(drcontext, ilist, where, reg2) != DRREG_SUCCESS) {
+        if (drreg_unreserve_register(drcontext, bb, instr, reg2) != DRREG_SUCCESS) {
             ZEROSPY_EXIT_PROCESS("InstrumentMem drreg_unreserve_register != DRREG_SUCCESS");
         }
 #endif
