@@ -6,8 +6,6 @@
 #include <assert.h>
 #include <algorithm>
 
-#define ARM_CCTLIB
-#define ARM64_CCTLIB
 // #define ZEROSPY_DEBUG
 #define _WERROR
 
