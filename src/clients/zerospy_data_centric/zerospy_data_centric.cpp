@@ -1390,7 +1390,7 @@ struct ZerospyInstrument{
         uint32_t refSize = opnd_size_in_bytes(opnd_get_size(opnd));
         if (refSize==0) {
             // Something strange happened, so ignore it
-            assert(0 && "Something strange happened! refSize==0.\n");
+            // assert(0 && "Something strange happened! refSize==0.\n");
             return ;
         }
 #ifdef ZEROSPY_DEBUG
@@ -1621,6 +1621,36 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
     // Currently, we mark x87 control instructions handling FPU states are ignorable (not insterested)
     if(instr_is_ignorable(instr)) {
         return ;
+    }
+
+#ifdef X86
+    if(!instr_is_gather(instr))
+#endif
+    {
+        bool ignore=true;
+        int num_srcs = instr_num_srcs(instr);
+        for(int i=0; i<num_srcs; ++i) {
+            opnd_t opnd = instr_get_src(instr, i);
+            if(opnd_is_memory_reference(opnd)) {
+                uint32_t refSize = opnd_size_in_bytes(opnd_get_size(opnd));
+                if (refSize!=0) {
+                    ignore = false;
+                    break;
+                }
+#ifdef DEBUG_ZEROSPY
+                else {
+                    // Something strange happened, so ignore it
+                    dr_mutex_lock(gLock);
+                    dr_fprintf(STDOUT, "^^ INFO: Disassembled Instruction ^^^\n");
+                    dr_fprintf(STDOUT, "ins=%p\n", instr);
+                    disassemble(drcontext, instr_get_app_pc(instr), STDOUT);
+                    dr_fprintf(STDOUT, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                    dr_mutex_unlock(gLock);
+                }
+#endif
+            }
+        }
+        if(ignore) return ;
     }
 
     // store cct in tls filed

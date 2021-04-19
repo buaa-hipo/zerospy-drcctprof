@@ -5,6 +5,8 @@
 #include <assert.h>
 #include <algorithm>
 
+#define USE_TIMER
+
 // #define ZEROSPY_DEBUG
 #define _WERROR
 
@@ -23,9 +25,11 @@ uint64_t get_miliseconds() {
 #include "drreg.h"
 #include "drutil.h"
 #include "drcctlib.h"
+#include "dr_tools.h"
+#include <sys/time.h>
 #include "utils.h"
 
-// #define USE_CLEANCALL
+#define USE_CLEANCALL
 #define ENABLE_SAMPLING 1
 #ifdef ENABLE_SAMPLING
 // different frequency configurations:
@@ -199,10 +203,15 @@ typedef struct _per_thread_t {
     vector<instr_t*> *instr_clones;
 } per_thread_t;
 
-#ifdef USE_CLEANCALL
-#define IS_SAMPLED(pt, WINDOW_ENABLE) (pt->sampleFlag)
+#ifdef USE_TIMER
+bool global_sample_flag = true;
+#define IS_SAMPLED(pt, a) (global_sample_flag)
 #else
-#define IS_SAMPLED(pt, WINDOW_ENABLE) ((int64_t)(BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR))<(int64_t)WINDOW_ENABLE)
+    #ifdef USE_CLEANCALL
+    #define IS_SAMPLED(pt, WINDOW_ENABLE) (pt->sampleFlag)
+    #else
+    #define IS_SAMPLED(pt, WINDOW_ENABLE) ((int64_t)(BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR))<(int64_t)WINDOW_ENABLE)
+    #endif
 #endif
 file_t gFile;
 static void *gLock;
@@ -611,8 +620,10 @@ struct BBSample {
     {
         void *drcontext = dr_get_current_drcontext();
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+        // if(drcctlib_get_thread_id()!=0)
+        // printf("[THREAD %d] BB UPDATE %lld, ins count=%d, %d == %d!\n", drcctlib_get_thread_id(), pt->numIns, instruction_count, pt->sampleFlag, sampleFlag);
         pt->numIns += instruction_count;
-        if(pt->sampleFlag) {
+        if(sampleFlag) {
             if(pt->numIns > WINDOW_ENABLE) {
                 pt->sampleFlag = false;
             }
@@ -624,11 +635,49 @@ struct BBSample {
         }
         // If the sample flag is changed, flush the region and re-instrument
         if(pt->sampleFlag != sampleFlag) {
+            // printf("[THREAD %d] BB FLUSH %d %lld, ins count=%d!\n", drcctlib_get_thread_id(), pt->sampleFlag, pt->numIns, instruction_count);
+            // assert(pt->numIns==0 || (pt->numIns > WINDOW_ENABLE && pt->numIns <= WINDOW_ENABLE+instruction_count) );
             dr_mcontext_t mcontext;
             mcontext.size = sizeof(mcontext);
             mcontext.flags = DR_MC_ALL;
-            // flush all fragments in code cache
-            dr_flush_region(0, ~((ptr_uint_t)0));
+            // // flush all fragments in code cache
+            // dr_flush_region(0, ~((ptr_uint_t)0));
+            dr_flush_region(src, 1);
+            dr_get_mcontext(drcontext, &mcontext);
+            mcontext.pc = src;
+            dr_redirect_execution(&mcontext);
+        }
+    }
+
+    static void update_per_bb_shared(uint instruction_count, app_pc src)
+    {
+        void *drcontext = dr_get_current_drcontext();
+        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+        pt->numIns += instruction_count;
+        if(sampleFlag) {
+            if(pt->numIns > WINDOW_ENABLE) {
+                pt->sampleFlag = false;
+            }
+        } else {
+            if(pt->numIns > WINDOW_DISABLE) {
+                pt->sampleFlag = true;
+                pt->numIns = 0;
+            }
+        }
+        // If the sample flag is changed, flush the region and re-instrument
+        if(pt->sampleFlag != sampleFlag) {
+            if(pt->numIns!=0 && (pt->numIns <= WINDOW_ENABLE || pt->numIns > WINDOW_ENABLE+instruction_count)) {
+                pt->numIns = sampleFlag ? WINDOW_ENABLE : 0;
+                return ;
+            }
+            // printf("[THREAD %d] BB FLUSH %d %lld, ins count=%d!\n", drcctlib_get_thread_id(), pt->sampleFlag, pt->numIns, instruction_count);
+            assert(pt->numIns==0 || (pt->numIns > WINDOW_ENABLE && pt->numIns <= WINDOW_ENABLE+instruction_count) );
+            dr_mcontext_t mcontext;
+            mcontext.size = sizeof(mcontext);
+            mcontext.flags = DR_MC_ALL;
+            // // flush all fragments in code cache
+            // dr_flush_region(0, ~((ptr_uint_t)0));
+            dr_delay_flush_region(src, 1, 0, NULL);
             dr_get_mcontext(drcontext, &mcontext);
             mcontext.pc = src;
             dr_redirect_execution(&mcontext);
@@ -674,6 +723,46 @@ void (*BBSampleTable[RATE_NUM][WINDOW_NUM][2])(uint, app_pc) = {
         {BBSample<RATE_5_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
     },
 };
+
+void (*BBSampleTableShared[RATE_NUM][WINDOW_NUM][2])(uint, app_pc) = {
+    {   {BBSample<RATE_0_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb_shared, BBSample<RATE_0_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb_shared},
+        {BBSample<RATE_0_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb_shared, BBSample<RATE_0_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb_shared},
+        {BBSample<RATE_0_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb_shared, BBSample<RATE_0_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb_shared},
+        {BBSample<RATE_0_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb_shared, BBSample<RATE_0_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb_shared},
+        {BBSample<RATE_0_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb_shared, BBSample<RATE_0_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb_shared},
+    },
+    {   {BBSample<RATE_1_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb_shared, BBSample<RATE_1_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb_shared},
+        {BBSample<RATE_1_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb_shared, BBSample<RATE_1_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb_shared},
+        {BBSample<RATE_1_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb_shared, BBSample<RATE_1_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb_shared},
+        {BBSample<RATE_1_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb_shared, BBSample<RATE_1_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb_shared},
+        {BBSample<RATE_1_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb_shared, BBSample<RATE_1_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb_shared},
+    },
+    {   {BBSample<RATE_2_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb_shared, BBSample<RATE_2_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb_shared},
+        {BBSample<RATE_2_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb_shared, BBSample<RATE_2_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb_shared},
+        {BBSample<RATE_2_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb_shared, BBSample<RATE_2_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb_shared},
+        {BBSample<RATE_2_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb_shared, BBSample<RATE_2_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb_shared},
+        {BBSample<RATE_2_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb_shared, BBSample<RATE_2_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb_shared},
+    },
+    {   {BBSample<RATE_3_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb_shared, BBSample<RATE_3_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb_shared},
+        {BBSample<RATE_3_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb_shared, BBSample<RATE_3_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb_shared},
+        {BBSample<RATE_3_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb_shared, BBSample<RATE_3_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb_shared},
+        {BBSample<RATE_3_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb_shared, BBSample<RATE_3_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb_shared},
+        {BBSample<RATE_3_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb_shared, BBSample<RATE_3_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb_shared},
+    },
+    {   {BBSample<RATE_4_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb_shared, BBSample<RATE_4_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb_shared},
+        {BBSample<RATE_4_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb_shared, BBSample<RATE_4_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb_shared},
+        {BBSample<RATE_4_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb_shared, BBSample<RATE_4_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb_shared},
+        {BBSample<RATE_4_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb_shared, BBSample<RATE_4_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb_shared},
+        {BBSample<RATE_4_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb_shared, BBSample<RATE_4_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb_shared},
+    },
+    {   {BBSample<RATE_5_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb_shared, BBSample<RATE_5_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb_shared},
+        {BBSample<RATE_5_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb_shared, BBSample<RATE_5_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb_shared},
+        {BBSample<RATE_5_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb_shared, BBSample<RATE_5_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb_shared},
+        {BBSample<RATE_5_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb_shared, BBSample<RATE_5_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb_shared},
+        {BBSample<RATE_5_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb_shared, BBSample<RATE_5_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb_shared},
+    },
+};
+
 void (*BBSample_target[2])(uint, app_pc);
 
 template<int64_t WINDOW_ENABLE, int64_t WINDOW_DISABLE>
@@ -966,9 +1055,33 @@ struct BBSampleInstrument {
 // endif USE_CLEANCALL
 #endif
 
+template<bool ref_sampleFlag>
+void bb_flush_code(app_pc src) {
+    if(global_sample_flag!=ref_sampleFlag) {
+        // printf("FLUSH!\n"); fflush(stdout);
+        void *drcontext = dr_get_current_drcontext();
+        dr_mcontext_t mcontext;
+        mcontext.size = sizeof(mcontext);
+        mcontext.flags = DR_MC_ALL;
+        // flush all fragments in code cache
+        dr_flush_region(src, 1);
+        dr_get_mcontext(drcontext, &mcontext);
+        mcontext.pc = src;
+        dr_redirect_execution(&mcontext);
+    }
+}
+
 static dr_emit_flags_t
 event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, bool translating, OUT void **user_data)
 {
+    if(global_sample_flag) {
+        dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void*) bb_flush_code<true>, false, 1, 
+                            OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
+    } else {
+        dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void*) bb_flush_code<false>, false, 1, 
+                            OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
+    }
+    return DR_EMIT_DEFAULT;
     int num_instructions = 0;
     instr_t *instr;
     /* count the number of instructions in this block */
@@ -1467,6 +1580,26 @@ InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, i
     }
 }
 
+inline void getUnusedRegEntry(drvector_t* vec, instr_t* instr) {
+    drreg_init_and_fill_vector(vec, true);
+    // the regs used in this instr is not allowd to spill
+    for(int i=0; i<instr_num_srcs(instr); ++i) {
+        opnd_t opnd = instr_get_src(instr, i);
+        for(int j=0; j<opnd_num_regs_used(opnd); ++j) {
+            drreg_set_vector_entry(vec, opnd_get_reg_used(opnd, j), false);
+        }
+    }
+}
+
+#define RESERVE_REG(dc, bb, instr, vec, reg) do {\
+    if (drreg_reserve_register(dc, bb, instr, vec, &reg) != DRREG_SUCCESS) { \
+        ZEROSPY_EXIT_PROCESS("ERROR @ %s:%d: drreg_reserve_register != DRREG_SUCCESS", __FILE__, __LINE__); \
+    } } while(0)
+#define UNRESERVE_REG(dc, bb, instr, reg) do { \
+    if (drreg_unreserve_register(dc, bb, instr, reg) != DRREG_SUCCESS) { \
+        ZEROSPY_EXIT_PROCESS("ERROR @ %s:%d: drreg_unreserve_register != DRREG_SUCCESS", __FILE__, __LINE__); \
+    } } while(0)
+
 void
 InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
 {
@@ -1475,6 +1608,7 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
     if( op_enable_sampling.get_value() && 
        !op_no_flush.get_value() && 
        !IS_SAMPLED(pt, window_enable)) {
+           // printf("[Thread %d] No Instrument!\n", drcctlib_get_thread_id()); fflush(stdout);
            return;
     }
     // extract data from drcctprof's given message
@@ -1492,6 +1626,36 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
         return ;
     }
 
+#ifdef X86
+    if(!instr_is_gather(instr))
+#endif
+    {
+        bool ignore=true;
+        int num_srcs = instr_num_srcs(instr);
+        for(int i=0; i<num_srcs; ++i) {
+            opnd_t opnd = instr_get_src(instr, i);
+            if(opnd_is_memory_reference(opnd)) {
+                uint32_t refSize = opnd_size_in_bytes(opnd_get_size(opnd));
+                if (refSize!=0) {
+                    ignore = false;
+                    break;
+                }
+#ifdef DEBUG_ZEROSPY
+                else {
+                    // Something strange happened, so ignore it
+                    dr_mutex_lock(gLock);
+                    dr_fprintf(STDOUT, "^^ INFO: Disassembled Instruction ^^^\n");
+                    dr_fprintf(STDOUT, "ins=%p\n", instr);
+                    disassemble(drcontext, instr_get_app_pc(instr), STDOUT);
+                    dr_fprintf(STDOUT, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                    dr_mutex_unlock(gLock);
+                }
+#endif
+            }
+        }
+        if(ignore) return ;
+    }
+
     // store cct in tls filed
     // InstrumentIns(drcontext, bb, instr, slot);
     /* We need two scratch registers to get the value */
@@ -1505,11 +1669,10 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
     } else
 #endif
     {
-        if (drreg_reserve_register(drcontext, bb, instr, NULL, &reg1) != DRREG_SUCCESS 
-            || drreg_reserve_register(drcontext, bb, instr, NULL, &reg2) != DRREG_SUCCESS
-            ) {
-            ZEROSPY_EXIT_PROCESS("InstrumentMem drreg_reserve_register != DRREG_SUCCESS");
-        }
+        drvector_t vec;
+        getUnusedRegEntry(&vec, instr);
+        RESERVE_REG(drcontext, bb, instr, &vec, reg1);
+        RESERVE_REG(drcontext, bb, instr, &vec, reg2);
         int num_srcs = instr_num_srcs(instr);
         for(int i=0; i<num_srcs; ++i) {
             opnd_t opnd = instr_get_src(instr, i);
@@ -1517,21 +1680,17 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
                 InstrumentMem(drcontext, bb, instr, opnd, slot, reg1, reg2);
             }
         }
-        if (drreg_unreserve_register(drcontext, bb, instr, reg1) != DRREG_SUCCESS 
-            || drreg_unreserve_register(drcontext, bb, instr, reg2) != DRREG_SUCCESS
-            ) {
-            ZEROSPY_EXIT_PROCESS("InstrumentMem drreg_unreserve_register != DRREG_SUCCESS");
-        }
+        UNRESERVE_REG(drcontext, bb, instr, reg1);
+        UNRESERVE_REG(drcontext, bb, instr, reg2);
     }
 #else
 // ELSE USE_CLEANCALL
-    if (drreg_reserve_register(drcontext, bb, instr, NULL, &reg1) != DRREG_SUCCESS 
+    drvector_t vec;
+    getUnusedRegEntry(&vec, instr);
+    RESERVE_REG(drcontext, bb, instr, &vec, reg1);
 #ifdef ARM_CCTLIB
-        || drreg_reserve_register(drcontext, bb, instr, NULL, &reg2) != DRREG_SUCCESS
+    RESERVE_REG(drcontext, bb, instr, &vec, reg2);
 #endif
-        ) {
-        ZEROSPY_EXIT_PROCESS("InstrumentMem drreg_reserve_register != DRREG_SUCCESS");
-    }
     instr_t* skipcall = NULL;
     bool dead = false;
     if(op_no_flush.get_value()) {
@@ -1552,17 +1711,12 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
     // gather may result in failure, need special care
     if(instr_is_gather(instr)) {
         // We use instr_compute_address_ex_pos to handle gather (with VSIB addressing)
-#ifdef DEBUG
-        printf("INFO: HANDLE vgather\n");
-#endif
         ZerospyInstrument::InstrumentReadValueBeforeVGather(drcontext, bb, instr, slot);
     } else
 #endif
     {
 #ifndef ARM_CCTLIB
-        if (drreg_reserve_register(drcontext, bb, instr, NULL, &reg2) != DRREG_SUCCESS) {
-            ZEROSPY_EXIT_PROCESS("InstrumentMem drreg_reserve_register != DRREG_SUCCESS");
-        }
+        RESERVE_REG(drcontext, bb, instr, &vec, reg2);
 #endif
         int num_srcs = instr_num_srcs(instr);
         for(int i=0; i<num_srcs; ++i) {
@@ -1572,9 +1726,7 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
             }
         }
 #ifndef ARM_CCTLIB
-        if (drreg_unreserve_register(drcontext, bb, instr, reg2) != DRREG_SUCCESS) {
-            ZEROSPY_EXIT_PROCESS("InstrumentMem drreg_unreserve_register != DRREG_SUCCESS");
-        }
+        UNRESERVE_REG(drcontext, bb, instr, reg2);
 #endif
     }
     if(op_no_flush.get_value()) {
@@ -1582,13 +1734,10 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
         MINSERT(bb, instr, skipcall);
         UNRESERVE_AFLAGS(dead, bb, instr);
     }
-    if (drreg_unreserve_register(drcontext, bb, instr, reg1) != DRREG_SUCCESS 
+    UNRESERVE_REG(drcontext, bb, instr, reg1);
 #ifdef ARM_CCTLIB
-        || drreg_unreserve_register(drcontext, bb, instr, reg2) != DRREG_SUCCESS
+    UNRESERVE_REG(drcontext, bb, instr, reg2);
 #endif
-        ) {
-        ZEROSPY_EXIT_PROCESS("InstrumentMem drreg_unreserve_register != DRREG_SUCCESS");
-    }
 #endif
 }
 
@@ -1605,9 +1754,36 @@ ThreadOutputFileInit(per_thread_t *pt)
     }
 }
 
+#ifdef USE_TIMER
+void callback(int flush_id) {
+    fprintf(stderr, "[Thread %d] Code Cache Flushed!\n", drcctlib_get_thread_id()); fflush(stderr);
+}
+
+int num;
+
+void handler(void *drcontext, dr_mcontext_t *mcontext)
+{
+   global_sample_flag = !global_sample_flag;
+   fprintf(stderr,"[Thread %d] Timer triggered! Sample=%d\n", drcctlib_get_thread_id(), global_sample_flag); fflush(stderr);
+   if(global_sample_flag) {
+        if(!dr_set_itimer(ITIMER_REAL, 10, handler)) {
+            ZEROSPY_EXIT_PROCESS("HANDLER: DR_SET_ITIMER  ENABLE FAILED!\n");
+        }
+   } else {
+        if(!dr_set_itimer(ITIMER_REAL, 990, handler)) {
+            ZEROSPY_EXIT_PROCESS("HANDLER: DR_SET_ITIMER DISABLE FAILED!\n");
+        }
+   }
+//    fprintf(stderr,"[Thread %d] Timer triggered: Sending flush region request...\n", drcctlib_get_thread_id()); fflush(stderr);
+//    dr_delay_flush_region(0, ~((ptr_uint_t)0), 0, callback);
+//    fprintf(stderr,"[Thread %d] Timer triggered: flush region request send!\n", drcctlib_get_thread_id()); fflush(stderr);
+}
+#endif
+
 static void
 ClientThreadStart(void *drcontext)
 {
+    assert(dr_get_itimer(ITIMER_REAL));
     per_thread_t *pt = (per_thread_t *)dr_thread_alloc(drcontext, sizeof(per_thread_t));
     if (pt == NULL) {
         ZEROSPY_EXIT_PROCESS("pt == NULL");
@@ -1917,8 +2093,17 @@ ClientInit(int argc, const char *argv[])
         dr_fprintf(STDOUT, "[ZEROSPU INFO] Sampling Rate: %.3f, Window Size: %ld\n", conf2rate[op_rate.get_value()], conf2window[op_window.get_value()]);
         dr_fprintf(gFile,  "[ZEROSPU INFO] Sampling Rate: %.3f, Window Size: %ld\n", conf2rate[op_rate.get_value()], conf2window[op_window.get_value()]);
 #ifdef USE_CLEANCALL
-        BBSample_target[0] = BBSampleTable[op_rate.get_value()][op_window.get_value()][0];
-        BBSample_target[1] = BBSampleTable[op_rate.get_value()][op_window.get_value()][1];
+        if (dr_using_all_private_caches()) {
+            BBSample_target[0] = BBSampleTable[op_rate.get_value()][op_window.get_value()][0];
+            BBSample_target[1] = BBSampleTable[op_rate.get_value()][op_window.get_value()][1];
+            dr_fprintf(STDOUT, "[ZEROSPY INFO] Thread Private is enabled.\n");
+            dr_fprintf(gFile,  "[ZEROSPY INFO] Thread Private is enabled.\n");
+        } else {
+            BBSample_target[0] = BBSampleTableShared[op_rate.get_value()][op_window.get_value()][0];
+            BBSample_target[1] = BBSampleTableShared[op_rate.get_value()][op_window.get_value()][1];
+            dr_fprintf(STDOUT, "[ZEROSPY INFO] Thread Private is disabled.\n");
+            dr_fprintf(gFile,  "[ZEROSPY INFO] Thread Private is disabled.\n");
+        }
         BBSampleNoFlush_target = BBSampleNoFlushTable[op_rate.get_value()][op_window.get_value()];
 #else
         window_enable = conf2rate[op_rate.get_value()] * conf2window[op_window.get_value()];
@@ -2036,6 +2221,13 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     // drcctlib_init(ZEROSPY_FILTER_READ_MEM_ACCESS_INSTR, INVALID_FILE, InstrumentInsCallback, false/*do data centric*/);
     drcctlib_init_ex(ZEROSPY_FILTER_READ_MEM_ACCESS_INSTR, INVALID_FILE, InstrumentInsCallback, NULL, NULL, DRCCTLIB_CACHE_MODE);
     dr_register_exit_event(ClientExit);
+#ifdef USE_TIMER
+    if(op_enable_sampling.get_value()) {
+        if(!dr_set_itimer(ITIMER_REAL, 10, handler)) {
+            ZEROSPY_EXIT_PROCESS("DR_SET_ITIMER FAILED!\n");
+        }
+    }
+#endif
 }
 
 #ifdef __cplusplus
