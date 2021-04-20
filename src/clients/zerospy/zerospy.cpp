@@ -5,7 +5,7 @@
 #include <assert.h>
 #include <algorithm>
 
-#define USE_TIMER
+// #define USE_TIMER
 
 // #define ZEROSPY_DEBUG
 #define _WERROR
@@ -29,7 +29,7 @@ uint64_t get_miliseconds() {
 #include <sys/time.h>
 #include "utils.h"
 
-#define USE_CLEANCALL
+// #define USE_CLEANCALL
 #define ENABLE_SAMPLING 1
 #ifdef ENABLE_SAMPLING
 // different frequency configurations:
@@ -614,6 +614,7 @@ struct UnrolledConjunction<end , end , incr>{
 /*******************************************************************************************/
 #ifdef ENABLE_SAMPLING
 #ifdef USE_CLEANCALL
+uint64_t global_sample_mask = 0;
 template<int64_t WINDOW_ENABLE, int64_t WINDOW_DISABLE, bool sampleFlag>
 struct BBSample {
     static void update_per_bb(uint instruction_count, app_pc src)
@@ -654,34 +655,29 @@ struct BBSample {
         void *drcontext = dr_get_current_drcontext();
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
         pt->numIns += instruction_count;
-        if(sampleFlag) {
-            if(pt->numIns > WINDOW_ENABLE) {
-                pt->sampleFlag = false;
-            }
-        } else {
-            if(pt->numIns > WINDOW_DISABLE) {
-                pt->sampleFlag = true;
-                pt->numIns = 0;
-            }
-        }
-        // If the sample flag is changed, flush the region and re-instrument
-        if(pt->sampleFlag != sampleFlag) {
-            if(pt->numIns!=0 && (pt->numIns <= WINDOW_ENABLE || pt->numIns > WINDOW_ENABLE+instruction_count)) {
-                pt->numIns = sampleFlag ? WINDOW_ENABLE : 0;
-                return ;
-            }
-            // printf("[THREAD %d] BB FLUSH %d %lld, ins count=%d!\n", drcctlib_get_thread_id(), pt->sampleFlag, pt->numIns, instruction_count);
-            assert(pt->numIns==0 || (pt->numIns > WINDOW_ENABLE && pt->numIns <= WINDOW_ENABLE+instruction_count) );
-            dr_mcontext_t mcontext;
-            mcontext.size = sizeof(mcontext);
-            mcontext.flags = DR_MC_ALL;
-            // // flush all fragments in code cache
-            // dr_flush_region(0, ~((ptr_uint_t)0));
-            dr_delay_flush_region(src, 1, 0, NULL);
-            dr_get_mcontext(drcontext, &mcontext);
-            mcontext.pc = src;
-            dr_redirect_execution(&mcontext);
-        }
+        assert("NOT IMPLEMENTED!");
+        // if(sampleFlag) {
+        //     if(pt->numIns > WINDOW_ENABLE) {
+        //         pt->sampleFlag = false;
+        //         uint64_t updateBit = 1 << (drcctlib_get_thread_id());
+        //         uint64_t sampled = __sync_and_and_fetch(global_sample_mask, (~updateBit));
+        //         if(!sampled) {
+        //             assert(dr_unlink_flush_region(0, ~((ptr_uint_t)0)));
+        //         }
+        //     }
+        // } else {
+        //     pt->sampleFlag = (pt->numIns > WINDOW_DISABLE);
+        // }
+        // // If the sample flag is changed, flush the region and re-instrument
+        // if(pt->sampleFlag != sampleFlag) {
+        //     if(sampleFlag /*pt->sampleFlag==false*/) {
+        //         pt->numIns = WINDOW_ENABLE;
+        //     } else {
+        //         pt->numIns = 0;
+        //     }
+        //     // assert(dr_unlink_flush_region(0, ~((ptr_uint_t)0)));
+            
+        // }
     }
 };
 
@@ -829,12 +825,17 @@ void (*BBSampleNoFlush_target)(uint);
 
 #else
 // use manual inlined updates
+#define RESERVE_AFLAGS(dc, bb, ins) assert(drreg_reserve_aflags (dc, bb, ins)==DRREG_SUCCESS)
+#define UNRESERVE_AFLAGS(dc, bb, ins) assert(drreg_unreserve_aflags (dc, bb, ins)==DRREG_SUCCESS)
 
-#define RESERVE_AFLAGS(dead, bb, ins) do { \
-    assert(drreg_are_aflags_dead(drcontext, ins, &dead)==DRREG_SUCCESS); \
-    if(!dead) assert(drreg_reserve_aflags (drcontext, bb, ins)==DRREG_SUCCESS); \
-} while(0)
-#define UNRESERVE_AFLAGS(dead, bb, ins) do {if(!dead)  assert(drreg_unreserve_aflags (drcontext, bb, ins)==DRREG_SUCCESS);} while(0)
+#define RESERVE_REG(dc, bb, instr, vec, reg) do {\
+    if (drreg_reserve_register(dc, bb, instr, vec, &reg) != DRREG_SUCCESS) { \
+        ZEROSPY_EXIT_PROCESS("ERROR @ %s:%d: drreg_reserve_register != DRREG_SUCCESS", __FILE__, __LINE__); \
+    } } while(0)
+#define UNRESERVE_REG(dc, bb, instr, reg) do { \
+    if (drreg_unreserve_register(dc, bb, instr, reg) != DRREG_SUCCESS) { \
+        ZEROSPY_EXIT_PROCESS("ERROR @ %s:%d: drreg_unreserve_register != DRREG_SUCCESS", __FILE__, __LINE__); \
+    } } while(0)
 
 #    ifdef ARM_CCTLIB
 #        define DRCCTLIB_LOAD_IMM32_0(dc, Rt, imm) \
@@ -891,23 +892,6 @@ minstr_load_wwint_to_reg(void *drcontext, instrlist_t *ilist, instr_t *where,
 #    endif
 
 // sample wrapper for sampling without code flush
-#if 0
-#define SAMPLED_CLEAN_CALL(insert_clean_call) do { \
-    bool dead; \
-    reg_id_t reg_ptr; \
-    RESERVE_AFLAGS(dead, bb, ins); \
-    assert(drreg_reserve_register(drcontext, bb, ins, NULL, &reg_ptr)==DRREG_SUCCESS); \
-    dr_insert_read_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);\
-    minstr_load_wint_to_reg(drcontext, ilist, where, reg_val, window_disable);\
-    MINSERT(bb, ins, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_INT32(window_enable))); \
-    instr_t* restore = INSTR_CREATE_label(drcontext); \
-    MINSERT(bb, ins, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(restore))); \
-    { insert_clean_call; } \
-    MINSERT(bb, ins, restore); \
-    assert(drreg_unreserve_register(drcontext, bb, ins, reg_ptr)==DRREG_SUCCESS); \
-    UNRESERVE_AFLAGS(dead, bb, ins); \
-} while(0)
-#endif
 #define SAMPLED_CLEAN_CALL(insert_clean_call) insert_clean_call
 
 struct BBSampleInstrument {
@@ -943,7 +927,7 @@ struct BBSampleInstrument {
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
         bool af_dead=false, reg_dead=false; 
         reg_id_t reg_ptr;
-        RESERVE_AFLAGS(af_dead, ilist, where);
+        RESERVE_AFLAGS(drcontext, ilist, where);
         assert(drreg_reserve_register(drcontext, ilist, where, NULL, &reg_ptr)==DRREG_SUCCESS);
         reg_id_t reg_val;
         bool regVal_dead = false;
@@ -967,19 +951,19 @@ struct BBSampleInstrument {
         }
         if(!regVal_dead) assert(drreg_get_app_value(drcontext, ilist, where, reg_val, reg_val)==DRREG_SUCCESS);
         if(!reg_dead) assert(drreg_get_app_value(drcontext, ilist, where, reg_ptr, reg_ptr)==DRREG_SUCCESS);
-        if(!af_dead ) assert(drreg_restore_app_aflags(drcontext, ilist, where)==DRREG_SUCCESS);
+        assert(drreg_restore_app_aflags(drcontext, ilist, where)==DRREG_SUCCESS);
         dr_insert_clean_call(drcontext, ilist, where, (void *)BBSampleInstrument::bb_flush_code, false, 1, OPND_CREATE_INTPTR(instr_get_app_pc(where)));
         MINSERT(ilist, where, restore);
         assert(drreg_unreserve_register(drcontext, ilist, where, reg_ptr)==DRREG_SUCCESS);
         assert(drreg_unreserve_register(drcontext, ilist, where, reg_val)==DRREG_SUCCESS);
-        UNRESERVE_AFLAGS(af_dead, ilist, where);
+        UNRESERVE_AFLAGS(drcontext, ilist, where);
     }
 
     static void insertBBSampleNoFlush(void* drcontext, instrlist_t *ilist, instr_t *where, int insCnt) {
         static_assert(sizeof(void*)==8);
         bool dead; 
         reg_id_t reg_ptr; 
-        RESERVE_AFLAGS(dead, ilist, where);
+        RESERVE_AFLAGS(drcontext, ilist, where);
         reg_id_t reg_val;
         bool regVal_dead = false;
         assert(drreg_reserve_register(drcontext, ilist, where, NULL, &reg_val)==DRREG_SUCCESS);
@@ -990,15 +974,15 @@ struct BBSampleInstrument {
 
         assert(drreg_unreserve_register(drcontext, ilist, where, reg_ptr)==DRREG_SUCCESS);
         assert(drreg_unreserve_register(drcontext, ilist, where, reg_val)==DRREG_SUCCESS);
-        UNRESERVE_AFLAGS(dead, ilist, where);
+        UNRESERVE_AFLAGS(drcontext, ilist, where);
     }
 #else
     static void insertBBSample(void* drcontext, instrlist_t *ilist, instr_t *where, int insCnt) {
         static_assert(sizeof(void*)==8);
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-        bool af_dead=false, reg_dead=false; 
+        bool reg_dead=false; 
         reg_id_t reg_ptr;
-        RESERVE_AFLAGS(af_dead, ilist, where);
+        RESERVE_AFLAGS(drcontext, ilist, where);
         assert(drreg_reserve_register(drcontext, ilist, where, NULL, &reg_ptr)==DRREG_SUCCESS);
         assert(drreg_is_register_dead(drcontext, reg_ptr, where, &reg_dead)==DRREG_SUCCESS);
         dr_insert_read_raw_tls(drcontext, ilist, where, tls_seg,
@@ -1023,19 +1007,18 @@ struct BBSampleInstrument {
             MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(0)));
             MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_NZ, opnd_create_instr(restore)));
         }
-        if(!af_dead ) assert(drreg_restore_app_aflags(drcontext, ilist, where)==DRREG_SUCCESS);
+        assert(drreg_restore_app_aflags(drcontext, ilist, where)==DRREG_SUCCESS);
         if(!reg_dead) assert(drreg_get_app_value(drcontext, ilist, where, reg_ptr, reg_ptr)==DRREG_SUCCESS);
         dr_insert_clean_call(drcontext, ilist, where, (void *)BBSampleInstrument::bb_flush_code, false, 1, OPND_CREATE_INTPTR(instr_get_app_pc(where)));
         MINSERT(ilist, where, restore);
         assert(drreg_unreserve_register(drcontext, ilist, where, reg_ptr)==DRREG_SUCCESS);
-        UNRESERVE_AFLAGS(af_dead, ilist, where);
+        UNRESERVE_AFLAGS(drcontext, ilist, where);
     }
 
     static void insertBBSampleNoFlush(void* drcontext, instrlist_t *ilist, instr_t *where, int insCnt) {
         static_assert(sizeof(void*)==8);
-        bool dead; 
         reg_id_t reg_ptr; 
-        RESERVE_AFLAGS(dead, ilist, where);
+        RESERVE_AFLAGS(drcontext, ilist, where);
         assert(drreg_reserve_register(drcontext, ilist, where, NULL, &reg_ptr)==DRREG_SUCCESS);
         dr_insert_read_raw_tls(drcontext, ilist, where, tls_seg,
                             tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
@@ -1048,40 +1031,111 @@ struct BBSampleInstrument {
         dr_insert_write_raw_tls(drcontext, ilist, where, tls_seg,
                             tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
         assert(drreg_unreserve_register(drcontext, ilist, where, reg_ptr)==DRREG_SUCCESS);
-        UNRESERVE_AFLAGS(dead, ilist, where);
+        UNRESERVE_AFLAGS(drcontext, ilist, where);
     }
 #endif
 };
 // endif USE_CLEANCALL
 #endif
 
+bool marked = false;
+
+#ifdef USE_TIMER
+void callback(int flush_id) {
+    fprintf(stderr, "[Thread %d] Code Cache Flushed!\n", drcctlib_get_thread_id()); fflush(stderr);
+}
+
+// static dr_signal_action_t
+// code_flush_callback(void *drcontext, dr_siginfo_t *siginfo)
+// {
+//     if(siginfo->sig == SIGUSR1) {
+//         fprintf(stderr, "[Thread %d] SIGUSR1 Detected! Flush Code Cache!\n", drcctlib_get_thread_id()); fflush(stderr);
+//         dr_flush_region(0, ~((ptr_uint_t)0));
+//         return DR_SIGNAL_REDIRECT;
+//     }
+//     return DR_SIGNAL_DELIVER;
+// }
+
+int num;
+
+void handler(void *drcontext, dr_mcontext_t *mcontext)
+{
+    global_sample_flag = !global_sample_flag;
+    fprintf(stderr,"[Thread %d] Timer triggered! Sample=%d\n", drcctlib_get_thread_id(), global_sample_flag); fflush(stderr);
+    if(global_sample_flag) {
+        if(!dr_set_itimer(ITIMER_REAL, 1, handler)) {
+            ZEROSPY_EXIT_PROCESS("HANDLER: DR_SET_ITIMER  ENABLE FAILED!\n");
+        }
+    } else {
+        if(!dr_set_itimer(ITIMER_REAL, 999, handler)) {
+            ZEROSPY_EXIT_PROCESS("HANDLER: DR_SET_ITIMER DISABLE FAILED!\n");
+        }
+    }
+    marked = false;
+//    fprintf(stderr,"[Thread %d] Timer triggered: Sending flush region request...\n", drcctlib_get_thread_id()); fflush(stderr);
+//    dr_delay_flush_region(0, ~((ptr_uint_t)0), 0, callback);
+//    fprintf(stderr,"[Thread %d] Timer triggered: flush region request send!\n", drcctlib_get_thread_id()); fflush(stderr);
+}
+
 template<bool ref_sampleFlag>
 void bb_flush_code(app_pc src) {
     if(global_sample_flag!=ref_sampleFlag) {
-        // printf("FLUSH!\n"); fflush(stdout);
-        void *drcontext = dr_get_current_drcontext();
-        dr_mcontext_t mcontext;
-        mcontext.size = sizeof(mcontext);
-        mcontext.flags = DR_MC_ALL;
-        // flush all fragments in code cache
-        dr_flush_region(src, 1);
-        dr_get_mcontext(drcontext, &mcontext);
-        mcontext.pc = src;
-        dr_redirect_execution(&mcontext);
+        if(!marked) {
+            marked = true;
+            dr_unlink_flush_region(0, ~((ptr_uint_t)0));
+        }
+        // // Only the thread successfully get the lock will flush the code cache to avoid data race
+        // bool willFlush = dr_mutex_trylock(gLock);
+        // // printf("[THREAD %d] WILL FLUSH? %s(%d)\n", drcctlib_get_thread_id(), willFlush?"YES":"NO", willFlush); fflush(stdout);
+        // if(willFlush) {
+        //     if(!isFlushing) {
+        //         isFlushing = true;
+        //         dr_mutex_unlock(gLock);
+        //         printf("[THREAD %d] FLUSH!\n", drcctlib_get_thread_id()); fflush(stdout);
+        //         // flush all fragments in code cache
+        //         dr_flush_region(0, ~((ptr_uint_t)0));
+        //         // dr_unlink_flush_region(0, ~((ptr_uint_t)0));
+        //         // dr_flush_region(src, 1);
+        //         dr_mutex_lock(gLock);
+        //         isFlushing = false;
+        //         dr_mutex_unlock(gLock);
+        //         printf("[THREAD %d] FLUSHED!\n", drcctlib_get_thread_id()); fflush(stdout);
+        //         // if(global_sample_flag) {
+        //         //     if(!dr_set_itimer(ITIMER_REAL, 10, handler)) {
+        //         //         ZEROSPY_EXIT_PROCESS("HANDLER: DR_SET_ITIMER  ENABLE FAILED!\n");
+        //         //     }
+        //         // } else {
+        //         //     if(!dr_set_itimer(ITIMER_REAL, 990, handler)) {
+        //         //         ZEROSPY_EXIT_PROCESS("HANDLER: DR_SET_ITIMER DISABLE FAILED!\n");
+        //         //     }
+        //         // }
+        //         // dr_mcontext_t mcontext;
+        //         // mcontext.size = sizeof(mcontext);
+        //         // mcontext.flags = DR_MC_ALL;
+        //         // dr_get_mcontext(drcontext, &mcontext);
+        //         // mcontext.pc = src;
+        //         // dr_redirect_execution(&mcontext);
+        //     } else {
+        //         dr_mutex_unlock(gLock);
+        //     }
+        // }
     }
 }
+#endif
 
 static dr_emit_flags_t
 event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, bool translating, OUT void **user_data)
 {
-    if(global_sample_flag) {
-        dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void*) bb_flush_code<true>, false, 1, 
-                            OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
-    } else {
-        dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void*) bb_flush_code<false>, false, 1, 
-                            OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
-    }
-    return DR_EMIT_DEFAULT;
+    // if(global_sample_flag) {
+    //     // printf("[Thread %d] Insert CLEAN CALL: SAMPLED\n", drcctlib_get_thread_id());
+    //     dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void*) bb_flush_code<true>, false, 1, 
+    //                         OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
+    // } else {
+    //     // printf("[Thread %d] Insert CLEAN CALL: NOT SAMPLED\n", drcctlib_get_thread_id());
+    //     dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void*) bb_flush_code<false>, false, 1, 
+    //                         OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
+    // }
+    // return DR_EMIT_DEFAULT;
     int num_instructions = 0;
     instr_t *instr;
     /* count the number of instructions in this block */
@@ -1367,8 +1421,6 @@ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN)
 #endif
 #endif /*ENABLE_SAMPLING*/
 
-#include <signal.h>
-
 struct ZerospyInstrument{
     static __attribute__((always_inline)) void InstrumentReadValueBeforeAndAfterLoading(void *drcontext, instrlist_t *bb, instr_t *ins, opnd_t opnd, reg_id_t addr_reg, int32_t slot)
     {
@@ -1555,6 +1607,17 @@ struct ZerospyInstrument{
 #endif
 };
 
+inline void getUnusedRegEntry(drvector_t* vec, instr_t* instr) {
+    drreg_init_and_fill_vector(vec, true);
+    // the regs used in this instr is not allowd to spill
+    for(int i=0; i<instr_num_srcs(instr); ++i) {
+        opnd_t opnd = instr_get_src(instr, i);
+        for(int j=0; j<opnd_num_regs_used(opnd); ++j) {
+            drreg_set_vector_entry(vec, opnd_get_reg_used(opnd, j), false);
+        }
+    }
+}
+
 static void
 InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, int32_t slot, reg_id_t reg1, reg_id_t reg2)
 {
@@ -1576,29 +1639,25 @@ InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, i
         dr_mutex_unlock(gLock);
 #endif
     } else {
+        drvector_t vec;
+        getUnusedRegEntry(&vec, where);
+        instr_t* skipcall = NULL;
+        if(op_enable_sampling.get_value()) {
+            RESERVE_AFLAGS(drcontext, ilist, where);
+            dr_insert_read_raw_tls(drcontext, ilist, where, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg2);
+            // Clear insCnt when insCnt > WINDOW_DISABLE
+            MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg2), OPND_CREATE_CCT_INT(window_enable)));
+            skipcall = INSTR_CREATE_label(drcontext);
+            MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_GT, opnd_create_instr(skipcall)));
+        }
         ZerospyInstrument::InstrumentReadValueBeforeAndAfterLoading(drcontext, ilist, where, ref, reg1, slot);
-    }
-}
-
-inline void getUnusedRegEntry(drvector_t* vec, instr_t* instr) {
-    drreg_init_and_fill_vector(vec, true);
-    // the regs used in this instr is not allowd to spill
-    for(int i=0; i<instr_num_srcs(instr); ++i) {
-        opnd_t opnd = instr_get_src(instr, i);
-        for(int j=0; j<opnd_num_regs_used(opnd); ++j) {
-            drreg_set_vector_entry(vec, opnd_get_reg_used(opnd, j), false);
+        if(op_enable_sampling.get_value()) {
+            assert(skipcall!=NULL);
+            MINSERT(ilist, where, skipcall);
+            UNRESERVE_AFLAGS(drcontext, ilist, where);
         }
     }
 }
-
-#define RESERVE_REG(dc, bb, instr, vec, reg) do {\
-    if (drreg_reserve_register(dc, bb, instr, vec, &reg) != DRREG_SUCCESS) { \
-        ZEROSPY_EXIT_PROCESS("ERROR @ %s:%d: drreg_reserve_register != DRREG_SUCCESS", __FILE__, __LINE__); \
-    } } while(0)
-#define UNRESERVE_REG(dc, bb, instr, reg) do { \
-    if (drreg_unreserve_register(dc, bb, instr, reg) != DRREG_SUCCESS) { \
-        ZEROSPY_EXIT_PROCESS("ERROR @ %s:%d: drreg_unreserve_register != DRREG_SUCCESS", __FILE__, __LINE__); \
-    } } while(0)
 
 void
 InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
@@ -1685,39 +1744,66 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
     }
 #else
 // ELSE USE_CLEANCALL
+#ifdef ARM_CCTLIB
     drvector_t vec;
     getUnusedRegEntry(&vec, instr);
     RESERVE_REG(drcontext, bb, instr, &vec, reg1);
-#ifdef ARM_CCTLIB
     RESERVE_REG(drcontext, bb, instr, &vec, reg2);
-#endif
     instr_t* skipcall = NULL;
     bool dead = false;
     if(op_no_flush.get_value()) {
-        RESERVE_AFLAGS(dead, bb, instr);
+        RESERVE_AFLAGS(drcontext, bb, instr);
         dr_insert_read_raw_tls(drcontext, bb, instr, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg1);
         // Clear insCnt when insCnt > WINDOW_DISABLE
-#ifdef ARM_CCTLIB
         minstr_load_wint_to_reg(drcontext, bb, instr, reg2, window_enable);
         MINSERT(bb, instr, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg1), opnd_create_reg(reg2)));
-#else
-        MINSERT(bb, instr, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg1), OPND_CREATE_CCT_INT(window_enable)));
-#endif
         skipcall = INSTR_CREATE_label(drcontext);
         MINSERT(bb, instr, XINST_CREATE_jump_cond(drcontext, DR_PRED_GT, opnd_create_instr(skipcall)));
     }
-
+    int num_srcs = instr_num_srcs(instr);
+    for(int i=0; i<num_srcs; ++i) {
+        opnd_t opnd = instr_get_src(instr, i);
+        if(opnd_is_memory_reference(opnd)) {
+            InstrumentMem(drcontext, bb, instr, opnd, slot, reg1, reg2);
+        }
+    }
+    if(op_no_flush.get_value()) {
+        assert(skipcall!=NULL);
+        MINSERT(bb, instr, skipcall);
+        UNRESERVE_AFLAGS(drcontext, bb, instr);
+    }
+    UNRESERVE_REG(drcontext, bb, instr, reg1);
+    UNRESERVE_REG(drcontext, bb, instr, reg2);
+#else
+// X86 architecture
+    drvector_t vec;
+    getUnusedRegEntry(&vec, instr);
 #ifdef X86
     // gather may result in failure, need special care
     if(instr_is_gather(instr)) {
+        instr_t* skipcall = NULL;
+        if(op_enable_sampling.get_value()) {
+            RESERVE_AFLAGS(drcontext, bb, instr);
+            RESERVE_REG(drcontext, bb, instr, &vec, reg1);
+            dr_insert_read_raw_tls(drcontext, bb, instr, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg1);
+            // Clear insCnt when insCnt > WINDOW_DISABLE
+            MINSERT(bb, instr, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg1), OPND_CREATE_CCT_INT(window_enable)));
+            skipcall = INSTR_CREATE_label(drcontext);
+            MINSERT(bb, instr, XINST_CREATE_jump_cond(drcontext, DR_PRED_GT, opnd_create_instr(skipcall)));
+        }
         // We use instr_compute_address_ex_pos to handle gather (with VSIB addressing)
         ZerospyInstrument::InstrumentReadValueBeforeVGather(drcontext, bb, instr, slot);
+        if(op_enable_sampling.get_value()) {
+            assert(skipcall!=NULL);
+            MINSERT(bb, instr, skipcall);
+            UNRESERVE_REG(drcontext, bb, instr, reg1);
+            UNRESERVE_AFLAGS(drcontext, bb, instr);
+        }
     } else
 #endif
     {
-#ifndef ARM_CCTLIB
+        RESERVE_REG(drcontext, bb, instr, &vec, reg1);
         RESERVE_REG(drcontext, bb, instr, &vec, reg2);
-#endif
         int num_srcs = instr_num_srcs(instr);
         for(int i=0; i<num_srcs; ++i) {
             opnd_t opnd = instr_get_src(instr, i);
@@ -1725,18 +1811,9 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
                 InstrumentMem(drcontext, bb, instr, opnd, slot, reg1, reg2);
             }
         }
-#ifndef ARM_CCTLIB
+        UNRESERVE_REG(drcontext, bb, instr, reg1);
         UNRESERVE_REG(drcontext, bb, instr, reg2);
-#endif
     }
-    if(op_no_flush.get_value()) {
-        assert(skipcall!=NULL);
-        MINSERT(bb, instr, skipcall);
-        UNRESERVE_AFLAGS(dead, bb, instr);
-    }
-    UNRESERVE_REG(drcontext, bb, instr, reg1);
-#ifdef ARM_CCTLIB
-    UNRESERVE_REG(drcontext, bb, instr, reg2);
 #endif
 #endif
 }
@@ -1754,36 +1831,10 @@ ThreadOutputFileInit(per_thread_t *pt)
     }
 }
 
-#ifdef USE_TIMER
-void callback(int flush_id) {
-    fprintf(stderr, "[Thread %d] Code Cache Flushed!\n", drcctlib_get_thread_id()); fflush(stderr);
-}
-
-int num;
-
-void handler(void *drcontext, dr_mcontext_t *mcontext)
-{
-   global_sample_flag = !global_sample_flag;
-   fprintf(stderr,"[Thread %d] Timer triggered! Sample=%d\n", drcctlib_get_thread_id(), global_sample_flag); fflush(stderr);
-   if(global_sample_flag) {
-        if(!dr_set_itimer(ITIMER_REAL, 10, handler)) {
-            ZEROSPY_EXIT_PROCESS("HANDLER: DR_SET_ITIMER  ENABLE FAILED!\n");
-        }
-   } else {
-        if(!dr_set_itimer(ITIMER_REAL, 990, handler)) {
-            ZEROSPY_EXIT_PROCESS("HANDLER: DR_SET_ITIMER DISABLE FAILED!\n");
-        }
-   }
-//    fprintf(stderr,"[Thread %d] Timer triggered: Sending flush region request...\n", drcctlib_get_thread_id()); fflush(stderr);
-//    dr_delay_flush_region(0, ~((ptr_uint_t)0), 0, callback);
-//    fprintf(stderr,"[Thread %d] Timer triggered: flush region request send!\n", drcctlib_get_thread_id()); fflush(stderr);
-}
-#endif
-
 static void
 ClientThreadStart(void *drcontext)
 {
-    assert(dr_get_itimer(ITIMER_REAL));
+    // assert(dr_get_itimer(ITIMER_REAL));
     per_thread_t *pt = (per_thread_t *)dr_thread_alloc(drcontext, sizeof(per_thread_t));
     if (pt == NULL) {
         ZEROSPY_EXIT_PROCESS("pt == NULL");
@@ -2156,6 +2207,7 @@ ClientExit(void)
 #ifdef ENABLE_SAMPLING
         // must unregister event after client exit, or it will cause unexpected errors during execution
         ( op_enable_sampling.get_value() && !drmgr_unregister_bb_instrumentation_event(event_basic_block) ) ||
+        // ( op_enable_sampling.get_value() && !drmgr_unregister_signal_event(code_flush_callback) ) ||
 #endif
         !drmgr_unregister_tls_field(tls_idx)) {
         printf("ERROR: zerospy failed to unregister in ClientExit");
@@ -2198,6 +2250,7 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
 #ifdef ENABLE_SAMPLING
         // bb instrumentation event must be performed in analysis passes (as we don't change the application codes)
         ( op_enable_sampling.get_value() && !drmgr_register_bb_instrumentation_event(event_basic_block, NULL, NULL) ) ||
+        // ( op_enable_sampling.get_value() && !drmgr_register_signal_event(code_flush_callback) ) ||
 #endif
         !drmgr_register_thread_init_event_ex(ClientThreadStart, &thread_init_pri) ||
         !drmgr_register_thread_exit_event_ex(ClientThreadEnd, &thread_exit_pri) ) {
@@ -2221,13 +2274,6 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     // drcctlib_init(ZEROSPY_FILTER_READ_MEM_ACCESS_INSTR, INVALID_FILE, InstrumentInsCallback, false/*do data centric*/);
     drcctlib_init_ex(ZEROSPY_FILTER_READ_MEM_ACCESS_INSTR, INVALID_FILE, InstrumentInsCallback, NULL, NULL, DRCCTLIB_CACHE_MODE);
     dr_register_exit_event(ClientExit);
-#ifdef USE_TIMER
-    if(op_enable_sampling.get_value()) {
-        if(!dr_set_itimer(ITIMER_REAL, 10, handler)) {
-            ZEROSPY_EXIT_PROCESS("DR_SET_ITIMER FAILED!\n");
-        }
-    }
-#endif
 }
 
 #ifdef __cplusplus
