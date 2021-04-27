@@ -29,7 +29,7 @@ uint64_t get_miliseconds() {
 #include <sys/time.h>
 #include "utils.h"
 
-#define USE_CLEANCALL
+// #define USE_CLEANCALL
 #define ENABLE_SAMPLING 1
 #ifdef ENABLE_SAMPLING
 // different frequency configurations:
