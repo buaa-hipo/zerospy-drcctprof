@@ -29,7 +29,7 @@ uint64_t get_miliseconds() {
 #include <sys/time.h>
 #include "utils.h"
 
-#define USE_CLEANCALL
+// #define USE_CLEANCALL
 #define ENABLE_SAMPLING 1
 #ifdef ENABLE_SAMPLING
 // different frequency configurations:
@@ -241,6 +241,7 @@ typedef struct _per_thread_t {
         ZEROSPY_EXIT_PROCESS("ERROR @ %s:%d: drreg_unreserve_register != DRREG_SUCCESS", __FILE__, __LINE__); \
     } } while(0)
 
+// reg_ctxt and scratch can overlap (same register)
 inline
 void insertSaveCachedKey(void* drcontext, instrlist_t *ilist, instr_t *where, 
                          uint8_t elementSize, uint8_t accessLen, uint8_t isApprox, 
@@ -299,31 +300,25 @@ void insertLoadAndComputeRedMap_2bytes( void* drcontext, instrlist_t *ilist, ins
 {
     // printf("insertLoadAndComputeRedMap_2bytes enter\n"); fflush(stdout);
     assert(reg_is_64bit(reg_val));
-    MINSERT(ilist, where, XINST_CREATE_load_1byte(drcontext, 
+    MINSERT(ilist, where, XINST_CREATE_load_2bytes(drcontext, 
                     opnd_create_reg(reg_32_to_16(reg_64_to_32(reg_val))),
                     OPND_CREATE_MEM16(reg_addr, offset)));
     // or based: 21 ops = 3 mov + 18 calc (7 or + 7 shr + 1 and + 1 or + 1 shr + 1 and)
-    // Merge all bits within a byte in parallel
-    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
-    // for(int i=0; i<7; ++i) {
-    //     MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(1)));
-    //     MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // }
-    // binary merging: (7 + 7) => (3 + 3)
+    // Merge all bits within a byte in parallel by binary merging: (7 + 7) => (3 * 3)
     // 0x
+    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
     MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(1)));
     MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
     // 00xx
+    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
     MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(2)));
     MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
     // 0000xxxx
+    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
     MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(4)));
     MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
     // 1.1 x = (~x) & 0x101
-    // MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(scratch), OPND_CREATE_CCT_INT(0x101)));
-    // MINSERT(ilist, where, INSTR_CREATE_andn(drcontext, opnd_create_reg(reg_val), opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // 1.2 x = (~x) & 0x01; 
-    MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(scratch), OPND_CREATE_CCT_INT(0x1)));
+    MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(scratch), OPND_CREATE_CCT_INT(0x101)));
     MINSERT(ilist, where, INSTR_CREATE_andn(drcontext, opnd_create_reg(reg_val), opnd_create_reg(reg_val), opnd_create_reg(scratch)));
     // x = (x>>7 | x)
     MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
@@ -346,28 +341,25 @@ void insertLoadAndComputeRedMap_4bytes( void* drcontext, instrlist_t *ilist, ins
 {
     // printf("insertLoadAndComputeRedMap_4bytes enter\n"); fflush(stdout);
     assert(reg_is_64bit(reg_val));
-    MINSERT(ilist, where, XINST_CREATE_load_1byte(drcontext, 
+    MINSERT(ilist, where, XINST_CREATE_load(drcontext, 
                     opnd_create_reg(reg_64_to_32(reg_val)),
                     OPND_CREATE_MEM32(reg_addr, offset)));
     // or based: 22 ops = (7 or + 7 shr + 1 and + 3 or + 3 shr + 1 and)
-    // Merge all bits within a byte in parallel
-    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
-    // for(int i=0; i<7; ++i) {
-    //     MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(1)));
-    //     MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // }
-    // binary merging: (7 + 7) => (3 + 3)
+    // Merge all bits within a byte in parallel by binary merging: (7 + 7) => (3 * 3)
     // 0x
+    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
     MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(1)));
     MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
     // 00xx
+    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
     MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(2)));
     MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
     // 0000xxxx
+    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
     MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(4)));
     MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // x = (~x) & 0x0101
-    MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(scratch), OPND_CREATE_CCT_INT(0x101)));
+    // x = (~x) & 0x01010101
+    MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(scratch), OPND_CREATE_CCT_INT(0x1010101)));
     MINSERT(ilist, where, INSTR_CREATE_andn(drcontext, opnd_create_reg(reg_val), opnd_create_reg(reg_val), opnd_create_reg(scratch)));
     // x = (x>>7 | x)
     MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
@@ -399,28 +391,25 @@ void insertLoadAndComputeRedMap_8bytes( void* drcontext, instrlist_t *ilist, ins
         reg_val = reg_32_to_64(reg_val);
         assert(0 && "REGISTER is 32 bit!");
     }
-    MINSERT(ilist, where, XINST_CREATE_load_1byte(drcontext, 
+    MINSERT(ilist, where, XINST_CREATE_load(drcontext, 
                     opnd_create_reg(reg_val),
                     OPND_CREATE_MEM64(reg_addr, offset)));
     // or based: 22 ops = (7 or + 7 shr + 1 and + 3 or + 3 shr + 1 and)
-    // Merge all bits within a byte in parallel
-    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
-    // for(int i=0; i<7; ++i) {
-    //     MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(1)));
-    //     MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // }
-    // binary merging: (7 + 7) => (3 + 3)
+    // Merge all bits within a byte in parallel by binary merging: (7 + 7) => (3 * 3)
     // 0x
+    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
     MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(1)));
     MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
     // 00xx
+    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
     MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(2)));
     MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
     // 0000xxxx
+    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
     MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(4)));
     MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // x = (~x) & 0x01010101
-    MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(scratch), OPND_CREATE_CCT_INT(0x1010101)));
+    // x = (~x) & 0x0101010101010101LL
+    MINSERT(ilist, where, INSTR_CREATE_mov_imm(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT64(0x101010101010101LL)));
     MINSERT(ilist, where, INSTR_CREATE_andn(drcontext, opnd_create_reg(reg_val), opnd_create_reg(reg_val), opnd_create_reg(scratch)));
     // x = (x>>7 | x)
     MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
@@ -545,6 +534,21 @@ void unreserve_simd_reg(void* drcontext, instrlist_t *ilist, instr_t* where, reg
     // TODO: if we spilled, restore the application value of the spilled SIMD register
 }
 
+uint8_t mask[64] __attribute__((aligned(64))) = {   0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1 };
+
+uint8_t mask_shuf[32] __attribute__((aligned(64))) = { 
+                                         0x00, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 
+                                         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                                         0x00, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 
+                                         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+
 // SIMD needed
 template<int AccessLen>
 void insertLoadAndComputeRedMap_simd(void* drcontext, instrlist_t *ilist, instr_t *where, reg_id_t reg_base, reg_id_t reg_addr, reg_id_t scratch) {
@@ -609,33 +613,16 @@ void insertLoadAndComputeRedMap_simd(void* drcontext, instrlist_t *ilist, instr_
     // x = (~x) & broadcast(0x01)
     switch (AccessLen) {
         case 16: {
-            uint8_t mask[16] __attribute__((aligned(64))) = { 
-                                         0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
-                                         0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1 };
             // We directly load the simd mask from memory
             MINSERT(ilist, where, INSTR_CREATE_vmovdqa(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_ABSMEM(mask, OPSZ_16)));
             break ;
         }
         case 32: {
-            uint8_t mask[32] __attribute__((aligned(64))) = { 
-                                         0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
-                                         0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
-                                         0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
-                                         0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1 };
             // We directly load the simd mask from memory
             MINSERT(ilist, where, INSTR_CREATE_vmovdqa(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_ABSMEM(mask, OPSZ_32)));
             break ;
         }
         case 64: {
-            uint8_t mask[64] __attribute__((aligned(64))) = { 
-                                         0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
-                                         0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
-                                         0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
-                                         0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
-                                         0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
-                                         0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
-                                         0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
-                                         0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1 };
             // We directly load the simd mask from memory
             MINSERT(ilist, where, INSTR_CREATE_vmovdqa(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_ABSMEM(mask, OPSZ_64)));
             break ;
@@ -673,11 +660,8 @@ void insertLoadAndComputeRedMap_simd(void* drcontext, instrlist_t *ilist, instr_
     switch (AccessLen) {
         case 16: {
             // shuffle: [...clear...] [72:64] [8:0]
-            uint8_t mask[16] __attribute__((aligned(64))) = { 
-                                         0x00, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 
-                                         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
             // We directly load the simd mask from memory
-            MINSERT(ilist, where, INSTR_CREATE_vmovdqa(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_ABSMEM(mask, OPSZ_16)));
+            MINSERT(ilist, where, INSTR_CREATE_vmovdqa(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_ABSMEM(mask_shuf, OPSZ_16)));
             MINSERT(ilist, where, INSTR_CREATE_vpshufb(drcontext, opnd_create_reg(reg_val), opnd_create_reg(reg_val), opnd_create_reg(reg_scratch)));
             // now store the lower 32-bits into target (INOUT) reg_addr register
             MINSERT(ilist, where, INSTR_CREATE_vmovq(drcontext, opnd_create_reg(reg_addr), opnd_create_reg(reg_val)));
@@ -685,13 +669,8 @@ void insertLoadAndComputeRedMap_simd(void* drcontext, instrlist_t *ilist, instr_
         }
         case 32: {
             // shuffle: [...clear...] [200:192] [136:128] | [...clear...] [72:64] [8:0]
-            uint8_t mask[32] __attribute__((aligned(64))) = { 
-                                         0x00, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 
-                                         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                                         0x00, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 
-                                         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
             // We directly load the simd mask from memory
-            MINSERT(ilist, where, INSTR_CREATE_vmovdqa(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_ABSMEM(mask, OPSZ_32)));
+            MINSERT(ilist, where, INSTR_CREATE_vmovdqa(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_ABSMEM(mask_shuf, OPSZ_32)));
             MINSERT(ilist, where, INSTR_CREATE_vpshufb(drcontext, opnd_create_reg(reg_val), opnd_create_reg(reg_val), opnd_create_reg(reg_scratch)));
             // As shuffle is performed per lane, so we need further merging
             // 1. permutation to merge two lanes into the first lane: 8 = (10) (00) -> [...] [192:128] [64:0]
@@ -1522,9 +1501,10 @@ struct BBSampleInstrument {
         // printf("[Flush] memRefCnt=%d, current cache num: %d, next: %d\n", memRefCnt, pt->cache_val_num, next_cache_val_num);
         if(next_cache_val_num > MAX_CACHE_SIZE) {
             // flush_cache(pt);
+// #if 0
             for(int i=0; i<pt->cache_val_num; ++i) {
                 context_handle_t ctxt = pt->cache_ptr[i].ctxt_hndl;
-                assert(ctxt!=0);
+                //assert(ctxt!=0);
                 uint32_t info = pt->cache_ptr[i].info;
                 uint64_t redmap = pt->cache_ptr[i].redmap;
                 bool isApprox = DECODE_ISAPPROX_FROM_CACHED_INFO(info);
@@ -1539,9 +1519,10 @@ struct BBSampleInstrument {
                     AddToRedTable((uint64_t)MAKE_CONTEXT_PAIR(accessLen, ctxt), zeros, redmap, accessLen, pt);
                 }
             }
+//             memset(pt->cache_ptr, 0, sizeof(val_cache_t)*MAX_CACHE_SIZE);
+// #endif
             pt->cache_val_num = 0;
             BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_VAL_CACHE_PTR) = pt->cache_ptr;
-            memset(pt->cache_ptr, 0, sizeof(val_cache_t)*MAX_CACHE_SIZE);
         } else {
             pt->cache_val_num = next_cache_val_num;
         }
@@ -1809,7 +1790,9 @@ event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, b
             BBSampleInstrument::insertBBSample(drcontext, bb, instrlist_first(bb), num_instructions, memRefCnt);
         }
     } else {
-        dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *)BBSampleInstrument::bb_flush_code, false, 1, OPND_CREATE_CCT_INT(memRefCnt));
+        if(memRefCnt) {
+            dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *)BBSampleInstrument::bb_flush_code, false, 1, OPND_CREATE_CCT_INT(memRefCnt));
+        }
     }
     
 #endif
@@ -2175,16 +2158,16 @@ struct ZerospyInstrument{
             } else {
                 reg_id_t reg_ctxt, reg_base;
                 RESERVE_AFLAGS(drcontext, bb, ins);
-                RESERVE_REG(drcontext, bb, ins, NULL, reg_ctxt);
+                // We use the scratch to store the calling context value from drcctlib
+                reg_ctxt = scratch;
                 RESERVE_REG(drcontext, bb, ins, NULL, reg_base);
+                drcctlib_get_context_handle_in_reg(drcontext, bb, ins, slot, reg_ctxt, reg_base);
                 dr_insert_read_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_VAL_CACHE_PTR, reg_base);
-                drcctlib_get_context_handle_in_reg(drcontext, bb, ins, slot, reg_ctxt, scratch);
                 insertSaveCachedKey(drcontext, bb, ins, /*elemSize=*/refSize, /*accesslen=*/refSize, /*isApprox=*/0, reg_base, reg_ctxt, scratch);
                 insertComputeAndCacheRedmap_INT(drcontext, bb, ins, refSize, reg_base, addr_reg, scratch);
                 // store the new cache pointer to the TLS field
                 MINSERT(bb, ins, XINST_CREATE_add(drcontext, opnd_create_reg(reg_base), OPND_CREATE_CCT_INT(sizeof(val_cache_t))));
                 dr_insert_write_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_VAL_CACHE_PTR, reg_base);
-                UNRESERVE_REG(drcontext, bb, ins, reg_ctxt);
                 UNRESERVE_REG(drcontext, bb, ins, reg_base);
                 UNRESERVE_AFLAGS(drcontext, bb, ins);
             }
@@ -2324,12 +2307,6 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
 {
     // early return when code flush is enabled and not sampled
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-    if( op_enable_sampling.get_value() && 
-       !op_no_flush.get_value() && 
-       !IS_SAMPLED(pt, window_enable)) {
-           // printf("[Thread %d] No Instrument!\n", drcctlib_get_thread_id()); fflush(stdout);
-           return;
-    }
     // extract data from drcctprof's given message
     instrlist_t *bb = instrument_msg->bb;
     instr_t *instr = instrument_msg->instr;
