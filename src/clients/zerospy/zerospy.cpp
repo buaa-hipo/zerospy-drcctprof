@@ -28,6 +28,7 @@ uint64_t get_miliseconds() {
 #include "dr_tools.h"
 #include <sys/time.h>
 #include "utils.h"
+#include "drx.h"
 
 // #define USE_CLEANCALL
 #define ENABLE_SAMPLING 1
@@ -228,6 +229,8 @@ typedef struct _per_thread_t {
 #define INOUT
 #define OUT
 
+file_t gFlagF;
+
 // use manual inlined updates
 #define RESERVE_AFLAGS(dc, bb, ins) assert(drreg_reserve_aflags (dc, bb, ins)==DRREG_SUCCESS)
 #define UNRESERVE_AFLAGS(dc, bb, ins) assert(drreg_unreserve_aflags (dc, bb, ins)==DRREG_SUCCESS)
@@ -268,6 +271,7 @@ void insertLoadAndComputeRedMap_1byte(  void* drcontext, instrlist_t *ilist, ins
                                         IN reg_id_t reg_addr, int offset, 
                                         OUT reg_id_t reg_val, OUT reg_id_t scratch) 
 {
+    return ;
     // printf("insertLoadAndComputeRedMap_1byte enter\n"); fflush(stdout);
     assert(reg_is_64bit(reg_val));
     MINSERT(ilist, where, XINST_CREATE_load_1byte(drcontext, 
@@ -298,6 +302,7 @@ void insertLoadAndComputeRedMap_2bytes( void* drcontext, instrlist_t *ilist, ins
                                         IN reg_id_t reg_addr, int offset, 
                                         OUT reg_id_t reg_val, OUT reg_id_t scratch) 
 {
+    return ;
     // printf("insertLoadAndComputeRedMap_2bytes enter\n"); fflush(stdout);
     assert(reg_is_64bit(reg_val));
     MINSERT(ilist, where, XINST_CREATE_load_2bytes(drcontext, 
@@ -346,6 +351,14 @@ void insertLoadAndComputeRedMap_4bytes( void* drcontext, instrlist_t *ilist, ins
                     OPND_CREATE_MEM32(reg_addr, offset)));
     // or based: 22 ops = (7 or + 7 shr + 1 and + 3 or + 3 shr + 1 and)
     // Merge all bits within a byte in parallel by binary merging: (7 + 7) => (3 * 3)
+    bool dead; assert(drreg_are_aflags_dead(drcontext, where, &dead)==DRREG_SUCCESS);
+    dr_fprintf(gFlagF, "AFLAG is dead: %d (drreg) vs %d (drx): \n", dead, drx_aflags_are_dead(where));
+    for(instr_t* inst=where; inst!=NULL; inst=instr_get_next(inst)) {
+        dr_fprintf(gFlagF, "\t");
+        disassemble(drcontext, instr_get_app_pc(inst), gFlagF);
+    }
+    dr_fprintf(gFlagF, "======================\n"); 
+    assert(dead==drx_aflags_are_dead(where));
     // 0x
     MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
     MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(1)));
@@ -385,6 +398,7 @@ void insertLoadAndComputeRedMap_8bytes( void* drcontext, instrlist_t *ilist, ins
                                         IN reg_id_t reg_addr, int offset, 
                                         OUT reg_id_t reg_val, OUT reg_id_t scratch) 
 {
+    return ;
     // printf("insertLoadAndComputeRedMap_8bytes enter\n"); fflush(stdout);
     assert(dr_get_isa_mode(drcontext)==DR_ISA_AMD64 && "insertLoadAndComputeRedMap_8bytes only supports X64 ISA!");
     if(reg_is_32bit(reg_val)) {
@@ -552,6 +566,7 @@ uint8_t mask_shuf[32] __attribute__((aligned(64))) = {
 // SIMD needed
 template<int AccessLen>
 void insertLoadAndComputeRedMap_simd(void* drcontext, instrlist_t *ilist, instr_t *where, reg_id_t reg_base, reg_id_t reg_addr, reg_id_t scratch) {
+    return ;
     static_assert(AccessLen==16 || AccessLen==32 || AccessLen==64);
     // printf("insertLoadAndComputeRedMap_simd %d enter\n", AccessLen); fflush(stdout);
     // disassemble(drcontext, instr_get_app_pc(where), STDOUT);
@@ -2157,9 +2172,12 @@ struct ZerospyInstrument{
                 }
             } else {
                 reg_id_t reg_ctxt, reg_base;
-                RESERVE_AFLAGS(drcontext, bb, ins);
                 // We use the scratch to store the calling context value from drcctlib
                 reg_ctxt = scratch;
+                bool is_saved = !drx_aflags_are_dead(ins);
+                if(is_saved) {
+                    MINSERT(bb, ins, INSTR_CREATE_pushf(ins));
+                }
                 RESERVE_REG(drcontext, bb, ins, NULL, reg_base);
                 drcctlib_get_context_handle_in_reg(drcontext, bb, ins, slot, reg_ctxt, reg_base);
                 dr_insert_read_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_VAL_CACHE_PTR, reg_base);
@@ -2169,7 +2187,9 @@ struct ZerospyInstrument{
                 MINSERT(bb, ins, XINST_CREATE_add(drcontext, opnd_create_reg(reg_base), OPND_CREATE_CCT_INT(sizeof(val_cache_t))));
                 dr_insert_write_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_VAL_CACHE_PTR, reg_base);
                 UNRESERVE_REG(drcontext, bb, ins, reg_base);
-                UNRESERVE_AFLAGS(drcontext, bb, ins);
+                if(is_saved) {
+                    MINSERT(bb, ins, INSTR_CREATE_popf(ins));
+                }
             }
         }
     }
@@ -2285,8 +2305,8 @@ InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, i
         drvector_t vec;
         getUnusedRegEntry(&vec, where);
         instr_t* skipcall = NULL;
+        // RESERVE_AFLAGS(drcontext, ilist, where);
         if(op_enable_sampling.get_value()) {
-            RESERVE_AFLAGS(drcontext, ilist, where);
             dr_insert_read_raw_tls(drcontext, ilist, where, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg2);
             // Clear insCnt when insCnt > WINDOW_DISABLE
             MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg2), OPND_CREATE_CCT_INT(window_enable)));
@@ -2297,8 +2317,8 @@ InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, i
         if(op_enable_sampling.get_value()) {
             assert(skipcall!=NULL);
             MINSERT(ilist, where, skipcall);
-            UNRESERVE_AFLAGS(drcontext, ilist, where);
         }
+        // UNRESERVE_AFLAGS(drcontext, ilist, where);
     }
 }
 
@@ -2311,6 +2331,7 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
     instrlist_t *bb = instrument_msg->bb;
     instr_t *instr = instrument_msg->instr;
     int32_t slot = instrument_msg->slot;
+    if(!instr_is_app(instr)) return;
     // check if this instruction is actually our interest
     if(!instr_reads_memory(instr)) return;
     // If this instr is prefetch, the memory address is not guaranteed to be valid, and it may be also ignored by hardware
@@ -2817,6 +2838,8 @@ ClientInit(int argc, const char *argv[])
     gDebug = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
     DR_ASSERT(gDebug != INVALID_FILE);
 #endif
+    gFlagF = dr_open_file("debug.log", DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
+    DR_ASSERT(gFlagF != INVALID_FILE);
 }
 
 static void
@@ -2833,6 +2856,7 @@ ClientExit(void)
         dr_fprintf(gFile, "####################################\n");
     }
 #endif
+    dr_close_file(gFlagF);
     dr_close_file(gFile);
 #ifdef ENABLE_SAMPLING
 #ifndef USE_CLEANCALL
