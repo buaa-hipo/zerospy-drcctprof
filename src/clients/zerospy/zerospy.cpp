@@ -315,9 +315,10 @@ void insertSaveCachedKey(void* drcontext, instrlist_t *ilist, instr_t *where,
     MINSERT(ilist, where, XINST_CREATE_store(drcontext,
                     OPND_CREATE_MEM32(reg_base, offsetof(val_cache_t, ctxt_hndl)),
                     opnd_create_reg(reg_ctxt)));
-    dr_insert_clean_call(drcontext, ilist, where, (void *)debug_print_0, false, 1, opnd_create_reg(reg_ctxt));
-    dr_insert_clean_call(drcontext, ilist, where, (void *)debug_print_1, false, 2, opnd_create_reg(reg_base), opnd_create_reg(reg_ctxt));
-    MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT32(info.packed_info)));
+    // dr_insert_clean_call(drcontext, ilist, where, (void *)debug_print_0, false, 1, opnd_create_reg(reg_ctxt));
+    // dr_insert_clean_call(drcontext, ilist, where, (void *)debug_print_1, false, 2, opnd_create_reg(reg_base), opnd_create_reg(reg_ctxt));
+    int packed = info.packed_info;
+    MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT32(packed)));
     MINSERT(ilist, where, XINST_CREATE_store(drcontext,
                     OPND_CREATE_MEM32(reg_base, offsetof(val_cache_t, info)),
                     opnd_create_reg(scratch)));
@@ -1162,7 +1163,7 @@ struct BBSampleInstrument {
         // printf("[Flush] memRefCnt=%d, current cache num: %d, next: %d\n", memRefCnt, pt->cache_val_num, next_cache_val_num);
         if(next_cache_val_num > MAX_CACHE_SIZE) {
             // flush_cache(pt);
-// #if 0
+#if 1
             for(int i=0; i<pt->cache_val_num; ++i) {
                 context_handle_t ctxt = pt->cache_ptr[i].ctxt_hndl;
                 // if(!drcctlib_ctxt_hndl_is_valid(ctxt)) {
@@ -1184,7 +1185,7 @@ struct BBSampleInstrument {
                 }
             }
             // memset(pt->cache_ptr, 0, sizeof(val_cache_t)*MAX_CACHE_SIZE);
-// #endif
+#endif
             pt->cache_val_num = 0;
             BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_VAL_CACHE_PTR) = pt->cache_ptr;
         } else {
