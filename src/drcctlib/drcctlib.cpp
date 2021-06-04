@@ -2988,10 +2988,10 @@ drcctlib_get_context_handle_in_reg(void *drcontext, instrlist_t *ilist, instr_t 
                 XINST_CREATE_add(drcontext, opnd_create_reg(store_reg),
                                 opnd_create_reg(addr_reg)));
 #else
-        MINSERT(
-            ilist, where,
-            XINST_CREATE_add(drcontext, opnd_create_reg(store_reg), OPND_CREATE_SLOT(slot)));
-        //MINSERT(ilist, where, INSTR_CREATE_lea(drcontext, opnd_create_reg(store_reg), opnd_create_base_disp(store_reg, DR_REG_NULL, 0, slot, OPSZ_lea)));
+        // MINSERT(
+        //     ilist, where,
+        //     XINST_CREATE_add(drcontext, opnd_create_reg(store_reg), OPND_CREATE_SLOT(slot)));
+        MINSERT(ilist, where, INSTR_CREATE_lea(drcontext, opnd_create_reg(store_reg), opnd_create_base_disp(store_reg, DR_REG_NULL, 0, slot, OPSZ_lea)));
 #endif
     }
 }

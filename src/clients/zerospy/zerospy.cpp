@@ -1736,23 +1736,23 @@ struct ZerospyInstrument{
                 if(operSize==0) return;
                 // assert(operSize>0);
                 reg_id_t reg_base, reg_ctxt;
-                RESERVE_AFLAGS(drcontext, bb, ins);
+                //RESERVE_AFLAGS(drcontext, bb, ins);
                 RESERVE_REG(drcontext, bb, ins, NULL, reg_base);
-                RESERVE_REG(drcontext, bb, ins, NULL, reg_ctxt);
+                //RESERVE_REG(drcontext, bb, ins, NULL, reg_ctxt);
                 // dr_insert_clean_call(drcontext, bb, ins, (void *)debug_output, false, 2, OPND_CREATE_CCT_INT(refSize), opnd_create_reg(addr_reg));
                 dr_insert_read_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_VAL_CACHE_PTR, reg_base/*reg_base*/);
                 insertTraceCacheLoadedVal(drcontext, bb, ins, refSize, reg_base/*reg_base*/, addr_reg/*reg_addr*/, scratch);
                 // // drcctlib will use add operation to calculate the ctxt, so we just store the <slot> value and recover the ctxt when flushing caches
-                // // the starting cct ctxt value will be stored in each bb start event (after cctlib instrumentation).
-                drcctlib_get_context_handle_in_reg(drcontext, bb, ins, slot, /*ctxt*/reg_ctxt, scratch);
-                insertSaveCachedKey(drcontext, bb, ins, /*elemSize=*/operSize, /*accesslen=*/refSize, /*isApprox=*/1, reg_base/*reg_base*/, reg_ctxt, scratch);
+                // the starting cct ctxt value will be stored in each bb start event (after cctlib instrumentation).
+                drcctlib_get_context_handle_in_reg(drcontext, bb, ins, slot, /*ctxt*/addr_reg, scratch);
+                insertSaveCachedKey(drcontext, bb, ins, /*elemSize=*/operSize, /*accesslen=*/refSize, /*isApprox=*/1, reg_base/*reg_base*/, addr_reg, scratch);
                 // MINSERT(bb, ins, XINST_CREATE_add(drcontext, opnd_create_reg(reg_base), OPND_CREATE_CCT_INT(sizeof(val_cache_t))));
                 MINSERT(bb, ins, INSTR_CREATE_lea(drcontext, opnd_create_reg(reg_base), opnd_create_base_disp(reg_base, DR_REG_NULL, 0, sizeof(val_cache_t), OPSZ_lea)));
                 dr_insert_write_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_VAL_CACHE_PTR, reg_base);
                 //dr_insert_clean_call(drcontext, bb, ins, (void *)debug_assertion, false, 1, opnd_create_reg(reg_base));
-                UNRESERVE_REG(drcontext, bb, ins, reg_ctxt);
+                //UNRESERVE_REG(drcontext, bb, ins, reg_ctxt);
                 UNRESERVE_REG(drcontext, bb, ins, reg_base);
-                UNRESERVE_AFLAGS(drcontext, bb, ins);
+                //UNRESERVE_AFLAGS(drcontext, bb, ins);
             }
         } else {
             if(op_no_flush.get_value()) {
@@ -1774,24 +1774,24 @@ struct ZerospyInstrument{
                 }
             } else {
                 reg_id_t reg_base, reg_ctxt;
-                RESERVE_AFLAGS(drcontext, bb, ins);
+                //RESERVE_AFLAGS(drcontext, bb, ins);
                 RESERVE_REG(drcontext, bb, ins, NULL, reg_base);
-                RESERVE_REG(drcontext, bb, ins, NULL, reg_ctxt);
+                //RESERVE_REG(drcontext, bb, ins, NULL, reg_ctxt);
                 // dr_insert_clean_call(drcontext, bb, ins, (void *)debug_output, false, 2, OPND_CREATE_CCT_INT(refSize), opnd_create_reg(addr_reg));
                 dr_insert_read_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_VAL_CACHE_PTR, reg_base/*reg_base*/);
                 insertTraceCacheLoadedVal(drcontext, bb, ins, refSize, reg_base/*reg_base*/, addr_reg/*reg_addr*/, scratch);
                 // // drcctlib will use add operation to calculate the ctxt, so we just store the <slot> value and recover the ctxt when flushing caches
                 // // the starting cct ctxt value will be stored in each bb start event (after cctlib instrumentation).
-                drcctlib_get_context_handle_in_reg(drcontext, bb, ins, slot, /*ctxt*/reg_ctxt, scratch);
-                insertSaveCachedKey(drcontext, bb, ins, /*elemSize=*/refSize>8?1:refSize, /*accesslen=*/refSize, /*isApprox=*/0, reg_base/*reg_base*/, reg_ctxt, scratch);
+                drcctlib_get_context_handle_in_reg(drcontext, bb, ins, slot, /*ctxt*/addr_reg, scratch);
+                insertSaveCachedKey(drcontext, bb, ins, /*elemSize=*/refSize>8?1:refSize, /*accesslen=*/refSize, /*isApprox=*/0, reg_base/*reg_base*/, addr_reg, scratch);
                 // MINSERT(bb, ins, XINST_CREATE_add(drcontext, opnd_create_reg(reg_base), OPND_CREATE_CCT_INT(sizeof(val_cache_t))));
                 // use lea to avoid any effect on arithmetic flags
                 MINSERT(bb, ins, INSTR_CREATE_lea(drcontext, opnd_create_reg(reg_base), opnd_create_base_disp(reg_base, DR_REG_NULL, 0, sizeof(val_cache_t), OPSZ_lea)));
                 dr_insert_write_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_VAL_CACHE_PTR, reg_base);
                 //dr_insert_clean_call(drcontext, bb, ins, (void *)debug_assertion, false, 1, opnd_create_reg(reg_base));
-                UNRESERVE_REG(drcontext, bb, ins, reg_ctxt);
+                //UNRESERVE_REG(drcontext, bb, ins, reg_ctxt);
                 UNRESERVE_REG(drcontext, bb, ins, reg_base);
-                UNRESERVE_AFLAGS(drcontext, bb, ins);
+                //UNRESERVE_AFLAGS(drcontext, bb, ins);
             }
         }
     }
