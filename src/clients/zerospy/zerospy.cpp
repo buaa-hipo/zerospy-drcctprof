@@ -7,7 +7,7 @@
 
 // #define USE_TIMER
 
-// #define ZEROSPY_DEBUG
+//#define ZEROSPY_DEBUG
 #define _WERROR
 
 #ifdef TIMING
@@ -271,13 +271,22 @@ file_t gFlagF;
  * the cache is full or the sampling flag is changed to inactive. We 
  * will discard the cache when the sampling flag is not active.
  * ***************************************************************/
-void debug_print_1(int ctxt) {
+void debug_print_0(uint32_t ctxt) {
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
     uint64_t n = (uint64_t)(((val_cache_t*)BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_VAL_CACHE_PTR)) - (pt->cache_ptr));
-    printf("DEBUG@%ld(%d): ctxt=%x, stored ctxt=%x\n", n, pt->cache_val_num, ctxt, ((val_cache_t*)BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_VAL_CACHE_PTR))->ctxt_hndl); fflush(stdout);
+    printf("[DEBUG_PRINT_0] "); fflush(stdout);
+    printf("DEBUG@%ld(%d):  ctxt=%x, stored ctxt=%x\n", n, pt->cache_val_num, ctxt, ((val_cache_t*)BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_VAL_CACHE_PTR))->ctxt_hndl); fflush(stdout);
+}
+void debug_print_1(void* base, uint32_t ctxt) {
+    void *drcontext = dr_get_current_drcontext();
+    per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+    assert(base == BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_VAL_CACHE_PTR));
+    uint64_t n = (uint64_t)(((val_cache_t*)BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_VAL_CACHE_PTR)) - (pt->cache_ptr));
+    printf("[DEBUG_PRINT_1] "); fflush(stdout);
+    printf("DEBUG@%ld(%d): base=%p, ctxt=%x, stored ctxt=%x\n", n, pt->cache_val_num, base, ctxt, ((val_cache_t*)BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_VAL_CACHE_PTR))->ctxt_hndl); fflush(stdout);
     assert(drcctlib_ctxt_hndl_is_valid(ctxt));
-    assert(ctxt == (int)((val_cache_t*)BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_VAL_CACHE_PTR))->ctxt_hndl);
+    assert(ctxt == ((val_cache_t*)BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_VAL_CACHE_PTR))->ctxt_hndl);
     assert(n<=(uint64_t)pt->cache_val_num);
 }
 // reg_ctxt and scratch can overlap (same register)
@@ -301,11 +310,13 @@ void insertSaveCachedKey(void* drcontext, instrlist_t *ilist, instr_t *where,
     info.detail.isApprox    = isApprox;
     info.detail.elementSize = elementSize;
     info.detail.accessLen   = accessLen;
+    // printf("info=%x\n", info.packed_info);
     // avoid usage of arithmetic operations that changes the flags
     MINSERT(ilist, where, XINST_CREATE_store(drcontext,
                     OPND_CREATE_MEM32(reg_base, offsetof(val_cache_t, ctxt_hndl)),
                     opnd_create_reg(reg_ctxt)));
-    //dr_insert_clean_call(drcontext, ilist, where, (void *)debug_print_1, false, 1, opnd_create_reg(reg_ctxt));
+    dr_insert_clean_call(drcontext, ilist, where, (void *)debug_print_0, false, 1, opnd_create_reg(reg_ctxt));
+    dr_insert_clean_call(drcontext, ilist, where, (void *)debug_print_1, false, 2, opnd_create_reg(reg_base), opnd_create_reg(reg_ctxt));
     MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT32(info.packed_info)));
     MINSERT(ilist, where, XINST_CREATE_store(drcontext,
                     OPND_CREATE_MEM32(reg_base, offsetof(val_cache_t, info)),
@@ -1319,6 +1330,7 @@ event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, b
     int memRefCnt = 0;
     instr_t *instr;
     /* count the number of instructions in this block */
+    dr_fprintf(gFile, "^^ INFO: Disassembled Instruction ^^^\n");
     for (instr = instrlist_first(bb); instr != NULL; instr = instr_get_next(instr)) {
         num_instructions++;
         if(    (!op_no_flush.get_value()) 
@@ -1344,8 +1356,11 @@ event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, b
                     }
                 }
             }
+            dr_fprintf(gFile, "[memcnt=%d] ", memRefCnt);
         }
+        disassemble(drcontext, instr_get_app_pc(instr), gFile);
     }
+    dr_fprintf(gFile, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
     assert(num_instructions>=0);
     if(num_instructions==0) {
         return DR_EMIT_DEFAULT;
@@ -1726,8 +1741,8 @@ struct ZerospyInstrument{
                 // dr_insert_clean_call(drcontext, bb, ins, (void *)debug_output, false, 2, OPND_CREATE_CCT_INT(refSize), opnd_create_reg(addr_reg));
                 dr_insert_read_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_VAL_CACHE_PTR, reg_base/*reg_base*/);
                 insertTraceCacheLoadedVal(drcontext, bb, ins, refSize, reg_base/*reg_base*/, addr_reg/*reg_addr*/, scratch);
-                // drcctlib will use add operation to calculate the ctxt, so we just store the <slot> value and recover the ctxt when flushing caches
-                // the starting cct ctxt value will be stored in each bb start event (after cctlib instrumentation).
+                // // drcctlib will use add operation to calculate the ctxt, so we just store the <slot> value and recover the ctxt when flushing caches
+                // // the starting cct ctxt value will be stored in each bb start event (after cctlib instrumentation).
                 drcctlib_get_context_handle_in_reg(drcontext, bb, ins, slot, /*ctxt*/reg_ctxt, scratch);
                 insertSaveCachedKey(drcontext, bb, ins, /*elemSize=*/operSize, /*accesslen=*/refSize, /*isApprox=*/1, reg_base/*reg_base*/, reg_ctxt, scratch);
                 // MINSERT(bb, ins, XINST_CREATE_add(drcontext, opnd_create_reg(reg_base), OPND_CREATE_CCT_INT(sizeof(val_cache_t))));
@@ -1764,8 +1779,8 @@ struct ZerospyInstrument{
                 // dr_insert_clean_call(drcontext, bb, ins, (void *)debug_output, false, 2, OPND_CREATE_CCT_INT(refSize), opnd_create_reg(addr_reg));
                 dr_insert_read_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_VAL_CACHE_PTR, reg_base/*reg_base*/);
                 insertTraceCacheLoadedVal(drcontext, bb, ins, refSize, reg_base/*reg_base*/, addr_reg/*reg_addr*/, scratch);
-                // drcctlib will use add operation to calculate the ctxt, so we just store the <slot> value and recover the ctxt when flushing caches
-                // the starting cct ctxt value will be stored in each bb start event (after cctlib instrumentation).
+                // // drcctlib will use add operation to calculate the ctxt, so we just store the <slot> value and recover the ctxt when flushing caches
+                // // the starting cct ctxt value will be stored in each bb start event (after cctlib instrumentation).
                 drcctlib_get_context_handle_in_reg(drcontext, bb, ins, slot, /*ctxt*/reg_ctxt, scratch);
                 insertSaveCachedKey(drcontext, bb, ins, /*elemSize=*/refSize>8?1:refSize, /*accesslen=*/refSize, /*isApprox=*/0, reg_base/*reg_base*/, reg_ctxt, scratch);
                 // MINSERT(bb, ins, XINST_CREATE_add(drcontext, opnd_create_reg(reg_base), OPND_CREATE_CCT_INT(sizeof(val_cache_t))));
