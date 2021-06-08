@@ -271,6 +271,9 @@ file_t gFlagF;
  * the cache is full or the sampling flag is changed to inactive. We 
  * will discard the cache when the sampling flag is not active.
  * ***************************************************************/
+
+#include "detect.h"
+
 void debug_print_0(uint32_t ctxt) {
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
@@ -1779,7 +1782,8 @@ struct ZerospyInstrument{
                 //RESERVE_REG(drcontext, bb, ins, NULL, reg_ctxt);
                 // dr_insert_clean_call(drcontext, bb, ins, (void *)debug_output, false, 2, OPND_CREATE_CCT_INT(refSize), opnd_create_reg(addr_reg));
                 dr_insert_read_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_VAL_CACHE_PTR, reg_base/*reg_base*/);
-                insertTraceCacheLoadedVal(drcontext, bb, ins, refSize, reg_base/*reg_base*/, addr_reg/*reg_addr*/, scratch);
+                //insertTraceCacheLoadedVal(drcontext, bb, ins, refSize, reg_base/*reg_base*/, addr_reg/*reg_addr*/, scratch);
+                insertComputeAndCacheRedmap_INT(drcontext, bb, ins, refSize, reg_base, addr_reg, scratch);
                 // // drcctlib will use add operation to calculate the ctxt, so we just store the <slot> value and recover the ctxt when flushing caches
                 // // the starting cct ctxt value will be stored in each bb start event (after cctlib instrumentation).
                 drcctlib_get_context_handle_in_reg(drcontext, bb, ins, slot, /*ctxt*/addr_reg, scratch);
