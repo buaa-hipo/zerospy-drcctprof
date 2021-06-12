@@ -1,3 +1,5 @@
+#ifndef __UTILS_H__
+#define __UTILS_H__
 #include "dr_api.h"
 
 // TODO: search for dynamorio interface to obtain element witdh of a SIMD operation
@@ -456,5 +458,7 @@ bool instr_is_ignorable(instr_t *ins) {
     }
     return false;
 }
+
+#endif
 
 #endif

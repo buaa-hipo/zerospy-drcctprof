@@ -17,6 +17,7 @@ if (UNIX)
   add_compile_options(-Werror=sign-compare)
   add_compile_options(-Werror=narrowing)
   add_compile_options(-std=c++11)
+  add_compile_options(-march=native)
 
   if (DEBUG)
     add_compile_options(-g3)
