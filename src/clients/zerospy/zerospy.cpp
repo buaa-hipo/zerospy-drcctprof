@@ -106,33 +106,11 @@ zerospy_filter_read_mem_access_instr(instr_t *instr)
 static string g_folder_name;
 static int tls_idx;
 
-// struct INTRedLogs{
-//     uint64_t tot;
-//     uint64_t red;
-//     uint64_t fred; // full redundancy
-//     uint64_t redByteMap;
-// };
-
-// 4K log page
-#define LOG_PAGE_SIZE 4096
-/* as we use ctxt_hndl for logging key value, we calculate the 
-   maximum number of logging pages with CONTEXT_HANDLE_MAX */
-#define LOG_PAGE_NUM  (CONTEXT_HANDLE_MAX/LOG_PAGE_SIZE)
-#define CTXT2PAGE_IDX_1(ctxt) ((ctxt)>>12)
-#define CTXT2PAGE_IDX_2(ctxt) ((ctxt)&(LOG_PAGE_SIZE-1))
-
-#define RECOVER_CTXT(idx_1, idx_2) (((context_handle_t)(idx_1)<<12)|(context_handle_t)(idx_2))
-
 #define MAKE_KEY(ctxt_hndl, elementSize, accessLen) \
-    ((((uint64_t)(ctxt_hndl))<<32) | ((((uint64_t)(elementSize)<<8)|(uint64_t)(accessLen))))
+    ((((uint64_t)(ctxt_hndl))<<32) | ((((uint64_t)(elementSize))<<8)|(uint64_t)(accessLen)))
 #define DECODE_CTXT(key) (context_handle_t)(((key) >> 32) & 0xffffffff)
-#define DECODE_ACCESSLEN(key) ((key) & 0xff)
-#define DECODE_ELEMENTSIZE(key) (((key)>>8) & 0xff)
-template<int bmap_size>
-struct cache_t {
-    uint64_t key;
-    uint64_t redByteMap[bmap_size];
-}
+#define DECODE_ACCESSLEN(key) ((uint8_t)((key) & 0xff))
+#define DECODE_ELEMENTSIZE(key) ((uint8_t)(((key)>>8) & 0xff))
 
 struct INTRedLog_t{
     uint64_t tot;
@@ -151,8 +129,6 @@ struct FPRedLog_t{
 
 typedef std::unordered_map<uint64_t, INTRedLog_t> INTRedLogMap_t;
 typedef std::unordered_map<uint64_t, FPRedLog_t> FPRedLogMap_t;
-typedef cache_t<1> cache_int_t;
-typedef cache_t<MAX_VLEN> cache_fp_t;
 
 #define MINSERT instrlist_meta_preinsert
 #define delta 0.01
@@ -180,8 +156,6 @@ typedef struct _per_thread_t {
     INTRedLogMap_t* INTRedLogMap;
     file_t output_file;
     void* numInsBuff;
-    cache_int_t* int_cache;
-    cache_fp_t*  fp_cache;
     vector<instr_t*> *instr_clones;
 } per_thread_t;
 
@@ -404,63 +378,69 @@ inline __attribute__((always_inline)) uint64_t count_zero_bytemap_int256(uint8_t
 }
 
 /*******************************************************************************************/
-template<bool enable_cache>
-inline __attribute__((always_inline)) 
-INTRedLog_t* getINTRedLog(per_thread_t* pt, int ctxt_hndl, int accessLen, int elementSize)
-{
-    int page_idx_1 = CTXT2PAGE_IDX_1(ctxt_hndl);
-    int page_idx_2 = CTXT2PAGE_IDX_2(ctxt_hndl);
-    INTRedLog_t* log_ptr;
-    if(enable_cache) {
-        assert(pt->INTRedLog[page_idx_1]==NULL);
-        log_ptr = (INTRedLog_t*)dr_global_alloc(sizeof(INTRedLog_t)*LOG_PAGE_SIZE);
-        memset(log_ptr, 0, sizeof(INTRedLog_t)*LOG_PAGE_SIZE);
-        pt->INTRedLog[page_idx_1] = log_ptr;
+inline __attribute__((always_inline)) void AddINTRedLog(uint64_t ctxt_hndl, uint64_t accessLen, uint64_t redZero, uint64_t fred, uint64_t redByteMap, per_thread_t* pt) {
+    uint64_t key = MAKE_KEY(ctxt_hndl, 0/*elementSize, not used*/, accessLen);
+    INTRedLogMap_t::iterator it = pt->INTRedLogMap->find(key);
+    if(it==pt->INTRedLogMap->end()) {
+        INTRedLog_t log_ptr = { accessLen, redZero, fred, redByteMap };
+        pt->INTRedLogMap->insert({key, log_ptr});
     } else {
-        log_ptr = pt->INTRedLog[page_idx_1];
-        if(log_ptr==NULL) {
-            log_ptr = (INTRedLog_t*)dr_global_alloc(sizeof(INTRedLog_t)*LOG_PAGE_SIZE);
-            memset(log_ptr, 0, sizeof(INTRedLog_t)*LOG_PAGE_SIZE);
-            pt->INTRedLog[page_idx_1] = log_ptr;
-        }
+        it->second.tot += accessLen;
+        it->second.red += redZero;
+        it->second.fred += fred;
+        it->second.redByteMap &= redByteMap;
     }
-    log_ptr = &log_ptr[page_idx_2];
-    if(log_ptr->tot==0) {
-        // if it is the first time for logging, we need to initialze the redByteMap
-        log_ptr->redByteMap = (uint64_t)(-1);
-        log_ptr->info.accessLen = accessLen;
-        log_ptr->info.elementSize = elementSize;
-    }
-    return log_ptr;
 }
 
-template<bool enable_cache>
-inline __attribute__((always_inline)) 
-FPRedLog_t* getFPRedLog(per_thread_t* pt, int ctxt_hndl, int accessLen, int elementSize)
-{
-    int page_idx_1 = CTXT2PAGE_IDX_1(ctxt_hndl);
-    int page_idx_2 = CTXT2PAGE_IDX_2(ctxt_hndl);
-    FPRedLog_t* log_ptr;
-    if(enable_cache) {
-        assert(pt->FPRedLog[page_idx_1]==NULL);
-        log_ptr = (FPRedLog_t*)dr_global_alloc(sizeof(FPRedLog_t)*LOG_PAGE_SIZE);
-        memset(log_ptr, 0, sizeof(FPRedLog_t)*LOG_PAGE_SIZE);
-        pt->FPRedLog[page_idx_1] = log_ptr;
+template<int start, int end, int step>
+struct UnrolledFunctions {
+    static inline __attribute__((always_inline)) int getFullyRedundantZeroFP(void* pval) {
+        switch(step) {
+            case 4:
+                return (((*reinterpret_cast<uint32_t*>(((uint8_t*)pval)+start))&0x7fffffffLL)==0?1:0)
+                    + UnrolledFunctions<start+step, end, step>::getFullyRedundantZeroFP(pval);
+            case 8:
+                return (((*reinterpret_cast<uint64_t*>(((uint8_t*)pval)+start))&0x7fffffffffffffffLL)==0?1:0)
+                    + UnrolledFunctions<start+step, end, step>::getFullyRedundantZeroFP(pval);
+        }
+        assert(0);
+        return 0;
+    }
+};
+
+template<int end, int step>
+struct UnrolledFunctions<end, end, step> {
+    static inline __attribute__((always_inline)) int getFullyRedundantZeroFP(void* pval) {
+        return 0;
+    }
+};
+
+template<class T, int n>
+inline __attribute__((always_inline)) void mergeRedByteMapFP(T* redByteMap, T* pval) {
+    for(int i=0; i<n; ++i) {
+        redByteMap[i] |= pval[i];
+    }
+}
+
+template<int esize, int size>
+inline __attribute__((always_inline)) void AddFPRedLog(uint64_t ctxt_hndl, void* pval, per_thread_t* pt) {
+    uint64_t key = MAKE_KEY(ctxt_hndl, esize, size);
+    FPRedLogMap_t::iterator it = pt->FPRedLogMap->find(key);
+    if(it==pt->FPRedLogMap->end()) {
+        FPRedLog_t log_ptr;
+        log_ptr.ftot = size/esize;
+        log_ptr.fred = UnrolledFunctions<0, size, esize>::getFullyRedundantZeroFP(pval);
+        memcpy(log_ptr.redByteMap, pval, size);
+        pt->FPRedLogMap->insert({key, log_ptr});
     } else {
-        log_ptr = pt->FPRedLog[page_idx_1];
-        if(log_ptr==NULL) {
-            log_ptr = (FPRedLog_t*)dr_global_alloc(sizeof(FPRedLog_t)*LOG_PAGE_SIZE);
-            memset(log_ptr, 0, sizeof(FPRedLog_t)*LOG_PAGE_SIZE);
-            pt->FPRedLog[page_idx_1] = log_ptr;
+        it->second.ftot += size/esize;
+        it->second.fred += UnrolledFunctions<0, size, esize>::getFullyRedundantZeroFP(pval);
+        if(esize==4) {
+            mergeRedByteMapFP<uint32_t, size/esize>((uint32_t*)it->second.redByteMap, (uint32_t*)pval);
+        } else {
+            mergeRedByteMapFP<uint64_t, size/esize>((uint64_t*)it->second.redByteMap, (uint64_t*)pval);
         }
     }
-    log_ptr = &log_ptr[page_idx_2];
-    // update info
-    if(log_ptr->ftot==0) {
-        log_ptr->info.accessLen = accessLen;
-        log_ptr->info.elementSize = elementSize;
-    }
-    return log_ptr;
 }
 
 template<int accessLen, int elementSize, bool enable_cache>
@@ -474,13 +454,12 @@ void CheckAndInsertIntPage(int ctxt_hndl, void* addr) {
     static_assert(  accessLen==elementSize || elementSize==1  );
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-    INTRedLog_t* log_ptr = getINTRedLog<enable_cache>(pt, ctxt_hndl, accessLen, elementSize);
     // update info
-    log_ptr->tot += accessLen;
     if(accessLen<=8) {
         uint8_t* bytes = reinterpret_cast<uint8_t*>(addr);
         if(bytes[accessLen-1]!=0) {
             // the log have already been clear to 0, so we do nothing here and quick return.
+            AddINTRedLog(ctxt_hndl, accessLen, 0, 0, 0, pt);
             return ;
         }
     }
@@ -507,28 +486,22 @@ void CheckAndInsertIntPage(int ctxt_hndl, void* addr) {
         default:
             assert(0 && "UNKNOWN ACCESSLEN!\n");
     }
-
-    log_ptr->redByteMap &= redByteMap;
     uint64_t redZero;
     if(elementSize==1) {
         redZero = _mm_popcnt_u64(redByteMap);
-        log_ptr->fred += redZero;
+        AddINTRedLog(ctxt_hndl, accessLen, redZero, redZero, redByteMap, pt);
     } else {
         // accessLen == elementSize
-        redByteMap = (~redByteMap) & ((1<<accessLen)-1);
-        redZero = _lzcnt_u64(redByteMap) - (64-accessLen);
-        log_ptr->fred += ((redZero==accessLen)?1:0);
+        uint64_t redByteMap_2 = (~redByteMap) & ((1<<accessLen)-1);
+        redZero = _lzcnt_u64(redByteMap_2) - (64-accessLen);
+        AddINTRedLog(ctxt_hndl, accessLen, redZero, redZero==accessLen?1:0, redByteMap, pt);
     }
-    log_ptr->red += redZero;
 }
 
 template<bool enable_cache>
 void CheckLargeAndInsertIntPage(int ctxt_hndl, void* addr, int accessLen) {
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-    INTRedLog_t* log_ptr = getINTRedLog<enable_cache>(pt, ctxt_hndl, accessLen, 1);
-    // update info
-    log_ptr->tot += accessLen;
     uint64_t redByteMap=0;
     uint8_t* bytes = reinterpret_cast<uint8_t*>(addr);
     int i=0;
@@ -548,10 +521,8 @@ void CheckLargeAndInsertIntPage(int ctxt_hndl, void* addr, int accessLen) {
         redByteMap |= count_zero_bytemap_int8(&bytes[i])<<i;
         i += 1;
     }
-    log_ptr->redByteMap &= redByteMap;
     uint64_t redZero = _mm_popcnt_u64(redByteMap);
-    log_ptr->fred += redZero;
-    log_ptr->red += redZero;
+    AddINTRedLog(ctxt_hndl, accessLen, redZero, redZero, redByteMap, pt);
 }
 
 template<int accessLen, int elementSize, bool enable_cache>
@@ -563,79 +534,7 @@ void CheckAndInsertFpPage(int ctxt_hndl, void* addr) {
     static_assert(  elementSize==4 || elementSize==8  );
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-    FPRedLog_t* log_ptr = getFPRedLog<enable_cache>(pt, ctxt_hndl, accessLen, elementSize);
-    // update info
-    log_ptr->ftot += accessLen/elementSize;
-    switch(accessLen) {
-        case 4: {
-            uint32_t* bmap = reinterpret_cast<uint32_t*>(log_ptr->redByteMap);
-            uint32_t* pval = reinterpret_cast<uint32_t*>(addr);
-            uint32_t val = *pval;
-            *bmap |= val;
-            log_ptr->fred += ((val & 0x7fffffffLL) == 0)?1:0;
-            } break;
-        case 8:{
-            uint64_t* bmap = reinterpret_cast<uint64_t*>(log_ptr->redByteMap);
-            uint64_t* pval = reinterpret_cast<uint64_t*>(addr);
-            uint64_t val = *pval;
-            *bmap |= val;
-            log_ptr->fred += ((val & 0x7fffffffffffffffLL) == 0)?1:0;
-            } break;
-        case 16:{
-            __m128i* bmap = reinterpret_cast<__m128i*>(log_ptr->redByteMap);
-            __m128i* pval = reinterpret_cast<__m128i*>(addr);
-            __m128i  val  = _mm_loadu_si128(pval);
-            __m128i  bval = _mm_loadu_si128(bmap);
-            bval = _mm_or_si128(bval, val);
-            _mm_storeu_si128(bmap, bval);
-            if(elementSize==4) {
-                // single
-                uint32_t* pval_elem = reinterpret_cast<uint32_t*>(addr);
-                log_ptr->fred += 
-                    (((pval_elem[0] & 0x7fffffffLL) == 0)?1:0) +
-                    (((pval_elem[1] & 0x7fffffffLL) == 0)?1:0) +
-                    (((pval_elem[2] & 0x7fffffffLL) == 0)?1:0) +
-                    (((pval_elem[3] & 0x7fffffffLL) == 0)?1:0);
-            } else {
-                // double
-                uint64_t* pval_elem = reinterpret_cast<uint64_t*>(addr);
-                log_ptr->fred += 
-                    (((pval_elem[0] & 0x7fffffffffffffffLL) == 0)?1:0) +
-                    (((pval_elem[1] & 0x7fffffffffffffffLL) == 0)?1:0);
-            }
-            } break;
-        case 32:{
-            __m256i* bmap = reinterpret_cast<__m256i*>(log_ptr->redByteMap);
-            __m256i* pval = reinterpret_cast<__m256i*>(addr);
-            __m256i  val  = _mm256_loadu_si256(pval);
-            __m256i  bval = _mm256_loadu_si256(bmap);
-            bval = _mm256_or_si256(bval, val);
-            _mm256_storeu_si256(bmap, bval);
-            if(elementSize==4) {
-                // single
-                uint32_t* pval_elem = reinterpret_cast<uint32_t*>(addr);
-                log_ptr->fred += 
-                    (((pval_elem[0] & 0x7fffffffLL) == 0)?1:0) +
-                    (((pval_elem[1] & 0x7fffffffLL) == 0)?1:0) +
-                    (((pval_elem[2] & 0x7fffffffLL) == 0)?1:0) +
-                    (((pval_elem[3] & 0x7fffffffLL) == 0)?1:0) +
-                    (((pval_elem[4] & 0x7fffffffLL) == 0)?1:0) +
-                    (((pval_elem[5] & 0x7fffffffLL) == 0)?1:0) +
-                    (((pval_elem[6] & 0x7fffffffLL) == 0)?1:0) +
-                    (((pval_elem[7] & 0x7fffffffLL) == 0)?1:0);
-            } else {
-                // double
-                uint64_t* pval_elem = reinterpret_cast<uint64_t*>(addr);
-                log_ptr->fred += 
-                    (((pval_elem[0] & 0x7fffffffffffffffLL) == 0)?1:0) +
-                    (((pval_elem[1] & 0x7fffffffffffffffLL) == 0)?1:0) +
-                    (((pval_elem[2] & 0x7fffffffffffffffLL) == 0)?1:0) +
-                    (((pval_elem[3] & 0x7fffffffffffffffLL) == 0)?1:0);
-            }
-            } break;
-        default:
-            assert(0 && "Unknown AccessLen for FP!\n");
-    }
+    AddFPRedLog<elementSize, accessLen>(ctxt_hndl, addr, pt);
 }
 
 #ifdef X86
@@ -645,7 +544,6 @@ void CheckNByteValueAfterVGather(int ctxt_hndl, instr_t* instr)
     static_assert(ElemLen==4 || ElemLen==8);
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-    FPRedLog_t* log_ptr = getFPRedLog<false>(pt, ctxt_hndl, AccessLen, ElemLen);
     dr_mcontext_t mcontext;
     mcontext.size = sizeof(mcontext);
     mcontext.flags= DR_MC_ALL;
@@ -661,19 +559,7 @@ void CheckNByteValueAfterVGather(int ctxt_hndl, instr_t* instr)
         uint32_t pos;
         for( int index=0; instr_compute_address_ex_pos(instr, &mcontext, index, &addr, &is_write, &pos); ++index ) {
             DR_ASSERT(!is_write);
-            if(ElemLen==4) {
-                uint32_t  val  =*reinterpret_cast<uint32_t*>(addr);
-                uint32_t* bmap = reinterpret_cast<uint32_t*>(log_ptr->redByteMap);
-                log_ptr->ftot += 1;
-                log_ptr->fred += ((val & 0x7fffffffLL)==0)?1:0;
-                bmap[pos] |= val;
-            } else {
-                uint64_t  val  =*reinterpret_cast<uint64_t*>(addr);
-                uint64_t* bmap = reinterpret_cast<uint64_t*>(log_ptr->redByteMap);
-                log_ptr->ftot += 1;
-                log_ptr->fred += ((val & 0x7fffffffffffffffLL)==0)?1:0;
-                bmap[pos] |= val;
-            }
+            AddFPRedLog<ElemLen, ElemLen>(ctxt_hndl, addr, pt);
         }
     } else {
         assert(0 && "VGather should be a floating point operation!");
@@ -694,31 +580,6 @@ compute_log2(int value)
     }
     // returns -1 if value is not a power of 2.
     return -1;
-}
-
-template<bool is_floating>
-void insertInfoToLog(void* drcontext, instrlist_t* ilist, instr_t* where, int accessLen, int elemLen, reg_id_t reg_base) {
-    // we will not check for the consistancy of the constants (accesslen/elemLen) for release mode
-#ifdef DEBUG
-    // TODO: make sure the constants are consist for each updates
-#endif
-    union {
-        info_t detail;
-        int16_t packed;
-    } info;
-    static_assert(sizeof(info_t)==sizeof(int16_t));
-    info.detail.accessLen = accessLen;
-    info.detail.elementSize = elemLen;
-    int16_t info_store_val = info.packed;
-    if(is_floating) {
-        MINSERT(ilist, where, XINST_CREATE_store(drcontext,
-                        OPND_CREATE_MEM16(reg_base, offsetof(FPRedLog_t, info)),
-                        OPND_CREATE_INT16(info_store_val)));
-    } else {
-        MINSERT(ilist, where, XINST_CREATE_store(drcontext,
-                        OPND_CREATE_MEM16(reg_base, offsetof(INTRedLog_t, info)),
-                        OPND_CREATE_INT16(info_store_val)));
-    }
 }
 
 void insertComputeAndStoreRedZeroFromRedmap_INT(void* drcontext, instrlist_t* ilist, instr_t* where, int accessLen, int elementSize, reg_id_t reg_base, reg_id_t reg_redmap, reg_id_t scratch) {
@@ -769,42 +630,7 @@ void insertCheckAndUpdateInt(void* drcontext, instrlist_t* ilist, instr_t* where
         default:
             assert(elemLen==1);
     }
-    instr_t* skip_end = INSTR_CREATE_label(drcontext);
     // start check and update
-    if(enable_cache) {
-        assert(0);
-        // inlined check and updates without page allocation
-        MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_ctxt)));
-        dr_insert_read_raw_tls(drcontext, ilist, where, tls_seg, tls_offs + INSTRACE_TLS_OFFS_INTLOG_PTR, reg_base/*reg_base*/);
-        MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(12)));
-        // calculate the start pointer
-        MINSERT(ilist, where, XINST_CREATE_add_sll(drcontext, opnd_create_reg(reg_base), opnd_create_reg(reg_base), opnd_create_reg(scratch), compute_log2(sizeof(INTRedLog_t*))));
-        MINSERT(ilist, where, XINST_CREATE_load(drcontext, opnd_create_reg(reg_base), OPND_CREATE_MEMPTR(reg_base, 0)));
-        // Make sure the page has been allocated
-        MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_base), OPND_CREATE_CCT_INT(0)));
-        instr_t* skip_fastcache = INSTR_CREATE_label(drcontext);
-        MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_EQ, opnd_create_instr(skip_fastcache)));
-        // Now reg_base is the base pointer to the log page
-        // calculate the inner index within this page
-        MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(scratch), OPND_CREATE_CCT_INT(LOG_PAGE_SIZE-1)));
-        MINSERT(ilist, where, INSTR_CREATE_and(drcontext, opnd_create_reg(reg_ctxt), opnd_create_reg(scratch)));
-        // reg_ctxt has the inner index within this page (reg_base), so store the log addr (reg_base[reg_ctxt]) into reg_base
-        MINSERT(ilist, where, INSTR_CREATE_imul_imm(drcontext, opnd_create_reg(reg_ctxt), opnd_create_reg(reg_ctxt), OPND_CREATE_INT8(sizeof(INTRedLog_t))));
-        MINSERT(ilist, where, XINST_CREATE_add(drcontext, opnd_create_reg(reg_base), opnd_create_reg(reg_ctxt)));
-        // now reg_ctxt is not live, so it can be used as scratch registers
-        // store the constant info into the log
-        insertInfoToLog<false/*not fp*/>(drcontext, ilist, where, accessLen, elemLen, reg_base);
-        // compuate and accumulate the redmap into the log
-        insertComputeAndCacheRedmap_INT(drcontext, ilist, where, accessLen, reg_base, reg_addr, scratch);
-        // now the redmap is stored in reg_addr, so we count the redundant zero utilizing 
-        /* Here we utilize LZCNT instruction in SSE4.0 for acceleration (e.g., latency=3 in Broadwell).
-        LZCNT will return the number of the most significant bit 0, we need some extra efforts. Note
-        that the original table-based approach may result in additional cache polution and thus aff-
-        ects the target program's performance.*/
-        insertComputeAndStoreRedZeroFromRedmap_INT(drcontext, ilist, where, accessLen, elemLen, reg_base, reg_addr, scratch);
-        MINSERT(ilist, where, XINST_CREATE_jump(drcontext, opnd_create_instr(skip_end)));
-        MINSERT(ilist, where, skip_fastcache);
-    }
     switch(accessLen) {
         case 1:
             dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertIntPage<1,1,enable_cache>, false, 2, opnd_create_reg(reg_ctxt), opnd_create_reg(reg_addr));
@@ -828,7 +654,6 @@ void insertCheckAndUpdateInt(void* drcontext, instrlist_t* ilist, instr_t* where
             dr_insert_clean_call(drcontext, ilist, where, (void*)CheckLargeAndInsertIntPage<enable_cache>, false, 3, opnd_create_reg(reg_ctxt), opnd_create_reg(reg_addr), OPND_CREATE_CCT_INT(accessLen));
             break;
     }
-    MINSERT(ilist, where, skip_end);
 }
 
 template<bool enable_cache>
@@ -1373,10 +1198,10 @@ ClientThreadStart(void *drcontext)
     if (pt == NULL) {
         ZEROSPY_EXIT_PROCESS("pt == NULL");
     }
-    pt->INTRedLog = (INTRedLog_t**)dr_global_alloc(sizeof(void*)*LOG_PAGE_NUM);
-    pt->FPRedLog = (FPRedLog_t**)dr_global_alloc(sizeof(void*)*LOG_PAGE_NUM);
-    memset(pt->INTRedLog, 0, sizeof(void*)*LOG_PAGE_NUM);
-    memset(pt->FPRedLog , 0, sizeof(void*)*LOG_PAGE_NUM);
+    pt->INTRedLogMap = new INTRedLogMap_t();
+    pt->FPRedLogMap = new FPRedLogMap_t();
+    pt->FPRedLogMap->rehash(100000000);
+    pt->INTRedLogMap->rehash(100000000);
     pt->instr_clones = new vector<instr_t*>();
     pt->numInsBuff = dr_get_dr_segment_base(tls_seg);
     BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR) = 0;
@@ -1419,34 +1244,25 @@ static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad,
 {
     vector<RedundacyData> tmpList;
     vector<RedundacyData>::iterator tmpIt;
-    INTRedLog_t** log_ptr = pt->INTRedLog;
 
     file_t gTraceFile = pt->output_file;
     
     uint64_t grandTotalRedundantBytes = 0;
-    tmpList.reserve(LOG_PAGE_NUM);
+    tmpList.reserve(pt->INTRedLogMap->size());
     dr_fprintf(STDOUT, "Dumping INTEGER Redundancy Info...\n");
     uint64_t count = 0, rep = -1, num = 0;
-    for (int i=0; i<LOG_PAGE_NUM; ++i) {
+    for(auto it=pt->INTRedLogMap->begin(); it!=pt->INTRedLogMap->end(); ++it) {
         ++count;
-        if(100 * count / (LOG_PAGE_NUM*LOG_PAGE_SIZE)!=rep) {
-            rep = 100 * count / (LOG_PAGE_NUM*LOG_PAGE_SIZE);
+        if(100 * count / (pt->INTRedLogMap->size())!=rep) {
+            rep = 100 * count / (pt->INTRedLogMap->size());
             dr_fprintf(STDOUT, "\r%ld%%  Finish",rep); fflush(stdout);
         }
-        if(log_ptr[i]!=NULL) {
-            for(int j=0; j<LOG_PAGE_SIZE; ++j) {
-                if(log_ptr[i][j].tot>0) {
-                    RedundacyData tmp = {
-                        RECOVER_CTXT(i, j),       log_ptr[i][j].red,
-                        log_ptr[i][j].fred,       log_ptr[i][j].tot,
-                        log_ptr[i][j].redByteMap, log_ptr[i][j].info.accessLen
-                    };
-                    tmpList.push_back(tmp);
-                    grandTotalRedundantBytes += tmp.frequency;
-                    ++num;
-                }
-            }
-        }
+        RedundacyData tmp = { DECODE_CTXT(it->first), it->second.red,
+                              it->second.fred,        it->second.tot,
+                              it->second.redByteMap,  DECODE_ACCESSLEN(it->first) };
+        tmpList.push_back(tmp);
+        grandTotalRedundantBytes += tmp.frequency;
+        ++num;
     }
     dr_fprintf(STDOUT, "\r100%%  Finish, Total num = %ld\n", count); fflush(stdout);
     if(count == 0) {
@@ -1573,35 +1389,31 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
 {
     vector<ApproxRedundacyData> tmpList;
     vector<ApproxRedundacyData>::iterator tmpIt;
-    FPRedLog_t** log_ptr = pt->FPRedLog;
-    tmpList.reserve(LOG_PAGE_NUM);
+    tmpList.reserve(pt->FPRedLogMap->size());
     
     file_t gTraceFile = pt->output_file;
     uint64_t grandTotalRedundantBytes = 0;
 
     dr_fprintf(STDOUT, "Dumping FLOATING POINT Redundancy Info...\n");
     uint64_t count = 0, rep = -1, num = 0;
-    for (int i=0; i<LOG_PAGE_NUM; ++i) {
+    for (auto it=pt->FPRedLogMap->begin(); it!=pt->FPRedLogMap->end(); ++it) {
         ++count;
-        if(100 * count / (LOG_PAGE_NUM*LOG_PAGE_SIZE)!=rep) {
-            rep = 100 * count / (LOG_PAGE_NUM*LOG_PAGE_SIZE);
+        if(100 * count / (pt->FPRedLogMap->size())!=rep) {
+            rep = 100 * count / (pt->FPRedLogMap->size());
             dr_fprintf(STDOUT, "\r%ld%%  Finish",rep); fflush(stdout);
         }
-        if(log_ptr[i]!=NULL) {
-            for(int j=0; j<LOG_PAGE_SIZE; ++j) {
-                if(log_ptr[i][j].ftot>0) {
-                    uint64_t redByteMap = getFPRedByteMap((uint8_t*)log_ptr[i][j].redByteMap, log_ptr[i][j].info.accessLen, log_ptr[i][j].info.elementSize);
-                    ApproxRedundacyData tmp = {
-                        RECOVER_CTXT(i, j),           log_ptr[i][j].fred,
-                        log_ptr[i][j].ftot,           redByteMap,
-                        log_ptr[i][j].info.accessLen, log_ptr[i][j].info.elementSize
-                    };
-                    tmpList.push_back(tmp);
-                    grandTotalRedundantBytes += log_ptr[i][j].fred * log_ptr[i][j].info.accessLen;
-                    ++num;
-                }
-            }
-        }
+        uint8_t accessLen = DECODE_ACCESSLEN(it->first);
+        uint8_t elementSize = DECODE_ELEMENTSIZE(it->first);
+        uint64_t redByteMap = getFPRedByteMap((uint8_t*)it->second.redByteMap, accessLen, elementSize);
+        ApproxRedundacyData tmp = { DECODE_CTXT(it->first),
+                                    it->second.fred,
+                                    it->second.ftot,
+                                    redByteMap,
+                                    accessLen,
+                                    elementSize };
+        tmpList.push_back(tmp);
+        grandTotalRedundantBytes += it->second.fred * accessLen;
+        ++num;
     }
     dr_fprintf(STDOUT, "\r100%%  Finish, Total num = %ld\n", count); fflush(stdout);
     if(count == 0) {
@@ -1666,25 +1478,11 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
 /*******************************************************************/
 static uint64_t getThreadByteLoad(per_thread_t *pt) {
     register uint64_t x = 0;
-    INTRedLog_t** int_log_ptr = pt->INTRedLog;
-    for (int i=0; i<LOG_PAGE_NUM; ++i) {
-        if(int_log_ptr[i]!=NULL) {
-            for(int j=0; j<LOG_PAGE_SIZE; ++j) {
-                if(int_log_ptr[i][j].tot>0) {
-                    x += int_log_ptr[i][j].tot;
-                }
-            }
-        }
+    for (auto it=pt->INTRedLogMap->begin(); it!=pt->INTRedLogMap->end(); ++it) {
+        x += it->second.tot;
     }
-    FPRedLog_t** fp_log_ptr = pt->FPRedLog;
-    for (int i=0; i<LOG_PAGE_NUM; ++i) {
-        if(fp_log_ptr[i]!=NULL) {
-            for(int j=0; j<LOG_PAGE_SIZE; ++j) {
-                if(fp_log_ptr[i][j].ftot>0) {
-                    x += fp_log_ptr[i][j].ftot * fp_log_ptr[i][j].info.accessLen;
-                }
-            }
-        }
+    for (auto it=pt->FPRedLogMap->begin(); it!=pt->FPRedLogMap->end(); ++it) {
+        x += it->second.ftot * DECODE_ACCESSLEN(it->first);
     }
     return x;
 }
@@ -1716,20 +1514,12 @@ ClientThreadEnd(void *drcontext)
         dr_mutex_unlock(gLock);
     }
     dr_close_file(pt->output_file);
-    for(int i=0; i<LOG_PAGE_NUM; ++i) {
-        if(pt->INTRedLog[i]) {
-            dr_global_free(pt->INTRedLog[i], LOG_PAGE_SIZE*sizeof(INTRedLog_t));
-        }
-        if(pt->FPRedLog[i]) {
-            dr_global_free(pt->FPRedLog[i], LOG_PAGE_SIZE*sizeof(FPRedLog_t));
-        }
-    }
-    dr_global_free(pt->INTRedLog, LOG_PAGE_NUM*sizeof(void*));
-    dr_global_free(pt->FPRedLog, LOG_PAGE_NUM*sizeof(void*));
     for(size_t i=0;i<pt->instr_clones->size();++i) {
         instr_destroy(drcontext, (*pt->instr_clones)[i]);
     }
     delete pt->instr_clones;
+    delete pt->INTRedLogMap;
+    delete pt->FPRedLogMap;
 #ifdef DEBUG_REUSE
     dr_close_file(pt->log_file);
 #endif
