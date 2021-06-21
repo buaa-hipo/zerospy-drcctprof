@@ -221,15 +221,16 @@ uint64_t grandTotBytesApproxRedLoad = 0;
 
 /****************************************************************************************/
 inline __attribute__((always_inline)) uint64_t count_zero_bytemap_int8(uint8_t * addr) {
-    register uint8_t xx = *((uint8_t*)addr);
-    // reduce by bits until byte level
-    // xx = xx | (xx>>1) | (xx>>2) | (xx>>3) | (xx>>4) | (xx>>5) | (xx>>6) | (xx>>7);
-    xx = xx | (xx>>1);
-    xx = xx | (xx>>2);
-    xx = xx | (xx>>4);
-    // now xx is byte level reduced, check if it is zero and mask the unused bits
-    xx = (~xx) & 0x1;
-    return xx;
+    return addr[0]==0?1:0;
+    // register uint8_t xx = *((uint8_t*)addr);
+    // // reduce by bits until byte level
+    // // xx = xx | (xx>>1) | (xx>>2) | (xx>>3) | (xx>>4) | (xx>>5) | (xx>>6) | (xx>>7);
+    // xx = xx | (xx>>1);
+    // xx = xx | (xx>>2);
+    // xx = xx | (xx>>4);
+    // // now xx is byte level reduced, check if it is zero and mask the unused bits
+    // xx = (~xx) & 0x1;
+    // return xx;
 }
 inline __attribute__((always_inline)) uint64_t count_zero_bytemap_int16(uint8_t * addr) {
     register uint16_t xx = *((uint16_t*)addr);
@@ -406,6 +407,32 @@ struct UnrolledFunctions {
         assert(0);
         return 0;
     }
+    static inline __attribute__((always_inline)) void mergeRedByteMapFP(void* redByteMap, void* pval) {
+        switch(step) {
+            case 4:
+                reinterpret_cast<uint32_t*>(redByteMap)[start] |= reinterpret_cast<uint32_t*>(pval)[start];
+                break;
+            case 8:
+                reinterpret_cast<uint64_t*>(redByteMap)[start] |= reinterpret_cast<uint64_t*>(pval)[start];
+                break;
+            default:
+                assert(0 && "Unknown type size!\n");
+        }
+        UnrolledFunctions<start+step, end, step>::mergeRedByteMapFP(redByteMap, pval);
+    }
+    static inline __attribute__((always_inline)) void memcpy(void* dst, void* src) {
+        switch(step) {
+            case 4:
+                reinterpret_cast<uint32_t*>(dst)[start] = reinterpret_cast<uint32_t*>(src)[start];
+                break;
+            case 8:
+                reinterpret_cast<uint64_t*>(dst)[start] = reinterpret_cast<uint64_t*>(src)[start];
+                break;
+            default:
+                assert(0 && "Unknown type size!\n");
+        }
+        UnrolledFunctions<start+step, end, step>::memcpy(dst, src);
+    }
 };
 
 template<int end, int step>
@@ -413,14 +440,13 @@ struct UnrolledFunctions<end, end, step> {
     static inline __attribute__((always_inline)) int getFullyRedundantZeroFP(void* pval) {
         return 0;
     }
-};
-
-template<class T, int n>
-inline __attribute__((always_inline)) void mergeRedByteMapFP(T* redByteMap, T* pval) {
-    for(int i=0; i<n; ++i) {
-        redByteMap[i] |= pval[i];
+    static inline __attribute__((always_inline)) void mergeRedByteMapFP(void* redByteMap, void* pval) {
+        return ;
     }
-}
+    static inline __attribute__((always_inline)) void memcpy(void* dst, void* src) {
+        return ;
+    }
+};
 
 template<int esize, int size>
 inline __attribute__((always_inline)) void AddFPRedLog(uint64_t ctxt_hndl, void* pval, per_thread_t* pt) {
@@ -430,21 +456,21 @@ inline __attribute__((always_inline)) void AddFPRedLog(uint64_t ctxt_hndl, void*
         FPRedLog_t log_ptr;
         log_ptr.ftot = size/esize;
         log_ptr.fred = UnrolledFunctions<0, size, esize>::getFullyRedundantZeroFP(pval);
-        memcpy(log_ptr.redByteMap, pval, size);
+        UnrolledFunctions<0, size, esize>::memcpy(log_ptr.redByteMap, pval);
         pt->FPRedLogMap->insert({key, log_ptr});
     } else {
         it->second.ftot += size/esize;
         it->second.fred += UnrolledFunctions<0, size, esize>::getFullyRedundantZeroFP(pval);
         if(esize==4) {
-            mergeRedByteMapFP<uint32_t, size/esize>((uint32_t*)it->second.redByteMap, (uint32_t*)pval);
+            UnrolledFunctions<0, size, esize>::mergeRedByteMapFP(it->second.redByteMap, pval);
         } else {
-            mergeRedByteMapFP<uint64_t, size/esize>((uint64_t*)it->second.redByteMap, (uint64_t*)pval);
+            UnrolledFunctions<0, size, esize>::mergeRedByteMapFP(it->second.redByteMap, pval);
         }
     }
 }
 
 template<int accessLen, int elementSize, bool enable_cache>
-void CheckAndInsertIntPage(int ctxt_hndl, void* addr) {
+void CheckAndInsertIntPage(int slot, void* addr) {
     static_assert(  accessLen==1 || 
                     accessLen==2 || 
                     accessLen==4 || 
@@ -454,6 +480,7 @@ void CheckAndInsertIntPage(int ctxt_hndl, void* addr) {
     static_assert(  accessLen==elementSize || elementSize==1  );
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+    context_handle_t ctxt_hndl = drcctlib_get_context_handle(drcontext, slot);
     // update info
     if(accessLen<=8) {
         uint8_t* bytes = reinterpret_cast<uint8_t*>(addr);
@@ -463,6 +490,7 @@ void CheckAndInsertIntPage(int ctxt_hndl, void* addr) {
             return ;
         }
     }
+    return ;
     uint64_t redByteMap;
     switch(accessLen) {
         case 1:
@@ -499,9 +527,10 @@ void CheckAndInsertIntPage(int ctxt_hndl, void* addr) {
 }
 
 template<bool enable_cache>
-void CheckLargeAndInsertIntPage(int ctxt_hndl, void* addr, int accessLen) {
+void CheckLargeAndInsertIntPage(int slot, void* addr, int accessLen) {
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+    context_handle_t ctxt_hndl = drcctlib_get_context_handle(drcontext, slot);
     uint64_t redByteMap=0;
     uint8_t* bytes = reinterpret_cast<uint8_t*>(addr);
     int i=0;
@@ -526,7 +555,7 @@ void CheckLargeAndInsertIntPage(int ctxt_hndl, void* addr, int accessLen) {
 }
 
 template<int accessLen, int elementSize, bool enable_cache>
-void CheckAndInsertFpPage(int ctxt_hndl, void* addr) {
+void CheckAndInsertFpPage(int slot, void* addr) {
     static_assert(  accessLen==4 || 
                     accessLen==8 || 
                     accessLen==16 || 
@@ -534,6 +563,7 @@ void CheckAndInsertFpPage(int ctxt_hndl, void* addr) {
     static_assert(  elementSize==4 || elementSize==8  );
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+    context_handle_t ctxt_hndl = drcctlib_get_context_handle(drcontext, slot);
     AddFPRedLog<elementSize, accessLen>(ctxt_hndl, addr, pt);
 }
 
@@ -582,43 +612,8 @@ compute_log2(int value)
     return -1;
 }
 
-void insertComputeAndStoreRedZeroFromRedmap_INT(void* drcontext, instrlist_t* ilist, instr_t* where, int accessLen, int elementSize, reg_id_t reg_base, reg_id_t reg_redmap, reg_id_t scratch) {
-    // First accumulate the tot (also to make sure the log is in cache)
-    MINSERT(ilist, where, XINST_CREATE_add(drcontext, OPND_CREATE_MEM64(reg_base, offsetof(INTRedLog_t, tot)), OPND_CREATE_INT8(accessLen)));
-    // The redmap format: bit 1 indicates zero byte, and bit 0 indicates non-zero byte
-    // we only use lzcnt when accesslen is equal to element size
-    if(accessLen==elementSize) {
-        // we need andn operation to make bit 0 indicate the zero byte: redmap = (~redmap)&((1<<accessLen)-1)
-        MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(scratch), OPND_CREATE_CCT_INT((1<<accessLen)-1)));
-        MINSERT(ilist, where, INSTR_CREATE_andn(drcontext, opnd_create_reg(reg_redmap), opnd_create_reg(reg_redmap), opnd_create_reg(scratch)));
-        // count the redmap via LZCNT instruction
-        MINSERT(ilist, where, INSTR_CREATE_lzcnt(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_redmap)));
-        // but we need to substruct the not-used leading most siginificant zeros from the counts.
-        int8_t unused_bits = IF_X64_ELSE(64,32)-accessLen;
-        assert(unused_bits >= 0);
-        if(unused_bits) {
-            MINSERT(ilist, where, XINST_CREATE_sub(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(unused_bits)));
-        }
-    } else if (elementSize==1) {
-        // if the element size is 1, we can use popcnt (latency=3) to count the 1s in the redmap to get the number of redundant zero.
-        MINSERT(ilist, where, INSTR_CREATE_popcnt(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_redmap)));
-    } else {
-        // TODO: although this should not be executed, we still want to implement for logical complementation.
-        assert(0 && "Currently fast caching of the strided access of integer values are not supported.");
-    }
-    // accumulate to the log
-    MINSERT(ilist, where, XINST_CREATE_add(drcontext, OPND_CREATE_MEM64(reg_base, offsetof(INTRedLog_t, red)), opnd_create_reg(scratch)));
-    // we add the carry to the fully redundant zero
-    MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(accessLen)));
-    instr_t* skip_fred_update = INSTR_CREATE_label(drcontext);
-    MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_EQ, opnd_create_instr(skip_fred_update)));
-    // only add when CF is set (redzero==accessLen, as it must satisfy: redzero<=accessLen)
-    MINSERT(ilist, where, INSTR_CREATE_add(drcontext, OPND_CREATE_MEM64(reg_base, offsetof(INTRedLog_t, fred)), OPND_CREATE_INT8(1)));
-    MINSERT(ilist, where, skip_fred_update);
-}
-
 template<bool enable_cache>
-void insertCheckAndUpdateInt(void* drcontext, instrlist_t* ilist, instr_t* where, int accessLen, int elemLen, reg_id_t reg_base, reg_id_t reg_addr, reg_id_t reg_ctxt, reg_id_t scratch) {
+void insertCheckAndUpdateInt(void* drcontext, instrlist_t* ilist, instr_t* where, int accessLen, int elemLen, int32_t slot, reg_id_t reg_addr, reg_id_t scratch) {
     // quick check
     switch(accessLen) {
         case 1:
@@ -633,31 +628,31 @@ void insertCheckAndUpdateInt(void* drcontext, instrlist_t* ilist, instr_t* where
     // start check and update
     switch(accessLen) {
         case 1:
-            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertIntPage<1,1,enable_cache>, false, 2, opnd_create_reg(reg_ctxt), opnd_create_reg(reg_addr));
+            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertIntPage<1,1,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
             break;
         case 2:
-            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertIntPage<2,2,enable_cache>, false, 2, opnd_create_reg(reg_ctxt), opnd_create_reg(reg_addr));
+            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertIntPage<2,2,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
             break;
         case 4:
-            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertIntPage<4,4,enable_cache>, false, 2, opnd_create_reg(reg_ctxt), opnd_create_reg(reg_addr));
+            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertIntPage<4,4,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
             break;
         case 8:
-            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertIntPage<8,8,enable_cache>, false, 2, opnd_create_reg(reg_ctxt), opnd_create_reg(reg_addr));
+            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertIntPage<8,8,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
             break;
         case 16:
-            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertIntPage<16,1,enable_cache>, false, 2, opnd_create_reg(reg_ctxt), opnd_create_reg(reg_addr));
+            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertIntPage<16,1,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
             break;
         case 32:
-            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertIntPage<32,1,enable_cache>, false, 2, opnd_create_reg(reg_ctxt), opnd_create_reg(reg_addr));
+            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertIntPage<32,1,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
             break;
         default:
-            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckLargeAndInsertIntPage<enable_cache>, false, 3, opnd_create_reg(reg_ctxt), opnd_create_reg(reg_addr), OPND_CREATE_CCT_INT(accessLen));
+            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckLargeAndInsertIntPage<enable_cache>, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr), OPND_CREATE_CCT_INT(accessLen));
             break;
     }
 }
 
 template<bool enable_cache>
-void insertCheckAndUpdateFp(void* drcontext, instrlist_t* ilist, instr_t* where, int accessLen, int elemLen, reg_id_t reg_base, reg_id_t reg_addr, reg_id_t reg_ctxt, reg_id_t scratch) {
+void insertCheckAndUpdateFp(void* drcontext, instrlist_t* ilist, instr_t* where, int accessLen, int elemLen, int32_t slot, reg_id_t reg_addr, reg_id_t scratch) {
     // quick check
     switch(accessLen) {
         case 4:
@@ -677,23 +672,23 @@ void insertCheckAndUpdateFp(void* drcontext, instrlist_t* ilist, instr_t* where,
     }
     switch(accessLen) {
         case 4:
-            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertFpPage<4,4,enable_cache>, false, 2, opnd_create_reg(reg_ctxt), opnd_create_reg(reg_addr));
+            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertFpPage<4,4,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
             break;
         case 8:
-            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertFpPage<8,8,enable_cache>, false, 2, opnd_create_reg(reg_ctxt), opnd_create_reg(reg_addr));
+            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertFpPage<8,8,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
             break;
         case 16:
             if(elemLen==4) {
-                dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertFpPage<16,4,enable_cache>, false, 2, opnd_create_reg(reg_ctxt), opnd_create_reg(reg_addr));
+                dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertFpPage<16,4,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
             } else {
-                dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertFpPage<16,8,enable_cache>, false, 2, opnd_create_reg(reg_ctxt), opnd_create_reg(reg_addr));
+                dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertFpPage<16,8,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
             }
             break;
         case 32:
             if(elemLen==4) {
-                dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertFpPage<32,4,enable_cache>, false, 2, opnd_create_reg(reg_ctxt), opnd_create_reg(reg_addr));
+                dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertFpPage<32,4,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
             } else {
-                dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertFpPage<32,8,enable_cache>, false, 2, opnd_create_reg(reg_ctxt), opnd_create_reg(reg_addr));
+                dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertFpPage<32,8,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
             }
             break;
     }
@@ -940,7 +935,7 @@ event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, b
 }
 
 struct ZerospyInstrument{
-    static __attribute__((always_inline)) void InstrumentReadValueBeforeAndAfterLoading(void *drcontext, instrlist_t *bb, instr_t *ins, opnd_t opnd, reg_id_t reg_base, reg_id_t addr_reg, reg_id_t reg_ctxt, reg_id_t scratch)
+    static __attribute__((always_inline)) void InstrumentReadValueBeforeAndAfterLoading(void *drcontext, instrlist_t *bb, instr_t *ins, opnd_t opnd, int32_t slot, reg_id_t addr_reg, reg_id_t scratch)
     {
         uint32_t refSize = opnd_size_in_bytes(opnd_get_size(opnd));
         if (refSize==0) {
@@ -970,10 +965,10 @@ struct ZerospyInstrument{
         {
             uint32_t operSize = FloatOperandSizeTable(ins, opnd);
             if(operSize>0) {
-                insertCheckAndUpdateFp<false>(drcontext, bb, ins, refSize, operSize, reg_base, addr_reg, reg_ctxt, scratch);
+                insertCheckAndUpdateFp<false>(drcontext, bb, ins, refSize, operSize, slot, addr_reg, scratch);
             }
         } else {
-            insertCheckAndUpdateInt<false>(drcontext, bb, ins, refSize, refSize>8?1:refSize, reg_base, addr_reg, reg_ctxt, scratch);
+            insertCheckAndUpdateInt<false>(drcontext, bb, ins, refSize, refSize>8?1:refSize, slot, addr_reg, scratch);
         }
     }
 #ifdef X86
@@ -1041,7 +1036,7 @@ inline void getUnusedRegEntry(drvector_t* vec, instr_t* instr) {
 }
 
 static void
-InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, int32_t slot, reg_id_t reg_base, reg_id_t reg_addr, reg_id_t reg_ctxt, reg_id_t scratch)
+InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, int32_t slot, reg_id_t reg_addr, reg_id_t scratch)
 {
     if (!drutil_insert_get_mem_addr(drcontext, ilist, where, ref, reg_addr/*addr*/,
                                     scratch/*scratch*/)) {
@@ -1051,7 +1046,7 @@ InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, i
         dr_fprintf(STDERR, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
         ZEROSPY_EXIT_PROCESS("InstrumentMem drutil_insert_get_mem_addr failed!");
     } else {
-        ZerospyInstrument::InstrumentReadValueBeforeAndAfterLoading(drcontext, ilist, where, ref, reg_base, reg_addr, reg_ctxt, scratch);
+        ZerospyInstrument::InstrumentReadValueBeforeAndAfterLoading(drcontext, ilist, where, ref, slot, reg_addr, scratch);
     }
 }
 
@@ -1059,7 +1054,7 @@ void InstrumentMemAll(void* drcontext, instrlist_t *bb, instr_t* instr, int32_t 
 {
     drvector_t vec;
     getUnusedRegEntry(&vec, instr);
-    reg_id_t reg_base=DR_REG_NULL, reg_ctxt, reg_addr, scratch;
+    reg_id_t reg_base=DR_REG_NULL, reg_addr, scratch;
     // RESERVE_AFLAGS(drcontext, bb, instr);
     RESERVE_REG(drcontext, bb, instr, &vec, reg_addr);
     instr_t* skipcall = INSTR_CREATE_label(drcontext);
@@ -1070,18 +1065,14 @@ void InstrumentMemAll(void* drcontext, instrlist_t *bb, instr_t* instr, int32_t 
         MINSERT(bb, instr, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_addr), OPND_CREATE_CCT_INT(window_enable)));
         MINSERT(bb, instr, XINST_CREATE_jump_cond(drcontext, DR_PRED_GT, opnd_create_instr(skipcall)));
     }
-    // RESERVE_REG(drcontext, bb, instr, &vec, reg_base);
-    RESERVE_REG(drcontext, bb, instr, &vec, reg_ctxt);
     RESERVE_REG(drcontext, bb, instr, &vec, scratch);
-    drcctlib_get_context_handle_in_reg(drcontext, bb, instr, slot, reg_ctxt, scratch);
     int num_srcs = instr_num_srcs(instr);
     for(int i=0; i<num_srcs; ++i) {
         opnd_t opnd = instr_get_src(instr, i);
         if(opnd_is_memory_reference(opnd)) {
-            InstrumentMem(drcontext, bb, instr, opnd, slot, reg_base, reg_addr, reg_ctxt, scratch);
+            InstrumentMem(drcontext, bb, instr, opnd, slot, reg_addr, scratch);
         }
     }
-    UNRESERVE_REG(drcontext, bb, instr, reg_ctxt);
     UNRESERVE_REG(drcontext, bb, instr, scratch);
     MINSERT(bb, instr, skipcall);
     UNRESERVE_REG(drcontext, bb, instr, reg_addr);
