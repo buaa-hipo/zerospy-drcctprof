@@ -384,7 +384,7 @@ inline __attribute__((always_inline)) void AddINTRedLog(uint64_t ctxt_hndl, uint
     INTRedLogMap_t::iterator it = pt->INTRedLogMap->find(key);
     if(it==pt->INTRedLogMap->end()) {
         INTRedLog_t log_ptr = { accessLen, redZero, fred, redByteMap };
-        pt->INTRedLogMap->insert({key, log_ptr});
+        (*pt->INTRedLogMap)[key] = log_ptr;
     } else {
         it->second.tot += accessLen;
         it->second.red += redZero;
@@ -457,7 +457,7 @@ inline __attribute__((always_inline)) void AddFPRedLog(uint64_t ctxt_hndl, void*
         log_ptr.ftot = size/esize;
         log_ptr.fred = UnrolledFunctions<0, size, esize>::getFullyRedundantZeroFP(pval);
         UnrolledFunctions<0, size, esize>::memcpy(log_ptr.redByteMap, pval);
-        pt->FPRedLogMap->insert({key, log_ptr});
+        (*pt->FPRedLogMap)[key] = log_ptr;
     } else {
         it->second.ftot += size/esize;
         it->second.fred += UnrolledFunctions<0, size, esize>::getFullyRedundantZeroFP(pval);
@@ -1191,8 +1191,8 @@ ClientThreadStart(void *drcontext)
     }
     pt->INTRedLogMap = new INTRedLogMap_t();
     pt->FPRedLogMap = new FPRedLogMap_t();
-    pt->FPRedLogMap->rehash(100000000);
-    pt->INTRedLogMap->rehash(100000000);
+    pt->FPRedLogMap->rehash(10000000);
+    pt->INTRedLogMap->rehash(10000000);
     pt->instr_clones = new vector<instr_t*>();
     pt->numInsBuff = dr_get_dr_segment_base(tls_seg);
     BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR) = 0;
