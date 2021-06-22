@@ -197,7 +197,9 @@ file_t gFlagF;
  * will discard the cache when the sampling flag is not active.
  * ***************************************************************/
 
-#include "detect.h"
+// #include "detect.h"
+#define USE_SIMD
+#define USE_SSE
 
 #ifdef USE_CLEANCALL
 #define IS_SAMPLED(pt, WINDOW_ENABLE) (pt->sampleFlag)
@@ -277,6 +279,21 @@ inline __attribute__((always_inline)) uint64_t count_zero_bytemap_int64(uint8_t 
     xx = xx & 0xff;
     return xx;
 }
+#ifdef USE_SIMD
+uint8_t mask[64] __attribute__((aligned(64))) = {   0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1 };
+
+uint8_t mask_shuf[32] __attribute__((aligned(64))) = { 
+                                         0x00, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 
+                                         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                                         0x00, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 
+                                         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
 inline __attribute__((always_inline)) uint64_t count_zero_bytemap_int128(uint8_t * addr) {
     uint64_t xx;
@@ -377,7 +394,7 @@ inline __attribute__((always_inline)) uint64_t count_zero_bytemap_int256(uint8_t
     xx = (uint64_t)cast.e[0];
     return xx;
 }
-
+#endif
 /*******************************************************************************************/
 inline __attribute__((always_inline)) void AddINTRedLog(uint64_t ctxt_hndl, uint64_t accessLen, uint64_t redZero, uint64_t fred, uint64_t redByteMap, per_thread_t* pt) {
     uint64_t key = MAKE_KEY(ctxt_hndl, 0/*elementSize, not used*/, accessLen);
@@ -392,6 +409,34 @@ inline __attribute__((always_inline)) void AddINTRedLog(uint64_t ctxt_hndl, uint
         it->second.redByteMap &= redByteMap;
     }
 }
+
+static const unsigned char BitCountTable4[] __attribute__ ((aligned(64))) = {
+    0, 0, 1, 2
+};
+
+static const unsigned char BitCountTable16[] __attribute__ ((aligned(64))) = {
+    0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 2, 2, 3, 4
+};
+
+static const unsigned char BitCountTable256[] __attribute__ ((aligned(64))) = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 
+    4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 7, 8
+};
 
 template<int start, int end, int step>
 struct UnrolledFunctions {
@@ -433,6 +478,18 @@ struct UnrolledFunctions {
         }
         UnrolledFunctions<start+step, end, step>::memcpy(dst, src);
     }
+    static __attribute__((always_inline)) uint64_t BodyRedNum(uint64_t rmap){
+        static_assert(start < end);
+        if(step==1)
+            return ((start==0) ? (rmap&0x1) : ((rmap>>start)&0x1)) + (UnrolledFunctions<start+step,end,step>::BodyRedNum(rmap));
+        else if(step==2)
+            return ((start==0) ? BitCountTable4[rmap&0x3] : BitCountTable4[(rmap>>start)&0x3]) + (UnrolledFunctions<start+step,end,step>::BodyRedNum(rmap));
+        else if(step==4)
+            return ((start==0) ? BitCountTable16[rmap&0xf] : BitCountTable16[(rmap>>start)&0xf]) + (UnrolledFunctions<start+step,end,step>::BodyRedNum(rmap));
+        else if(step==8)
+            return ((start==0) ? BitCountTable256[rmap&0xff] : BitCountTable256[(rmap>>start)&0xff]) + (UnrolledFunctions<start+step,end,step>::BodyRedNum(rmap));
+        return 0;
+    }
 };
 
 template<int end, int step>
@@ -445,6 +502,9 @@ struct UnrolledFunctions<end, end, step> {
     }
     static inline __attribute__((always_inline)) void memcpy(void* dst, void* src) {
         return ;
+    }
+    static inline __attribute__((always_inline)) uint64_t BodyRedNum(uint64_t rmap) {
+        return 0;
     }
 };
 
@@ -506,30 +566,44 @@ void CheckAndInsertIntPage(int slot, void* addr) {
             redByteMap = count_zero_bytemap_int64((uint8_t*)addr);
             break;
         case 16:
-            // redByteMap = count_zero_bytemap_int128((uint8_t*)addr);
+#ifdef USE_SIMD
+            redByteMap = count_zero_bytemap_int128((uint8_t*)addr);
+#else
             redByteMap = count_zero_bytemap_int64((uint8_t*)addr) |
                         (count_zero_bytemap_int64((uint8_t*)addr+8)<<8);
+#endif
             break;
         case 32:
-            // redByteMap = count_zero_bytemap_int256((uint8_t*)addr);
+#ifdef USE_SIMD
+            redByteMap = count_zero_bytemap_int256((uint8_t*)addr);
+#else
             redByteMap = count_zero_bytemap_int64((uint8_t*)addr) |
                         (count_zero_bytemap_int64((uint8_t*)addr+8)<<8) |
                         (count_zero_bytemap_int64((uint8_t*)addr+16)<<16) |
                         (count_zero_bytemap_int64((uint8_t*)addr+24)<<24);
+#endif
             break;
         default:
             assert(0 && "UNKNOWN ACCESSLEN!\n");
     }
-    uint64_t redZero;
+#ifdef USE_SSE
     if(elementSize==1) {
-        redZero = _mm_popcnt_u64(redByteMap);
+        uint64_t redZero = _mm_popcnt_u64(redByteMap);
         AddINTRedLog(ctxt_hndl, accessLen, redZero, redZero, redByteMap, pt);
     } else {
         // accessLen == elementSize
         uint64_t redByteMap_2 = (~redByteMap) & ((1<<accessLen)-1);
-        redZero = _lzcnt_u64(redByteMap_2) - (64-accessLen);
+        uint64_t redZero = _lzcnt_u64(redByteMap_2) - (64-accessLen);
         AddINTRedLog(ctxt_hndl, accessLen, redZero, redZero==accessLen?1:0, redByteMap, pt);
     }
+#else
+    uint64_t redZero = UnrolledFunctions<0, accessLen, elementSize>::BodyRedNum(redByteMap);
+    if(elementSize==1) {
+        AddINTRedLog(ctxt_hndl, accessLen, redZero, redZero, redByteMap, pt);
+    } else {
+        AddINTRedLog(ctxt_hndl, accessLen, redZero, redZero==accessLen?1:0, redByteMap, pt);
+    }
+#endif
 }
 
 template<bool enable_cache>
