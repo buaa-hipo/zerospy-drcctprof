@@ -1,4 +1,5 @@
-#include <unordered_map>
+//#include <unordered_map>
+#include <map>
 #include <vector>
 #include <string>
 #include <sys/stat.h>
@@ -112,6 +113,10 @@ static int tls_idx;
 #define DECODE_ACCESSLEN(key) ((uint8_t)((key) & 0xff))
 #define DECODE_ELEMENTSIZE(key) ((uint8_t)(((key)>>8) & 0xff))
 
+#define ENCODE_TO_UPPER(upper, src) ((((uint64_t)upper)<<56) | ((uint64_t)src))
+#define DECODE_UPPER(enc) (uint8_t)(((uint64_t)enc>>56) & 0xff)
+#define DECODE_SRC(enc) (uint64_t)((uint64_t)enc & 0xffffffffffffffLL)
+
 struct INTRedLog_t{
     uint64_t tot;
     uint64_t red;
@@ -124,11 +129,12 @@ struct INTRedLog_t{
 struct FPRedLog_t{
     uint64_t ftot;
     uint64_t fred;
-    uint64_t redByteMap[MAX_VLEN];
+    //uint64_t redByteMap[MAX_VLEN];
+    uint64_t redByteMap;
 };
 
-typedef std::unordered_map<uint64_t, INTRedLog_t> INTRedLogMap_t;
-typedef std::unordered_map<uint64_t, FPRedLog_t> FPRedLogMap_t;
+typedef std::map<context_handle_t, INTRedLog_t> INTRedLogMap_t;
+typedef std::map<context_handle_t, FPRedLog_t> FPRedLogMap_t;
 
 #define MINSERT instrlist_meta_preinsert
 #define delta 0.01
@@ -397,11 +403,11 @@ inline __attribute__((always_inline)) uint64_t count_zero_bytemap_int256(uint8_t
 #endif
 /*******************************************************************************************/
 inline __attribute__((always_inline)) void AddINTRedLog(uint64_t ctxt_hndl, uint64_t accessLen, uint64_t redZero, uint64_t fred, uint64_t redByteMap, per_thread_t* pt) {
-    uint64_t key = MAKE_KEY(ctxt_hndl, 0/*elementSize, not used*/, accessLen);
-    INTRedLogMap_t::iterator it = pt->INTRedLogMap->find(key);
+    //uint64_t key = MAKE_KEY(ctxt_hndl, 0/*elementSize, not used*/, accessLen);
+    INTRedLogMap_t::iterator it = pt->INTRedLogMap->find(ctxt_hndl);
     if(it==pt->INTRedLogMap->end()) {
-        INTRedLog_t log_ptr = { accessLen, redZero, fred, redByteMap };
-        (*pt->INTRedLogMap)[key] = log_ptr;
+        INTRedLog_t log_ptr = { ENCODE_TO_UPPER(accessLen, accessLen), redZero, fred, redByteMap };
+        (*pt->INTRedLogMap)[ctxt_hndl] = log_ptr;
     } else {
         it->second.tot += accessLen;
         it->second.red += redZero;
@@ -437,6 +443,64 @@ static const unsigned char BitCountTable256[] __attribute__ ((aligned(64))) = {
     3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 
     4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 7, 8
 };
+
+/*******************************************************************************************/
+// single floating point zero byte counter
+// 32-bit float: |sign|exp|mantissa| = | 1 | 8 | 23 |
+// the redmap of single floating point takes up 5 bits (1 bit sign, 1 bit exp, 3 bit mantissa)
+#define SP_MAP_SIZE 5
+inline __attribute__((always_inline)) uint64_t count_zero_bytemap_fp(void * addr) {
+    register uint32_t xx = *((uint32_t*)addr);
+    // reduce by bits until byte level
+    // | 0 | x0x0 x0x0 | 0x0 x0x0 x0x0 x0x0 x0x0 x0x0 |
+    xx = xx | ((xx>>1)&0xffbfffff);
+    // | x | 00xx 00xx | 0xx 00xx 00xx 00xx 00xx 00xx |
+    xx = xx | ((xx>>2)&0xffdfffff);
+    // | x | 0000 xxxx | 000 xxxx 0000 xxxx 0000 xxxx |
+    xx = xx | ((xx>>4)&0xfff7ffff);
+    // now xx is byte level reduced, check if it is zero and mask the unused bits
+    xx = (~xx) & 0x80810101;
+    // narrowing
+    xx = xx | (xx>>7) | (xx>>14) | (xx>>20) | (xx>>27);
+    xx = xx & 0x1f;
+    return xx;
+}
+inline __attribute__((always_inline)) bool hasRedundancy_fp(void * addr) {
+    register uint32_t xx = *((uint32_t*)addr);
+    return (xx & 0x007f0000)==0;
+}
+/*******************************************************************************************/
+// double floating point zero byte counter
+// 64-bit float: |sign|exp|mantissa| = | 1 | 11 | 52 |
+// the redmap of single floating point takes up 10 bits (1 bit sign, 2 bit exp, 7 bit mantissa)
+#define DP_MAP_SIZE 10
+inline __attribute__((always_inline)) uint64_t count_zero_bytemap_dp(void * addr) {
+    register uint64_t xx = (static_cast<uint64_t*>(addr))[0];
+    // reduce by bits until byte level
+    // | 0 | 0x0 x0x0 x0x0 | x0x0 x0x0_x0x0 x0x0_x0x0 x0x0_x0x0 x0x0_x0x0 x0x0_x0x0 x0x0_x0x0 |
+    xx = xx | ((xx>>1)&(~0x4008000000000000LL));
+    // | x | 0xx 00xx 00xx | 00xx 00xx_00xx 00xx_00xx 00xx_00xx 00xx_00xx 00xx_00xx 00xx_00xx |
+    xx = xx | ((xx>>2)&(~0x200c000000000000LL));
+    // | x | xxx 0000 xxxx | xxxx 0000_xxxx 0000_xxxx 0000_xxxx 0000_xxxx 0000_xxxx 0000_xxxx |
+    xx = xx | ((xx>>4)&(~0x100f000000000000LL));
+    // now xx is byte level reduced, check if it is zero and mask the unused bits
+    xx = (~xx) & 0x9011010101010101LL;
+    // narrowing
+    register uint64_t m = xx & 0x1010101010101LL;
+    m = m | (m>>7);
+    m = m | (m>>14);
+    m = m | (m>>28);
+    m = m & 0x7f;
+    xx = xx | (xx>>9) | (xx>>7);
+    xx = (xx >> 45) & 0x380;
+    xx = m | xx;
+    return xx;
+}
+inline __attribute__((always_inline)) bool hasRedundancy_dp(void * addr) {
+    register uint64_t xx = *((uint64_t*)addr);
+    return (xx & 0x000f000000000000LL)==0;
+}
+/***************************************************************************************/
 
 template<int start, int end, int step>
 struct UnrolledFunctions {
@@ -490,6 +554,24 @@ struct UnrolledFunctions {
             return ((start==0) ? BitCountTable256[rmap&0xff] : BitCountTable256[(rmap>>start)&0xff]) + (UnrolledFunctions<start+step,end,step>::BodyRedNum(rmap));
         return 0;
     }
+    static __attribute__((always_inline)) uint64_t BodyRedMapFP(uint8_t* addr){
+        if(step==4)
+            return count_zero_bytemap_fp((void*)(addr+start)) | (UnrolledFunctions<start+step,end,step>::BodyRedMapFP(addr)<<SP_MAP_SIZE);
+        else if(step==8)
+            return count_zero_bytemap_dp((void*)(addr+start)) | (UnrolledFunctions<start+step,end,step>::BodyRedMapFP(addr)<<DP_MAP_SIZE);
+        else
+            assert(0 && "Not Supportted floating size! now only support for FP32 or FP64.");
+        return 0;
+    }
+    static __attribute__((always_inline)) uint64_t BodyHasRedundancy(uint8_t* addr){
+        if(step==4)
+            return hasRedundancy_fp((void*)(addr+start)) || (UnrolledFunctions<start+step,end,step>::BodyHasRedundancy(addr));
+        else if(step==8)
+            return hasRedundancy_dp((void*)(addr+start)) || (UnrolledFunctions<start+step,end,step>::BodyHasRedundancy(addr));
+        else
+            assert(0 && "Not Supportted floating size! now only support for FP32 or FP64.");
+        return 0;
+    }
 };
 
 template<int end, int step>
@@ -506,26 +588,45 @@ struct UnrolledFunctions<end, end, step> {
     static inline __attribute__((always_inline)) uint64_t BodyRedNum(uint64_t rmap) {
         return 0;
     }
+    static __attribute__((always_inline)) uint64_t BodyRedMapFP(uint8_t* addr){
+        return 0;
+    }
+    static __attribute__((always_inline)) uint64_t BodyHasRedundancy(uint8_t* addr){
+        return 0;
+    }
 };
 
 template<int esize, int size>
 inline __attribute__((always_inline)) void AddFPRedLog(uint64_t ctxt_hndl, void* pval, per_thread_t* pt) {
-    uint64_t key = MAKE_KEY(ctxt_hndl, esize, size);
-    FPRedLogMap_t::iterator it = pt->FPRedLogMap->find(key);
+    //uint64_t key = MAKE_KEY(ctxt_hndl, esize, size);
+    FPRedLogMap_t::iterator it = pt->FPRedLogMap->find(ctxt_hndl);
+    bool hasRedundancy = UnrolledFunctions<0, size, esize>::BodyHasRedundancy((uint8_t*)pval);
     if(it==pt->FPRedLogMap->end()) {
         FPRedLog_t log_ptr;
-        log_ptr.ftot = size/esize;
-        log_ptr.fred = UnrolledFunctions<0, size, esize>::getFullyRedundantZeroFP(pval);
-        UnrolledFunctions<0, size, esize>::memcpy(log_ptr.redByteMap, pval);
-        (*pt->FPRedLogMap)[key] = log_ptr;
+        log_ptr.ftot = ENCODE_TO_UPPER(size, size/esize);
+        if(hasRedundancy) {
+            uint64_t fred = UnrolledFunctions<0, size, esize>::getFullyRedundantZeroFP(pval);
+            log_ptr.fred = ENCODE_TO_UPPER(esize, fred);
+            log_ptr.redByteMap = UnrolledFunctions<0,size,esize>::BodyRedMapFP((uint8_t*)pval);
+        } else {
+            log_ptr.fred = ENCODE_TO_UPPER(esize, 0);
+            log_ptr.redByteMap = 0;
+        }
+        //UnrolledFunctions<0, size, esize>::memcpy(log_ptr.redByteMap, pval);
+        (*pt->FPRedLogMap)[ctxt_hndl] = log_ptr;
     } else {
         it->second.ftot += size/esize;
-        it->second.fred += UnrolledFunctions<0, size, esize>::getFullyRedundantZeroFP(pval);
-        if(esize==4) {
-            UnrolledFunctions<0, size, esize>::mergeRedByteMapFP(it->second.redByteMap, pval);
-        } else {
-            UnrolledFunctions<0, size, esize>::mergeRedByteMapFP(it->second.redByteMap, pval);
+        if(hasRedundancy) {
+            it->second.fred += UnrolledFunctions<0, size, esize>::getFullyRedundantZeroFP(pval);
+            if(it->second.redByteMap) {
+                it->second.redByteMap &= UnrolledFunctions<0,size,esize>::BodyRedMapFP((uint8_t*)pval);
+            }
         }
+        // if(esize==4) {
+        //     UnrolledFunctions<0, size, esize>::mergeRedByteMapFP(it->second.redByteMap, pval);
+        // } else {
+        //     UnrolledFunctions<0, size, esize>::mergeRedByteMapFP(it->second.redByteMap, pval);
+        // }
     }
 }
 
@@ -550,7 +651,6 @@ void CheckAndInsertIntPage(int slot, void* addr) {
             return ;
         }
     }
-    return ;
     uint64_t redByteMap;
     switch(accessLen) {
         case 1:
@@ -630,7 +730,11 @@ void CheckLargeAndInsertIntPage(int slot, void* addr, int accessLen) {
         redByteMap |= count_zero_bytemap_int8(&bytes[i])<<i;
         i += 1;
     }
+#ifdef USE_SSE
     uint64_t redZero = _mm_popcnt_u64(redByteMap);
+#else
+    uint64_t redZero = UnrolledFunctions<0, accessLen, elementSize>::BodyRedNum(redByteMap);
+#endif
     AddINTRedLog(ctxt_hndl, accessLen, redZero, redZero, redByteMap, pt);
 }
 
@@ -696,16 +800,7 @@ compute_log2(int value)
 template<bool enable_cache>
 void insertCheckAndUpdateInt(void* drcontext, instrlist_t* ilist, instr_t* where, int accessLen, int elemLen, int32_t slot, reg_id_t reg_addr, reg_id_t scratch) {
     // quick check
-    switch(accessLen) {
-        case 1:
-        case 2:
-        case 4:
-        case 8:
-            assert(accessLen==elemLen);
-            break;
-        default:
-            assert(elemLen==1);
-    }
+    //assert((accessLen<=8 && accessLen==elemLen) || elemLen==1);
     // start check and update
     switch(accessLen) {
         case 1:
@@ -735,22 +830,7 @@ void insertCheckAndUpdateInt(void* drcontext, instrlist_t* ilist, instr_t* where
 template<bool enable_cache>
 void insertCheckAndUpdateFp(void* drcontext, instrlist_t* ilist, instr_t* where, int accessLen, int elemLen, int32_t slot, reg_id_t reg_addr, reg_id_t scratch) {
     // quick check
-    switch(accessLen) {
-        case 4:
-        case 8:
-            assert(accessLen==elemLen);
-            break;
-        case 16:
-        case 32:
-            assert(elemLen==4 || elemLen==8);
-            break;
-        default:
-            assert(0 && "Unknown accessLen");
-    }
-    // start check and update
-    if(enable_cache) {
-        // TODO: inlined check and updates
-    }
+    //assert(elemLen==4 || elemLen==8);
     switch(accessLen) {
         case 4:
             dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertFpPage<4,4,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
@@ -772,70 +852,11 @@ void insertCheckAndUpdateFp(void* drcontext, instrlist_t* ilist, instr_t* where,
                 dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertFpPage<32,8,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
             }
             break;
-    }
-    if(enable_cache) {
-        // TODO: inlined check and updates
+        default:
+            assert(0 && "Unknown accessLen");
     }
 }
 
-
-/*******************************************************************************************/
-// single floating point zero byte counter
-// 32-bit float: |sign|exp|mantissa| = | 1 | 8 | 23 |
-// the redmap of single floating point takes up 5 bits (1 bit sign, 1 bit exp, 3 bit mantissa)
-#define SP_MAP_SIZE 5
-inline __attribute__((always_inline)) uint64_t count_zero_bytemap_fp(void * addr) {
-    register uint32_t xx = *((uint32_t*)addr);
-    // reduce by bits until byte level
-    // | 0 | x0x0 x0x0 | 0x0 x0x0 x0x0 x0x0 x0x0 x0x0 |
-    xx = xx | ((xx>>1)&0xffbfffff);
-    // | x | 00xx 00xx | 0xx 00xx 00xx 00xx 00xx 00xx |
-    xx = xx | ((xx>>2)&0xffdfffff);
-    // | x | 0000 xxxx | 000 xxxx 0000 xxxx 0000 xxxx |
-    xx = xx | ((xx>>4)&0xfff7ffff);
-    // now xx is byte level reduced, check if it is zero and mask the unused bits
-    xx = (~xx) & 0x80810101;
-    // narrowing
-    xx = xx | (xx>>7) | (xx>>14) | (xx>>20) | (xx>>27);
-    xx = xx & 0x1f;
-    return xx;
-}
-inline __attribute__((always_inline)) bool hasRedundancy_fp(void * addr) {
-    register uint32_t xx = *((uint32_t*)addr);
-    return (xx & 0x007f0000)==0;
-}
-/*******************************************************************************************/
-// double floating point zero byte counter
-// 64-bit float: |sign|exp|mantissa| = | 1 | 11 | 52 |
-// the redmap of single floating point takes up 10 bits (1 bit sign, 2 bit exp, 7 bit mantissa)
-#define DP_MAP_SIZE 10
-inline __attribute__((always_inline)) uint64_t count_zero_bytemap_dp(void * addr) {
-    register uint64_t xx = (static_cast<uint64_t*>(addr))[0];
-    // reduce by bits until byte level
-    // | 0 | 0x0 x0x0 x0x0 | x0x0 x0x0_x0x0 x0x0_x0x0 x0x0_x0x0 x0x0_x0x0 x0x0_x0x0 x0x0_x0x0 |
-    xx = xx | ((xx>>1)&(~0x4008000000000000LL));
-    // | x | 0xx 00xx 00xx | 00xx 00xx_00xx 00xx_00xx 00xx_00xx 00xx_00xx 00xx_00xx 00xx_00xx |
-    xx = xx | ((xx>>2)&(~0x200c000000000000LL));
-    // | x | xxx 0000 xxxx | xxxx 0000_xxxx 0000_xxxx 0000_xxxx 0000_xxxx 0000_xxxx 0000_xxxx |
-    xx = xx | ((xx>>4)&(~0x100f000000000000LL));
-    // now xx is byte level reduced, check if it is zero and mask the unused bits
-    xx = (~xx) & 0x9011010101010101LL;
-    // narrowing
-    register uint64_t m = xx & 0x1010101010101LL;
-    m = m | (m>>7);
-    m = m | (m>>14);
-    m = m | (m>>28);
-    m = m & 0x7f;
-    xx = xx | (xx>>9) | (xx>>7);
-    xx = (xx >> 45) & 0x380;
-    xx = m | xx;
-    return xx;
-}
-inline __attribute__((always_inline)) bool hasRedundancy_dp(void * addr) {
-    register uint64_t xx = *((uint64_t*)addr);
-    return (xx & 0x000f000000000000LL)==0;
-}
-/***************************************************************************************/
 // accessLen & eleSize are size in bits
 template<uint32_t AccessLen, uint32_t EleSize>
 struct RedMapString {
@@ -974,6 +995,7 @@ event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, b
     /* count the number of instructions in this block */
     IF_DEBUG(dr_fprintf(gFile, "^^ INFO: Disassembled Instruction ^^^\n"));
     for (instr = instrlist_first(bb); instr != NULL; instr = instr_get_next(instr)) {
+        if(!instr_is_app(instr)) continue;
         num_instructions++;
         if(    (!op_no_flush.get_value()) 
             &&   instr_reads_memory(instr) 
@@ -1238,7 +1260,6 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
         if(ignore) return ;
     }
 
-    // store cct in tls filed
 #ifdef X86
     if(instr_is_gather(instr)) {
         InstrumentVGather(drcontext, bb, instr, slot);
@@ -1274,8 +1295,8 @@ ClientThreadStart(void *drcontext)
     }
     pt->INTRedLogMap = new INTRedLogMap_t();
     pt->FPRedLogMap = new FPRedLogMap_t();
-    pt->FPRedLogMap->rehash(10000000);
-    pt->INTRedLogMap->rehash(10000000);
+    // pt->FPRedLogMap->rehash(10000000);
+    // pt->INTRedLogMap->rehash(10000000);
     pt->instr_clones = new vector<instr_t*>();
     pt->numInsBuff = dr_get_dr_segment_base(tls_seg);
     BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR) = 0;
@@ -1331,9 +1352,10 @@ static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad,
             rep = 100 * count / (pt->INTRedLogMap->size());
             dr_fprintf(STDOUT, "\r%ld%%  Finish",rep); fflush(stdout);
         }
-        RedundacyData tmp = { DECODE_CTXT(it->first), it->second.red,
-                              it->second.fred,        it->second.tot,
-                              it->second.redByteMap,  DECODE_ACCESSLEN(it->first) };
+        uint64_t tot = DECODE_SRC(it->second.tot);
+        uint8_t accessLen = DECODE_UPPER(it->second.tot);
+        RedundacyData tmp = { it->first, it->second.red,        it->second.fred,
+                              tot,       it->second.redByteMap, accessLen };
         tmpList.push_back(tmp);
         grandTotalRedundantBytes += tmp.frequency;
         ++num;
@@ -1405,60 +1427,6 @@ static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad,
     return grandTotalRedundantBytes;
 }
 
-template<int start, int end, int incr>
-struct UnrolledConjunctionApprox{
-    static __attribute__((always_inline)) uint64_t BodyRedMap(uint8_t* addr){
-        if(incr==4)
-            return count_zero_bytemap_fp((void*)(addr+start)) | (UnrolledConjunctionApprox<start+incr,end,incr>::BodyRedMap(addr)<<SP_MAP_SIZE);
-        else if(incr==8)
-            return count_zero_bytemap_dp((void*)(addr+start)) | (UnrolledConjunctionApprox<start+incr,end,incr>::BodyRedMap(addr)<<DP_MAP_SIZE);
-        else
-            assert(0 && "Not Supportted floating size! now only support for FP32 or FP64.");
-        return 0;
-    }
-};
-
-template<int end,  int incr>
-struct UnrolledConjunctionApprox<end , end , incr>{
-    static __attribute__((always_inline)) uint64_t BodyRedMap(uint8_t* addr){
-        return 0;
-    }
-};
-
-/****************************************************************************************/
-
-static inline __attribute__((always_inline)) uint64_t getFPRedByteMap(uint8_t* addr, int accessLen, int elementSize) {
-    assert(elementSize <= accessLen);
-    assert(elementSize==4 || elementSize==8);
-    uint64_t map;
-    switch(accessLen) {
-        case 4:
-            map = UnrolledConjunctionApprox<0,4,4>::BodyRedMap(addr); 
-            break;
-        case 8:
-            assert(elementSize==8);
-            map = UnrolledConjunctionApprox<0,8,8>::BodyRedMap(addr); 
-            break;
-        case 16:
-            if(elementSize==4) {
-                map = UnrolledConjunctionApprox<0,16,4>::BodyRedMap(addr); 
-            } else {
-                map = UnrolledConjunctionApprox<0,16,8>::BodyRedMap(addr); 
-            }
-            break;
-        case 32:
-            if(elementSize==4) {
-                map = UnrolledConjunctionApprox<0,32,4>::BodyRedMap(addr); 
-            } else {
-                map = UnrolledConjunctionApprox<0,32,8>::BodyRedMap(addr); 
-            }
-            break;
-        default:
-            assert(0 && "Unknown accessLen!\n");
-    }
-    return map;
-}
-
 static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad, int threadId) 
 {
     vector<ApproxRedundacyData> tmpList;
@@ -1476,12 +1444,12 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
             rep = 100 * count / (pt->FPRedLogMap->size());
             dr_fprintf(STDOUT, "\r%ld%%  Finish",rep); fflush(stdout);
         }
-        uint8_t accessLen = DECODE_ACCESSLEN(it->first);
-        uint8_t elementSize = DECODE_ELEMENTSIZE(it->first);
-        uint64_t redByteMap = getFPRedByteMap((uint8_t*)it->second.redByteMap, accessLen, elementSize);
-        ApproxRedundacyData tmp = { DECODE_CTXT(it->first),
-                                    it->second.fred,
-                                    it->second.ftot,
+        uint8_t accessLen = DECODE_UPPER(it->second.ftot);
+        uint8_t elementSize = DECODE_UPPER(it->second.fred);
+        uint64_t redByteMap = it->second.redByteMap;
+        ApproxRedundacyData tmp = { it->first,
+                                    DECODE_SRC(it->second.fred),
+                                    DECODE_SRC(it->second.ftot),
                                     redByteMap,
                                     accessLen,
                                     elementSize };
@@ -1553,10 +1521,10 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
 static uint64_t getThreadByteLoad(per_thread_t *pt) {
     register uint64_t x = 0;
     for (auto it=pt->INTRedLogMap->begin(); it!=pt->INTRedLogMap->end(); ++it) {
-        x += it->second.tot;
+        x += DECODE_SRC(it->second.tot);
     }
     for (auto it=pt->FPRedLogMap->begin(); it!=pt->FPRedLogMap->end(); ++it) {
-        x += it->second.ftot * DECODE_ACCESSLEN(it->first);
+        x += DECODE_SRC(it->second.ftot) * DECODE_UPPER(it->second.ftot);
     }
     return x;
 }
@@ -1710,7 +1678,7 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
                        "http://dynamorio.org/issues");
     ClientInit(argc, argv);
 
-    if (!drmgr_init()) {
+    if (!drmgr_init() || !drx_init()) {
         ZEROSPY_EXIT_PROCESS("ERROR: zerospy unable to initialize drmgr");
     }
     drreg_options_t ops = { sizeof(ops), 4 /*max slots needed*/, false };
