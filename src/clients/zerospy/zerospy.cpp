@@ -1,4 +1,4 @@
-#include <unordered_map>
+// #include <unordered_map>
 #include <vector>
 #include <string>
 #include <sys/stat.h>
@@ -108,12 +108,18 @@ static int tls_idx;
 
 #define MAKE_KEY(ctxt_hndl, elementSize, accessLen) \
     ((((uint64_t)(ctxt_hndl))<<32) | ((((uint64_t)(elementSize))<<8)|(uint64_t)(accessLen)))
-#define DECODE_CTXT(key) (context_handle_t)(((key) >> 32) & 0xffffffff)
-#define DECODE_ACCESSLEN(key) ((uint8_t)((key) & 0xff))
-#define DECODE_ELEMENTSIZE(key) ((uint8_t)(((key)>>8) & 0xff))
+// #define DECODE_CTXT(key) (context_handle_t)(((key) >> 32) & 0xffffffff)
+// #define DECODE_ACCESSLEN(key) ((uint8_t)((key) & 0xff))
+// #define DECODE_ELEMENTSIZE(key) ((uint8_t)(((key)>>8) & 0xff))
+
+// 64K cache
+#define MAX_CACHE_NUM 65536
+#define ENCODE_CONSTANT(upper, normal) (((uint64_t)(upper)<<56) | ((uint64_t)normal))
+#define DECODE_UPPER(val) (uint8_t)(((val)>>56)&0xff)
+#define DECODE_NORMAL(val) ((val) & 0xffffffffffffffLL)
 
 struct INTRedLog_t{
-    uint64_t tot;
+    uint64_t tot; // upper 8-bits are accessLen
     uint64_t red;
     uint64_t fred;
     uint64_t redByteMap;
@@ -122,13 +128,13 @@ struct INTRedLog_t{
 // AVX2
 #define MAX_VLEN 4
 struct FPRedLog_t{
-    uint64_t ftot;
-    uint64_t fred;
+    uint64_t ftot; // upper 8-bits are accessLen
+    uint64_t fred; // upper 8-bits are elementSize
     uint64_t redByteMap[MAX_VLEN];
 };
 
-typedef std::unordered_map<uint64_t, INTRedLog_t> INTRedLogMap_t;
-typedef std::unordered_map<uint64_t, FPRedLog_t> FPRedLogMap_t;
+// typedef std::unordered_map<uint64_t, INTRedLog_t> INTRedLogMap_t;
+// typedef std::unordered_map<uint64_t, FPRedLog_t> FPRedLogMap_t;
 
 #define MINSERT instrlist_meta_preinsert
 #define delta 0.01
@@ -152,8 +158,14 @@ static uint tls_offs;
 #define MAX_CLONE_INS 1048576
 
 typedef struct _per_thread_t {
-    FPRedLogMap_t* FPRedLogMap;
-    INTRedLogMap_t* INTRedLogMap;
+    FPRedLog_t** FPRedLogList;
+    INTRedLog_t** INTRedLogList;
+    vector<FPRedLog_t*>* fp_cache_list;
+    vector<INTRedLog_t*>* int_cache_list;
+    FPRedLog_t* fp_cache_ptr;
+    INTRedLog_t* int_cache_ptr;
+    int fp_cache_idx;
+    int int_cache_idx;
     file_t output_file;
     void* numInsBuff;
     vector<instr_t*> *instr_clones;
@@ -397,16 +409,31 @@ inline __attribute__((always_inline)) uint64_t count_zero_bytemap_int256(uint8_t
 #endif
 /*******************************************************************************************/
 inline __attribute__((always_inline)) void AddINTRedLog(uint64_t ctxt_hndl, uint64_t accessLen, uint64_t redZero, uint64_t fred, uint64_t redByteMap, per_thread_t* pt) {
-    uint64_t key = MAKE_KEY(ctxt_hndl, 0/*elementSize, not used*/, accessLen);
-    INTRedLogMap_t::iterator it = pt->INTRedLogMap->find(key);
-    if(it==pt->INTRedLogMap->end()) {
-        INTRedLog_t log_ptr = { accessLen, redZero, fred, redByteMap };
-        (*pt->INTRedLogMap)[key] = log_ptr;
+    // lookup the preallocated entry list to seek whether there is a valid log entry
+    INTRedLog_t* p = pt->INTRedLogList[ctxt_hndl];
+    if(p==NULL) {
+        // if no valid entry exists, take a log from the preallocated cache
+        p = &(pt->int_cache_ptr[pt->int_cache_idx]);
+        // set up initial values
+        p->tot = ENCODE_CONSTANT(accessLen, accessLen);
+        p->red = redZero;
+        p->fred = fred;
+        p->redByteMap = redByteMap;
+        // insert the initialized entry
+        pt->INTRedLogList[ctxt_hndl] = p;
+        ++(pt->int_cache_idx);
+        // if the cache is empty, allocate a new one
+        if(pt->int_cache_idx >= MAX_CACHE_NUM) {
+            pt->int_cache_idx = 0;
+            pt->int_cache_ptr = (INTRedLog_t*)dr_global_alloc(sizeof(INTRedLog_t)*MAX_CACHE_NUM);
+            pt->int_cache_list->push_back(pt->int_cache_ptr);
+        }
     } else {
-        it->second.tot += accessLen;
-        it->second.red += redZero;
-        it->second.fred += fred;
-        it->second.redByteMap &= redByteMap;
+        // if exists, accumulate the log
+        p->tot += accessLen;
+        p->red += redZero;
+        p->fred += fred;
+        p->redByteMap &= redByteMap;
     }
 }
 
@@ -510,21 +537,32 @@ struct UnrolledFunctions<end, end, step> {
 
 template<int esize, int size>
 inline __attribute__((always_inline)) void AddFPRedLog(uint64_t ctxt_hndl, void* pval, per_thread_t* pt) {
-    uint64_t key = MAKE_KEY(ctxt_hndl, esize, size);
-    FPRedLogMap_t::iterator it = pt->FPRedLogMap->find(key);
-    if(it==pt->FPRedLogMap->end()) {
-        FPRedLog_t log_ptr;
-        log_ptr.ftot = size/esize;
-        log_ptr.fred = UnrolledFunctions<0, size, esize>::getFullyRedundantZeroFP(pval);
-        UnrolledFunctions<0, size, esize>::memcpy(log_ptr.redByteMap, pval);
-        (*pt->FPRedLogMap)[key] = log_ptr;
+    FPRedLog_t* p = pt->FPRedLogList[ctxt_hndl];
+    if(p==NULL) {
+        // if no valid entry exists, take a log from the preallocated cache
+        p = &(pt->fp_cache_ptr[pt->fp_cache_idx]);
+        // set up initial values
+        p->ftot = ENCODE_CONSTANT(size, size/esize);
+        uint64_t fred = UnrolledFunctions<0, size, esize>::getFullyRedundantZeroFP(pval);
+        p->fred = ENCODE_CONSTANT(esize, fred);
+        UnrolledFunctions<0, size, esize>::memcpy(p->redByteMap, pval);
+        // insert the initialized entry
+        pt->FPRedLogList[ctxt_hndl] = p;
+        ++(pt->fp_cache_idx);
+        // if the cache is empty, allocate a new one
+        if(pt->fp_cache_idx >= MAX_CACHE_NUM) {
+            pt->fp_cache_idx = 0;
+            pt->fp_cache_ptr = (FPRedLog_t*)dr_global_alloc(sizeof(FPRedLog_t)*MAX_CACHE_NUM);
+            pt->fp_cache_list->push_back(pt->fp_cache_ptr);
+        }
     } else {
-        it->second.ftot += size/esize;
-        it->second.fred += UnrolledFunctions<0, size, esize>::getFullyRedundantZeroFP(pval);
+        // if exists, accumulate the log
+        p->ftot += size/esize;
+        p->fred += UnrolledFunctions<0, size, esize>::getFullyRedundantZeroFP(pval);
         if(esize==4) {
-            UnrolledFunctions<0, size, esize>::mergeRedByteMapFP(it->second.redByteMap, pval);
+            UnrolledFunctions<0, size, esize>::mergeRedByteMapFP(p->redByteMap, pval);
         } else {
-            UnrolledFunctions<0, size, esize>::mergeRedByteMapFP(it->second.redByteMap, pval);
+            UnrolledFunctions<0, size, esize>::mergeRedByteMapFP(p->redByteMap, pval);
         }
     }
 }
@@ -1272,10 +1310,24 @@ ClientThreadStart(void *drcontext)
     if (pt == NULL) {
         ZEROSPY_EXIT_PROCESS("pt == NULL");
     }
-    pt->INTRedLogMap = new INTRedLogMap_t();
-    pt->FPRedLogMap = new FPRedLogMap_t();
-    pt->FPRedLogMap->rehash(10000000);
-    pt->INTRedLogMap->rehash(10000000);
+    pt->INTRedLogList = (INTRedLog_t **)dr_raw_mem_alloc(
+        (size_t)(sizeof(INTRedLog_t *)) * ((size_t)CONTEXT_HANDLE_MAX),
+        DR_MEMPROT_READ | DR_MEMPROT_WRITE, NULL);
+    pt->FPRedLogList = (FPRedLog_t **)dr_raw_mem_alloc(
+        (size_t)sizeof(FPRedLog_t *) * (size_t)CONTEXT_HANDLE_MAX,
+        DR_MEMPROT_READ | DR_MEMPROT_WRITE, NULL);
+    assert(pt->INTRedLogList);
+    assert(pt->FPRedLogList);
+    memset(pt->INTRedLogList, 0, (size_t)sizeof(INTRedLog_t*)*(size_t)CONTEXT_HANDLE_MAX);
+    memset(pt->FPRedLogList, 0, (size_t)sizeof(FPRedLog_t*)*(size_t)CONTEXT_HANDLE_MAX);
+    pt->int_cache_ptr = (INTRedLog_t*)dr_global_alloc(sizeof(INTRedLog_t)*MAX_CACHE_NUM);
+    pt->fp_cache_ptr = (FPRedLog_t*)dr_global_alloc(sizeof(FPRedLog_t)*MAX_CACHE_NUM);
+    assert(pt->int_cache_ptr);
+    assert(pt->fp_cache_ptr);
+    pt->int_cache_idx = 0;
+    pt->fp_cache_idx = 0;
+    pt->int_cache_list = new vector<INTRedLog_t*>(1, pt->int_cache_ptr);
+    pt->fp_cache_list = new vector<FPRedLog_t*>(1, pt->fp_cache_ptr);
     pt->instr_clones = new vector<instr_t*>();
     pt->numInsBuff = dr_get_dr_segment_base(tls_seg);
     BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR) = 0;
@@ -1322,24 +1374,26 @@ static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad,
     file_t gTraceFile = pt->output_file;
     
     uint64_t grandTotalRedundantBytes = 0;
-    tmpList.reserve(pt->INTRedLogMap->size());
+    // tmpList.reserve(CONTEXT_HANDLE_MAX);
     dr_fprintf(STDOUT, "Dumping INTEGER Redundancy Info...\n");
     uint64_t count = 0, rep = -1, num = 0;
-    for(auto it=pt->INTRedLogMap->begin(); it!=pt->INTRedLogMap->end(); ++it) {
+    for(int i=0; i<CONTEXT_HANDLE_MAX; ++i) {
         ++count;
-        if(100 * count / (pt->INTRedLogMap->size())!=rep) {
-            rep = 100 * count / (pt->INTRedLogMap->size());
+        if(100 * count / (CONTEXT_HANDLE_MAX)!=rep) {
+            rep = 100 * count / (CONTEXT_HANDLE_MAX);
             dr_fprintf(STDOUT, "\r%ld%%  Finish",rep); fflush(stdout);
         }
-        RedundacyData tmp = { DECODE_CTXT(it->first), it->second.red,
-                              it->second.fred,        it->second.tot,
-                              it->second.redByteMap,  DECODE_ACCESSLEN(it->first) };
-        tmpList.push_back(tmp);
-        grandTotalRedundantBytes += tmp.frequency;
-        ++num;
+        if(pt->INTRedLogList[i]!=NULL) {
+            RedundacyData tmp = { i, pt->INTRedLogList[i]->red,
+                                pt->INTRedLogList[i]->fred,        DECODE_NORMAL(pt->INTRedLogList[i]->tot),
+                                pt->INTRedLogList[i]->redByteMap,  DECODE_UPPER(pt->INTRedLogList[i]->tot) };
+            tmpList.push_back(tmp);
+            grandTotalRedundantBytes += tmp.frequency;
+            ++num;
+        }
     }
-    dr_fprintf(STDOUT, "\r100%%  Finish, Total num = %ld\n", count); fflush(stdout);
-    if(count == 0) {
+    dr_fprintf(STDOUT, "\r100%%  Finish, Total num = %ld\n", num); fflush(stdout);
+    if(num == 0) {
         dr_fprintf(STDOUT, "Warning: No valid profiling data is logged!\n");
         return 0;
     }
@@ -1463,34 +1517,36 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
 {
     vector<ApproxRedundacyData> tmpList;
     vector<ApproxRedundacyData>::iterator tmpIt;
-    tmpList.reserve(pt->FPRedLogMap->size());
+    // tmpList.reserve(CONTEXT_HANDLE_MAX);
     
     file_t gTraceFile = pt->output_file;
     uint64_t grandTotalRedundantBytes = 0;
 
     dr_fprintf(STDOUT, "Dumping FLOATING POINT Redundancy Info...\n");
     uint64_t count = 0, rep = -1, num = 0;
-    for (auto it=pt->FPRedLogMap->begin(); it!=pt->FPRedLogMap->end(); ++it) {
+    for(int i=0; i<CONTEXT_HANDLE_MAX; ++i) {
         ++count;
-        if(100 * count / (pt->FPRedLogMap->size())!=rep) {
-            rep = 100 * count / (pt->FPRedLogMap->size());
+        if(100 * count / (CONTEXT_HANDLE_MAX)!=rep) {
+            rep = 100 * count / (CONTEXT_HANDLE_MAX);
             dr_fprintf(STDOUT, "\r%ld%%  Finish",rep); fflush(stdout);
         }
-        uint8_t accessLen = DECODE_ACCESSLEN(it->first);
-        uint8_t elementSize = DECODE_ELEMENTSIZE(it->first);
-        uint64_t redByteMap = getFPRedByteMap((uint8_t*)it->second.redByteMap, accessLen, elementSize);
-        ApproxRedundacyData tmp = { DECODE_CTXT(it->first),
-                                    it->second.fred,
-                                    it->second.ftot,
-                                    redByteMap,
-                                    accessLen,
-                                    elementSize };
-        tmpList.push_back(tmp);
-        grandTotalRedundantBytes += it->second.fred * accessLen;
-        ++num;
+        if(pt->FPRedLogList[i]!=NULL) {
+            uint8_t accessLen = DECODE_UPPER(pt->FPRedLogList[i]->ftot);
+            uint8_t elementSize = DECODE_UPPER(pt->FPRedLogList[i]->fred);
+            uint64_t redByteMap = getFPRedByteMap((uint8_t*)pt->FPRedLogList[i]->redByteMap, accessLen, elementSize);
+            ApproxRedundacyData tmp = { i,
+                                        DECODE_NORMAL(pt->FPRedLogList[i]->fred),
+                                        DECODE_NORMAL(pt->FPRedLogList[i]->ftot),
+                                        redByteMap,
+                                        accessLen,
+                                        elementSize };
+            tmpList.push_back(tmp);
+            grandTotalRedundantBytes += DECODE_NORMAL(pt->FPRedLogList[i]->fred) * accessLen;
+            ++num;
+        }
     }
-    dr_fprintf(STDOUT, "\r100%%  Finish, Total num = %ld\n", count); fflush(stdout);
-    if(count == 0) {
+    dr_fprintf(STDOUT, "\r100%%  Finish, Total num = %ld\n", num); fflush(stdout);
+    if(num == 0) {
         dr_fprintf(STDOUT, "Warning: No valid profiling data is logged!\n");
         return 0;
     }
@@ -1552,11 +1608,15 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
 /*******************************************************************/
 static uint64_t getThreadByteLoad(per_thread_t *pt) {
     register uint64_t x = 0;
-    for (auto it=pt->INTRedLogMap->begin(); it!=pt->INTRedLogMap->end(); ++it) {
-        x += it->second.tot;
+    for(int i=0; i<CONTEXT_HANDLE_MAX; ++i) {
+        if(pt->INTRedLogList[i]!=NULL) {
+            x += pt->INTRedLogList[i]->tot;
+        }
     }
-    for (auto it=pt->FPRedLogMap->begin(); it!=pt->FPRedLogMap->end(); ++it) {
-        x += it->second.ftot * DECODE_ACCESSLEN(it->first);
+    for(int i=0; i<CONTEXT_HANDLE_MAX; ++i) {
+        if(pt->FPRedLogList[i]!=NULL) {
+            x += DECODE_NORMAL(pt->FPRedLogList[i]->ftot) * DECODE_UPPER(pt->FPRedLogList[i]->ftot);
+        }
     }
     return x;
 }
@@ -1592,8 +1652,16 @@ ClientThreadEnd(void *drcontext)
         instr_destroy(drcontext, (*pt->instr_clones)[i]);
     }
     delete pt->instr_clones;
-    delete pt->INTRedLogMap;
-    delete pt->FPRedLogMap;
+    dr_global_free(pt->INTRedLogList, sizeof(INTRedLog_t*)*CONTEXT_HANDLE_MAX);
+    dr_global_free(pt->FPRedLogList , sizeof(FPRedLog_t *)*CONTEXT_HANDLE_MAX);
+    for(size_t i=0; i<pt->int_cache_list->size(); ++i) {
+        dr_global_free((*pt->int_cache_list)[i], sizeof(INTRedLog_t)*MAX_CACHE_NUM);
+    }
+    delete pt->int_cache_list;
+    for(size_t i=0; i<pt->fp_cache_list->size(); ++i) {
+        dr_global_free((*pt->fp_cache_list)[i], sizeof(FPRedLog_t)*MAX_CACHE_NUM);
+    }
+    delete pt->fp_cache_list;
 #ifdef DEBUG_REUSE
     dr_close_file(pt->log_file);
 #endif
