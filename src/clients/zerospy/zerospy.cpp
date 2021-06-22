@@ -506,10 +506,16 @@ void CheckAndInsertIntPage(int slot, void* addr) {
             redByteMap = count_zero_bytemap_int64((uint8_t*)addr);
             break;
         case 16:
-            redByteMap = count_zero_bytemap_int128((uint8_t*)addr);
+            // redByteMap = count_zero_bytemap_int128((uint8_t*)addr);
+            redByteMap = count_zero_bytemap_int64((uint8_t*)addr) |
+                        (count_zero_bytemap_int64((uint8_t*)addr+8)<<8);
             break;
         case 32:
-            redByteMap = count_zero_bytemap_int256((uint8_t*)addr);
+            // redByteMap = count_zero_bytemap_int256((uint8_t*)addr);
+            redByteMap = count_zero_bytemap_int64((uint8_t*)addr) |
+                        (count_zero_bytemap_int64((uint8_t*)addr+8)<<8) |
+                        (count_zero_bytemap_int64((uint8_t*)addr+16)<<16) |
+                        (count_zero_bytemap_int64((uint8_t*)addr+24)<<24);
             break;
         default:
             assert(0 && "UNKNOWN ACCESSLEN!\n");
@@ -569,10 +575,11 @@ void CheckAndInsertFpPage(int slot, void* addr) {
 
 #ifdef X86
 template<uint32_t AccessLen, uint32_t ElemLen, bool isApprox>
-void CheckNByteValueAfterVGather(int ctxt_hndl, instr_t* instr)
+void CheckNByteValueAfterVGather(int slot, instr_t* instr)
 {
     static_assert(ElemLen==4 || ElemLen==8);
     void *drcontext = dr_get_current_drcontext();
+    context_handle_t ctxt_hndl = drcctlib_get_context_handle(drcontext, slot);
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
     dr_mcontext_t mcontext;
     mcontext.size = sizeof(mcontext);
@@ -596,7 +603,7 @@ void CheckNByteValueAfterVGather(int ctxt_hndl, instr_t* instr)
     }
 }
 #define HANDLE_VGATHER(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) \
-dr_insert_clean_call(drcontext, bb, ins, (void *)CheckNByteValueAfterVGather<(ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX)>, false, 2, opnd_create_reg(reg_ctxt), OPND_CREATE_INTPTR(ins_clone))
+dr_insert_clean_call(drcontext, bb, ins, (void *)CheckNByteValueAfterVGather<(ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX)>, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone))
 #endif
 /***************************************************************************************/
 
@@ -972,7 +979,7 @@ struct ZerospyInstrument{
         }
     }
 #ifdef X86
-    static __attribute__((always_inline)) void InstrumentReadValueBeforeVGather(void *drcontext, instrlist_t *bb, instr_t *ins, reg_id_t reg_ctxt){
+    static __attribute__((always_inline)) void InstrumentReadValueBeforeVGather(void *drcontext, instrlist_t *bb, instr_t *ins, int32_t slot){
         opnd_t opnd = instr_get_src(ins, 0);
         uint32_t operSize = FloatOperandSizeTable(ins, opnd); // VGather's second operand is the memory operand
         uint32_t refSize = opnd_size_in_bytes(opnd_get_size(instr_get_dst(ins, 0)));
@@ -1082,26 +1089,28 @@ void InstrumentMemAll(void* drcontext, instrlist_t *bb, instr_t* instr, int32_t 
 #ifdef X86
 void InstrumentVGather(void* drcontext, instrlist_t *bb, instr_t* instr, int32_t slot)
 {
-    drvector_t vec;
-    getUnusedRegEntry(&vec, instr);
-    reg_id_t reg_ctxt;
-    // RESERVE_AFLAGS(drcontext, bb, instr);
-    RESERVE_REG(drcontext, bb, instr, &vec, reg_ctxt);
-    instr_t* skipcall = INSTR_CREATE_label(drcontext);
     if(op_enable_sampling.get_value()) {
         assert(0);
+        drvector_t vec;
+        reg_id_t reg_ctxt;
+        RESERVE_AFLAGS(drcontext, bb, instr);
+        instr_t* skipcall = INSTR_CREATE_label(drcontext);
+        getUnusedRegEntry(&vec, instr);
         RESERVE_REG(drcontext, bb, instr, &vec, reg_ctxt);
         dr_insert_read_raw_tls(drcontext, bb, instr, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ctxt);
         // Clear insCnt when insCnt > WINDOW_DISABLE
         MINSERT(bb, instr, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ctxt), OPND_CREATE_CCT_INT(window_enable)));
         MINSERT(bb, instr, XINST_CREATE_jump_cond(drcontext, DR_PRED_GT, opnd_create_instr(skipcall)));
+        // We use instr_compute_address_ex_pos to handle gather (with VSIB addressing)
+        ZerospyInstrument::InstrumentReadValueBeforeVGather(drcontext, bb, instr, slot);
+        MINSERT(bb, instr, skipcall);
+        UNRESERVE_REG(drcontext, bb, instr, reg_ctxt);
+        UNRESERVE_AFLAGS(drcontext, bb, instr);
+        drvector_delete(&vec);
+    } else {
+        // We use instr_compute_address_ex_pos to handle gather (with VSIB addressing)
+        ZerospyInstrument::InstrumentReadValueBeforeVGather(drcontext, bb, instr, slot);
     }
-    drcctlib_get_context_handle_in_reg(drcontext, bb, instr, slot, reg_ctxt, DR_REG_NULL/*scratch not used for x86*/);
-    // We use instr_compute_address_ex_pos to handle gather (with VSIB addressing)
-    ZerospyInstrument::InstrumentReadValueBeforeVGather(drcontext, bb, instr, reg_ctxt);
-    MINSERT(bb, instr, skipcall);
-    UNRESERVE_REG(drcontext, bb, instr, reg_ctxt);
-    drvector_delete(&vec);
 }
 #endif
 
