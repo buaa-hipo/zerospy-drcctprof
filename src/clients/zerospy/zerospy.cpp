@@ -36,10 +36,15 @@ uint64_t get_miliseconds() {
 #include "utils.h"
 #include "drx.h"
 
-#ifdef X86
-#include <nmmintrin.h>
-#include <immintrin.h>
-#include <emmintrin.h>
+// #define USE_SIMD
+// #define USE_SSE
+
+#if defined(USE_SIMD) || defined(USE_SSE)
+    #ifdef X86
+        #include <nmmintrin.h>
+        #include <immintrin.h>
+        #include <emmintrin.h>
+    #endif
 #endif
 
 // #define WINDOW_ENABLE 1000000
@@ -204,8 +209,6 @@ file_t gFlagF;
  * ***************************************************************/
 
 // #include "detect.h"
-#define USE_SIMD
-#define USE_SSE
 
 #ifdef USE_CLEANCALL
 #define IS_SAMPLED(pt, WINDOW_ENABLE) (pt->sampleFlag)
@@ -622,11 +625,6 @@ inline __attribute__((always_inline)) void AddFPRedLog(uint64_t ctxt_hndl, void*
                 it->second.redByteMap &= UnrolledFunctions<0,size,esize>::BodyRedMapFP((uint8_t*)pval);
             }
         }
-        // if(esize==4) {
-        //     UnrolledFunctions<0, size, esize>::mergeRedByteMapFP(it->second.redByteMap, pval);
-        // } else {
-        //     UnrolledFunctions<0, size, esize>::mergeRedByteMapFP(it->second.redByteMap, pval);
-        // }
     }
 }
 
@@ -643,44 +641,42 @@ void CheckAndInsertIntPage(int slot, void* addr) {
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
     context_handle_t ctxt_hndl = drcctlib_get_context_handle(drcontext, slot);
     // update info
-    if(accessLen<=8) {
-        uint8_t* bytes = reinterpret_cast<uint8_t*>(addr);
-        if(bytes[accessLen-1]!=0) {
-            // the log have already been clear to 0, so we do nothing here and quick return.
-            AddINTRedLog(ctxt_hndl, accessLen, 0, 0, 0, pt);
-            return ;
-        }
+    uint8_t* bytes = reinterpret_cast<uint8_t*>(addr);
+    if(bytes[accessLen-1]!=0) {
+        // the log have already been clear to 0, so we do nothing here and quick return.
+        AddINTRedLog(ctxt_hndl, accessLen, 0, 0, 0, pt);
+        return ;
     }
     uint64_t redByteMap;
     switch(accessLen) {
         case 1:
-            redByteMap = count_zero_bytemap_int8((uint8_t*)addr);
+            redByteMap = count_zero_bytemap_int8(bytes);
             break;
         case 2:
-            redByteMap = count_zero_bytemap_int16((uint8_t*)addr);
+            redByteMap = count_zero_bytemap_int16(bytes);
             break;
         case 4:
-            redByteMap = count_zero_bytemap_int32((uint8_t*)addr);
+            redByteMap = count_zero_bytemap_int32(bytes);
             break;
         case 8:
-            redByteMap = count_zero_bytemap_int64((uint8_t*)addr);
+            redByteMap = count_zero_bytemap_int64(bytes);
             break;
         case 16:
 #ifdef USE_SIMD
-            redByteMap = count_zero_bytemap_int128((uint8_t*)addr);
+            redByteMap = count_zero_bytemap_int128(bytes);
 #else
-            redByteMap = count_zero_bytemap_int64((uint8_t*)addr) |
-                        (count_zero_bytemap_int64((uint8_t*)addr+8)<<8);
+            redByteMap = count_zero_bytemap_int64(bytes) |
+                        (count_zero_bytemap_int64(bytes+8)<<8);
 #endif
             break;
         case 32:
 #ifdef USE_SIMD
-            redByteMap = count_zero_bytemap_int256((uint8_t*)addr);
+            redByteMap = count_zero_bytemap_int256(bytes);
 #else
-            redByteMap = count_zero_bytemap_int64((uint8_t*)addr) |
-                        (count_zero_bytemap_int64((uint8_t*)addr+8)<<8) |
-                        (count_zero_bytemap_int64((uint8_t*)addr+16)<<16) |
-                        (count_zero_bytemap_int64((uint8_t*)addr+24)<<24);
+            redByteMap = count_zero_bytemap_int64(bytes) |
+                        (count_zero_bytemap_int64(bytes+8)<<8) |
+                        (count_zero_bytemap_int64(bytes+16)<<16) |
+                        (count_zero_bytemap_int64(bytes+24)<<24);
 #endif
             break;
         default:
@@ -733,7 +729,43 @@ void CheckLargeAndInsertIntPage(int slot, void* addr, int accessLen) {
 #ifdef USE_SSE
     uint64_t redZero = _mm_popcnt_u64(redByteMap);
 #else
-    uint64_t redZero = UnrolledFunctions<0, accessLen, elementSize>::BodyRedNum(redByteMap);
+    // now redmap is calculated, count for redundancy
+    bool counting = true;
+    register uint64_t redZero = 0;
+    int restLen = accessLen;
+    while(counting && restLen>=8) {
+        restLen -= 8;
+        register uint8_t t = BitCountTable256[(redByteMap>>restLen)&0xff];
+        redZero += t;
+        if(t!=8) {
+            counting = false;
+            break;
+        }
+    }
+    while(counting && restLen>=4) {
+        restLen -= 4;
+        register uint8_t t = BitCountTable16[(redByteMap>>restLen)&0xf];
+        redZero += t;
+        if(t!=4) {
+            counting = false;
+            break;
+        }
+    }
+    while(counting && restLen>=2) {
+        restLen -= 2;
+        register uint8_t t = BitCountTable4[(redByteMap>>restLen)&0x3];
+        redZero += t;
+        if(t!=8) {
+            counting = false;
+            break;
+        }
+    }
+    // dont check here as this loop must execute only once
+    while(counting && restLen>=1) {
+        restLen -= 1;
+        register uint8_t t = (redByteMap>>restLen)&0x1;
+        redZero += t;
+    }
 #endif
     AddINTRedLog(ctxt_hndl, accessLen, redZero, redZero, redByteMap, pt);
 }
@@ -1162,11 +1194,26 @@ void InstrumentMemAll(void* drcontext, instrlist_t *bb, instr_t* instr, int32_t 
     RESERVE_REG(drcontext, bb, instr, &vec, reg_addr);
     instr_t* skipcall = INSTR_CREATE_label(drcontext);
     if(op_enable_sampling.get_value()) {
-        assert(0);
+        RESERVE_AFLAGS(drcontext, bb, instr);
         dr_insert_read_raw_tls(drcontext, bb, instr, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_addr);
         // Clear insCnt when insCnt > WINDOW_DISABLE
         MINSERT(bb, instr, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_addr), OPND_CREATE_CCT_INT(window_enable)));
         MINSERT(bb, instr, XINST_CREATE_jump_cond(drcontext, DR_PRED_GT, opnd_create_instr(skipcall)));
+#ifdef X86
+        // if the XAX is used by memory operand, we need to early restore the app aflags and values
+        bool xax_needed = false;
+        for(int i=0, num_srcs=instr_num_srcs(instr); i<num_srcs; ++i) {
+            opnd_t opnd = instr_get_src(instr, i);
+            if(opnd_is_memory_reference(opnd)) {
+                xax_needed = xax_needed && opnd_uses_reg(opnd, DR_REG_XAX);
+            }
+        }
+        if (xax_needed &&
+            drreg_restore_app_aflags(drcontext, bb, instr) != DRREG_SUCCESS &&
+            drreg_get_app_value(drcontext, bb, instr, DR_REG_XAX, DR_REG_XAX) != DRREG_SUCCESS) {
+            ZEROSPY_EXIT_PROCESS("InstrumentMemAll drreg_get_app_value REG_XAX failed!");
+        }
+#endif
     }
     RESERVE_REG(drcontext, bb, instr, &vec, scratch);
     int num_srcs = instr_num_srcs(instr);
@@ -1178,6 +1225,9 @@ void InstrumentMemAll(void* drcontext, instrlist_t *bb, instr_t* instr, int32_t 
     }
     UNRESERVE_REG(drcontext, bb, instr, scratch);
     MINSERT(bb, instr, skipcall);
+    if(op_enable_sampling.get_value()) {
+        UNRESERVE_AFLAGS(drcontext, bb, instr);
+    }
     UNRESERVE_REG(drcontext, bb, instr, reg_addr);
     drvector_delete(&vec);
 }
@@ -1186,7 +1236,6 @@ void InstrumentMemAll(void* drcontext, instrlist_t *bb, instr_t* instr, int32_t 
 void InstrumentVGather(void* drcontext, instrlist_t *bb, instr_t* instr, int32_t slot)
 {
     if(op_enable_sampling.get_value()) {
-        assert(0);
         drvector_t vec;
         reg_id_t reg_ctxt;
         RESERVE_AFLAGS(drcontext, bb, instr);
@@ -1454,7 +1503,7 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
                                     accessLen,
                                     elementSize };
         tmpList.push_back(tmp);
-        grandTotalRedundantBytes += it->second.fred * accessLen;
+        grandTotalRedundantBytes += DECODE_SRC(it->second.fred) * accessLen;
         ++num;
     }
     dr_fprintf(STDOUT, "\r100%%  Finish, Total num = %ld\n", count); fflush(stdout);
@@ -1497,7 +1546,7 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
                 (*listIt).all0freq * 100.0 / grandTotalRedundantBytes,
                 (*listIt).all0freq * 100.0 / (*listIt).ftot,
                 (*listIt).all0freq,(*listIt).ftot); 
-            dr_fprintf(gTraceFile, "\n======= Redundant byte map : [mantiss | exponent | sign] ========\n");
+            dr_fprintf(gTraceFile, "\n======= Redundant byte map : [ sign | exponent | mantissa ] ========\n");
             if((*listIt).size==4) {
                 dr_fprintf(gTraceFile, "%s", getFpRedMapString_SP((*listIt).byteMap, (*listIt).accessLen/4).c_str());
             } else {
@@ -1693,7 +1742,7 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
                                          DRCCTLIB_THREAD_EVENT_PRI + 1 };
     drmgr_priority_t thread_exit_pri = { sizeof(thread_exit_pri),
                                          "zerispy-thread-exit", NULL, NULL,
-                                         DRCCTLIB_THREAD_EVENT_PRI + 1 };
+                                         DRCCTLIB_THREAD_EVENT_PRI - 1 };
     if (( op_enable_sampling.get_value() && 
            !drmgr_register_bb_instrumentation_event(event_basic_block, NULL, NULL) )
         || !drmgr_register_thread_init_event_ex(ClientThreadStart, &thread_init_pri) 
