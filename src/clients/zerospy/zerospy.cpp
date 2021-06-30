@@ -34,7 +34,7 @@ uint64_t get_miliseconds() {
 #include "dr_tools.h"
 #include <sys/time.h>
 #include "utils.h"
-#include "drx.h"
+#include "trace.h"
 
 // #ifdef X86
 //     #define USE_SIMD
@@ -126,18 +126,18 @@ struct cache_t {
 /* The maximum size of buffer for holding mem_refs. */
 #define MEM_BUF_SIZE(size) (sizeof(cache_t<size>) * MAX_NUM_MEM_REFS)
 
-static drx_buf_t *trace_buffer_i1;
-static drx_buf_t *trace_buffer_i2;
-static drx_buf_t *trace_buffer_i4;
-static drx_buf_t *trace_buffer_i8;
-static drx_buf_t *trace_buffer_i16;
-static drx_buf_t *trace_buffer_i32;
-static drx_buf_t *trace_buffer_sp1;
-static drx_buf_t *trace_buffer_dp1;
-static drx_buf_t *trace_buffer_sp4;
-static drx_buf_t *trace_buffer_dp2;
-static drx_buf_t *trace_buffer_sp8;
-static drx_buf_t *trace_buffer_dp4;
+static trace_buf_t *trace_buffer_i1;
+static trace_buf_t *trace_buffer_i2;
+static trace_buf_t *trace_buffer_i4;
+static trace_buf_t *trace_buffer_i8;
+static trace_buf_t *trace_buffer_i16;
+static trace_buf_t *trace_buffer_i32;
+static trace_buf_t *trace_buffer_sp1;
+static trace_buf_t *trace_buffer_dp1;
+static trace_buf_t *trace_buffer_sp4;
+static trace_buf_t *trace_buffer_dp2;
+static trace_buf_t *trace_buffer_sp8;
+static trace_buf_t *trace_buffer_dp4;
 
 struct INTRedLog_t{
     uint64_t tot;
@@ -1051,7 +1051,7 @@ void trace_update_int() {
     void* drcontext = dr_get_current_drcontext();
     // here we don't need to pass in the trace buffer pointer as we can statically know
     // which buffer will be updated at compile time.
-    drx_buf_t* trace_buffer;
+    trace_buf_t* trace_buffer;
     switch (sz) {
         case 1:
             trace_buffer = trace_buffer_i1; break;
@@ -1066,8 +1066,8 @@ void trace_update_int() {
         case 32:
             trace_buffer = trace_buffer_i32; break;
     }
-    void* buf_base = drx_buf_get_buffer_base(drcontext, trace_buffer);
-    void* buf_ptr = drx_buf_get_buffer_ptr(drcontext, trace_buffer);
+    void* buf_base = trace_buf_get_buffer_base(drcontext, trace_buffer);
+    void* buf_ptr = trace_buf_get_buffer_ptr(drcontext, trace_buffer);
     per_thread_t* pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
     cache_t<sz> *trace_base = (cache_t<sz> *)(char *)buf_base;
     cache_t<sz> *trace_ptr = (cache_t<sz> *)((char *)buf_ptr);
@@ -1076,14 +1076,14 @@ void trace_update_int() {
         STDOUT,
         "UPDATE INT: trace_ptr=%p, base=%p, end=%p, size=%ld, buf_size=%ld, buf_end=%p\n",
         trace_ptr, trace_base,
-        (char *)trace_base + drx_buf_get_buffer_size(drcontext, trace_buffer),
-        trace_ptr - trace_base, drx_buf_get_buffer_size(drcontext, trace_buffer),
-        drx_buf_get_buffer_end(drcontext, trace_buffer)));
+        (char *)trace_base + trace_buf_get_buffer_size(drcontext, trace_buffer),
+        trace_ptr - trace_base, trace_buf_get_buffer_size(drcontext, trace_buffer),
+        trace_buf_get_buffer_end(drcontext, trace_buffer)));
     for(cache_ptr=trace_base; cache_ptr<trace_ptr; ++cache_ptr) {
         CheckAndInsertIntPage_impl<sz, esize>(cache_ptr->ctxt_hndl, (void*)cache_ptr->val, pt);
     }
     // all buffered trace is updated, reset the buffer
-    drx_buf_set_buffer_ptr(drcontext, trace_buffer, buf_base);
+    trace_buf_set_buffer_ptr(drcontext, trace_buffer, buf_base);
 }
 
 template<int sz, int esize>
@@ -1091,7 +1091,7 @@ void trace_update_fp() {
     void* drcontext = dr_get_current_drcontext();
     // here we don't need to pass in the trace buffer pointer as we can statically know
     // which buffer will be updated at compile time.
-    drx_buf_t* trace_buffer;
+    trace_buf_t* trace_buffer;
     switch (sz) {
         case 4:
             trace_buffer = trace_buffer_sp1; break;
@@ -1110,8 +1110,8 @@ void trace_update_fp() {
                 trace_buffer = trace_buffer_dp4; break;
             }
     }
-    void* buf_base = drx_buf_get_buffer_base(drcontext, trace_buffer);
-    void* buf_ptr = drx_buf_get_buffer_ptr(drcontext, trace_buffer);
+    void* buf_base = trace_buf_get_buffer_base(drcontext, trace_buffer);
+    void* buf_ptr = trace_buf_get_buffer_ptr(drcontext, trace_buffer);
     per_thread_t* pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
     cache_t<sz> *trace_base = (cache_t<sz> *)(char *)buf_base;
     cache_t<sz> *trace_ptr = (cache_t<sz> *)((char *)buf_ptr);
@@ -1119,24 +1119,24 @@ void trace_update_fp() {
     IF_DEBUG(dr_fprintf(STDOUT,
                         "UPDATE FP: trace_ptr=%p, base=%p, size=%ld, buf_size=%ld\n",
                         trace_ptr, trace_base, trace_ptr - trace_base,
-                        drx_buf_get_buffer_size(drcontext, trace_buffer)));
+                        trace_buf_get_buffer_size(drcontext, trace_buffer)));
     for(cache_ptr=trace_base; cache_ptr<trace_ptr; ++cache_ptr) {
         AddFPRedLog<esize, sz>(cache_ptr->ctxt_hndl, (void*)cache_ptr->val, pt);
     }
     // all buffered trace is updated, reset the buffer
-    drx_buf_set_buffer_ptr(drcontext, trace_buffer, buf_base);
+    trace_buf_set_buffer_ptr(drcontext, trace_buffer, buf_base);
 }
 
 template<int size, int esize, bool is_float>
-void insertBufferCheck_impl(void* drcontext, instrlist_t *bb, instr_t* ins, ushort memRefCnt, drx_buf_t* trace_buffer, reg_id_t reg_ptr, reg_id_t reg_end) {
+void insertBufferCheck_impl(void* drcontext, instrlist_t *bb, instr_t* ins, ushort memRefCnt, trace_buf_t* trace_buffer, reg_id_t reg_ptr, reg_id_t reg_end) {
     // quick return without any instrumentation
     if(memRefCnt<=0) return ;
     instr_t* skip_update = INSTR_CREATE_label(drcontext);
     // when there may be overflow, we check and update the trace buffer if possible
     // the end buffer pointer
-    drx_buf_insert_load_buf_end(drcontext, trace_buffer, bb, ins, reg_end);
+    trace_buf_insert_load_buf_end(drcontext, trace_buffer, bb, ins, reg_end);
     // current buffer pointer
-    drx_buf_insert_load_buf_ptr(drcontext, trace_buffer, bb, ins, reg_ptr);
+    trace_buf_insert_load_buf_ptr(drcontext, trace_buffer, bb, ins, reg_ptr);
     // increament the buffer pointer with memRefCnt
     MINSERT(bb, ins,
             XINST_CREATE_add(drcontext, opnd_create_reg(reg_ptr),
@@ -1154,11 +1154,11 @@ void insertBufferCheck_impl(void* drcontext, instrlist_t *bb, instr_t* ins, usho
     MINSERT(bb, ins, skip_update);
 }
 
-void insertBufferClear_impl(void* drcontext, instrlist_t *bb, instr_t* ins, ushort memRefCnt, drx_buf_t* trace_buffer, reg_id_t reg_ptr) {
+void insertBufferClear_impl(void* drcontext, instrlist_t *bb, instr_t* ins, ushort memRefCnt, trace_buf_t* trace_buffer, reg_id_t reg_ptr) {
     // quick return without any instrumentation
     if(memRefCnt<=0) return ;
     // current buffer pointer
-    drx_buf_insert_clear_buf(drcontext, trace_buffer, bb, ins, reg_ptr);
+    trace_buf_insert_clear_buf(drcontext, trace_buffer, bb, ins, reg_ptr);
 }
 
 void insertBufferCheck(void* drcontext, instrlist_t *bb, instr_t* ins, ushort memRefCnt[12]) {
@@ -1318,43 +1318,7 @@ event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, b
                 dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *)BBInstrument::BBUpdate, false, 1, OPND_CREATE_CCT_INT(num_instructions));
             }
         }
-#ifdef TRY_ANALYSIS
-        // For better performance, we try to find a insert point, where it most satisfies the following attributes:
-        //      1. the aflags are dead;
-        //      2. there are no less than two free registers that we can use without any spilling.
-        //      3. all previous instructions do not access memory that can update the buffered trace
-        // If we find a point that satisfies the attributes, we can insert our instrumentation codes with less overhead;
-        // otherwise, we just insert before the first instruction of the basic block.
-        instr_t* instr;
-        instr_t* insert_pt = NULL;
-        for (instr = instrlist_first(bb); instr != NULL; instr = instr_get_next(instr)) {
-            if(!instr_is_app(instr)) continue;
-            if(drx_aflags_are_dead(instr)) {
-                insert_pt = instr;
-            }
-            int free_regs=0;
-            for(reg_id_t reg=DR_REG_START_GPR; reg <= DR_REG_STOP_GPR; ++reg) {
-                bool dead;
-                if(drreg_is_register_dead(drcontext, reg, instr, &dead)) {
-                    ++free_regs;
-                }
-            }
-            if(free_regs>=2) {
-                if(insert_pt==instr) break;
-                if(insert_pt==NULL) insert_pt=instr;
-            } else if(free_regs==1) {
-                // as we assume that the aflags is more heavy for spill and restore, 
-                // we only take this case when there are no other insert point is found.
-                if(insert_pt==NULL) insert_pt=instr;
-            }
-            if(instr_reads_memory(instr)) break;
-        }
-        if(insert_pt==NULL) {
-            insert_pt = instrlist_first(bb);
-        }
-#else
         instr_t* insert_pt = instrlist_first(bb);
-#endif
         insertBufferCheck(drcontext, bb, insert_pt, memRefCnt_detail);
     }
     return DR_EMIT_DEFAULT;
@@ -1392,14 +1356,14 @@ insert_load(void *drcontext, instrlist_t *ilist, instr_t *where, reg_id_t dst,
 }
 
 template<int size>
-inline __attribute__((always_inline)) void insertStoreTraceBuffer(void *drcontext, instrlist_t *ilist, instr_t *where, int32_t slot, reg_id_t reg_addr, reg_id_t reg_ptr, drx_buf_t* trace_buffer)
+inline __attribute__((always_inline)) void insertStoreTraceBuffer(void *drcontext, instrlist_t *ilist, instr_t *where, int32_t slot, reg_id_t reg_addr, reg_id_t reg_ptr, trace_buf_t* trace_buffer)
 {
-    drx_buf_insert_load_buf_ptr(drcontext, trace_buffer, ilist, where, reg_ptr);
+    trace_buf_insert_load_buf_ptr(drcontext, trace_buffer, ilist, where, reg_ptr);
     switch(size) {
         case 1: {
             reg_id_t reg_val = reg_resize_to_opsz(reg_addr,OPSZ_1);
             insert_load(drcontext, ilist, where, reg_val, reg_addr, 0, OPSZ_1);
-            drx_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+            trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
                              opnd_create_reg(reg_val), OPSZ_1,
                              offsetof(cache_t<size>, val));
             break;
@@ -1407,7 +1371,7 @@ inline __attribute__((always_inline)) void insertStoreTraceBuffer(void *drcontex
         case 2: {
             reg_id_t reg_val = reg_resize_to_opsz(reg_addr,OPSZ_2);
             insert_load(drcontext, ilist, where, reg_val, reg_addr, 0, OPSZ_2);
-            drx_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+            trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
                              opnd_create_reg(reg_val), OPSZ_2,
                              offsetof(cache_t<size>, val));
             break;
@@ -1415,14 +1379,14 @@ inline __attribute__((always_inline)) void insertStoreTraceBuffer(void *drcontex
         case 4: {
             reg_id_t reg_val = reg_resize_to_opsz(reg_addr,OPSZ_4);
             insert_load(drcontext, ilist, where, reg_val, reg_addr, 0, OPSZ_4);
-            drx_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+            trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
                              opnd_create_reg(reg_val), OPSZ_4,
                              offsetof(cache_t<size>, val));
             break;
         }
         case 8: {
             insert_load(drcontext, ilist, where, reg_addr, reg_addr, 0, OPSZ_8);
-            drx_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+            trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
                              opnd_create_reg(reg_addr), OPSZ_8,
                              offsetof(cache_t<size>, val));
             break;
@@ -1432,12 +1396,12 @@ inline __attribute__((always_inline)) void insertStoreTraceBuffer(void *drcontex
             RESERVE_REG(drcontext, ilist, where, NULL, scratch);
             // 0-7B
             insert_load(drcontext, ilist, where, scratch, reg_addr, 0, OPSZ_8);
-            drx_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+            trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
                              opnd_create_reg(scratch), OPSZ_8,
                              offsetof(cache_t<size>, val));
             // 8-15B
             insert_load(drcontext, ilist, where, scratch, reg_addr, 8, OPSZ_8);
-            drx_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+            trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
                              opnd_create_reg(scratch), OPSZ_8,
                              offsetof(cache_t<size>, val)+8);
             UNRESERVE_REG(drcontext, ilist, where, scratch);
@@ -1448,22 +1412,22 @@ inline __attribute__((always_inline)) void insertStoreTraceBuffer(void *drcontex
             RESERVE_REG(drcontext, ilist, where, NULL, scratch);
             // 0-7B
             insert_load(drcontext, ilist, where, scratch, reg_addr, 0, OPSZ_8);
-            drx_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+            trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
                              opnd_create_reg(scratch), OPSZ_8,
                              offsetof(cache_t<size>, val));
             // 8-15B
             insert_load(drcontext, ilist, where, scratch, reg_addr, 8, OPSZ_8);
-            drx_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+            trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
                              opnd_create_reg(scratch), OPSZ_8,
                              offsetof(cache_t<size>, val)+8);
             // 16-23B
             insert_load(drcontext, ilist, where, scratch, reg_addr, 16, OPSZ_8);
-            drx_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+            trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
                              opnd_create_reg(scratch), OPSZ_8,
                              offsetof(cache_t<size>, val)+16);
             // 24-31B
             insert_load(drcontext, ilist, where, scratch, reg_addr, 24, OPSZ_8);
-            drx_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+            trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
                              opnd_create_reg(scratch), OPSZ_8,
                              offsetof(cache_t<size>, val)+24);
             UNRESERVE_REG(drcontext, ilist, where, scratch);
@@ -1471,13 +1435,11 @@ inline __attribute__((always_inline)) void insertStoreTraceBuffer(void *drcontex
         }
     }
     drcctlib_get_context_handle_in_reg(drcontext, ilist, where, slot, reg_addr, reg_ptr);
-//#ifdef ARM_CCTLIB
-    drx_buf_insert_load_buf_ptr(drcontext, trace_buffer, ilist, where, reg_ptr);
-//#endif
-    drx_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+    trace_buf_insert_load_buf_ptr(drcontext, trace_buffer, ilist, where, reg_ptr);
+    trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
                              opnd_create_reg(reg_64_to_32(reg_addr)), OPSZ_4, offsetof(cache_t<size>, ctxt_hndl));
-    // update drx buffer
-    drx_buf_insert_update_buf_ptr(drcontext, trace_buffer, ilist, where, reg_ptr,
+    // update trace buffer
+    trace_buf_insert_update_buf_ptr(drcontext, trace_buffer, ilist, where, reg_ptr,
                                   DR_REG_NULL, sizeof(cache_t<size>));
 }
 
@@ -1801,10 +1763,10 @@ ThreadOutputFileInit(per_thread_t *pt)
 
 #define DEBUG_PRINT_TB_INFO(tb) \
     IF_DEBUG(dr_fprintf(STDOUT, #tb ": buf_ptr=%p, buf_base=%p, buf_end=%p, buf_size=%ld\n", \
-        drx_buf_get_buffer_ptr(drcontext, tb), \
-        drx_buf_get_buffer_base(drcontext, tb), \
-        drx_buf_get_buffer_end(drcontext, tb), \
-        drx_buf_get_buffer_size(drcontext, tb)))
+        trace_buf_get_buffer_ptr(drcontext, tb), \
+        trace_buf_get_buffer_base(drcontext, tb), \
+        trace_buf_get_buffer_end(drcontext, tb), \
+        trace_buf_get_buffer_size(drcontext, tb)))
 
 static void
 ClientThreadStart(void *drcontext)
@@ -1824,7 +1786,7 @@ ClientThreadStart(void *drcontext)
     drmgr_set_tls_field(drcontext, tls_idx, (void *)pt);
     // init output files
     ThreadOutputFileInit(pt);
-    // check drx
+    // check trace
     DEBUG_PRINT_TB_INFO(trace_buffer_i1);
     DEBUG_PRINT_TB_INFO(trace_buffer_i2);
     DEBUG_PRINT_TB_INFO(trace_buffer_i4);
@@ -2065,7 +2027,7 @@ static uint64_t getThreadByteLoad(per_thread_t *pt) {
 }
 /*******************************************************************/
 static void
-ClientThreadEndForDrx(void *drcontext) {
+ClientThreadEndFortrace(void *drcontext) {
     handleBufferUpdate();
 }
 
@@ -2188,18 +2150,18 @@ ClientExit(void)
             "ERROR: zerospy dr_raw_tls_calloc fail");
     }
     // free trace buffers
-    drx_buf_free(trace_buffer_i1);
-    drx_buf_free(trace_buffer_i2);
-    drx_buf_free(trace_buffer_i4);
-    drx_buf_free(trace_buffer_i8);
-    drx_buf_free(trace_buffer_i16);
-    drx_buf_free(trace_buffer_i32);
-    drx_buf_free(trace_buffer_sp1);
-    drx_buf_free(trace_buffer_dp1);
-    drx_buf_free(trace_buffer_sp4);
-    drx_buf_free(trace_buffer_dp2);
-    drx_buf_free(trace_buffer_sp8);
-    drx_buf_free(trace_buffer_dp4);
+    trace_buf_free(trace_buffer_i1);
+    trace_buf_free(trace_buffer_i2);
+    trace_buf_free(trace_buffer_i4);
+    trace_buf_free(trace_buffer_i8);
+    trace_buf_free(trace_buffer_i16);
+    trace_buf_free(trace_buffer_i32);
+    trace_buf_free(trace_buffer_sp1);
+    trace_buf_free(trace_buffer_dp1);
+    trace_buf_free(trace_buffer_sp4);
+    trace_buf_free(trace_buffer_dp2);
+    trace_buf_free(trace_buffer_sp8);
+    trace_buf_free(trace_buffer_dp4);
 
     dr_mutex_destroy(gLock);
     drcctlib_exit();
@@ -2208,7 +2170,7 @@ ClientExit(void)
         : event_basic_block<false>;
     if (!drmgr_unregister_thread_init_event(ClientThreadStart) ||
         !drmgr_unregister_thread_exit_event(ClientThreadEnd) ||
-        !drmgr_unregister_thread_exit_event(ClientThreadEndForDrx) ||
+        !drmgr_unregister_thread_exit_event(ClientThreadEndFortrace) ||
         // must unregister event after client exit, or it will cause unexpected errors during execution
         !drmgr_unregister_bb_instrumentation_event(event_basic_block_ptr) ||
         !drmgr_unregister_tls_field(tls_idx)) {
@@ -2218,15 +2180,8 @@ ClientExit(void)
     }
     drutil_exit();
     drreg_exit();
-    drx_exit();
+    trace_exit();
     drmgr_exit();
-}
-
-// fake fault
-void trace_fault(void *drcontext, void *buf_base, size_t size) {
-    // make sure the buffer is empty as we already handle the buffer before.
-    // assert(size==0);
-    // return ;
 }
 
 #ifdef __cplusplus
@@ -2240,7 +2195,7 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
                        "http://dynamorio.org/issues");
     ClientInit(argc, argv);
 
-    if (!drmgr_init() || !drx_init()) {
+    if (!drmgr_init() || !trace_init()) {
         ZEROSPY_EXIT_PROCESS("ERROR: zerospy unable to initialize drmgr");
     }
     drreg_options_t ops = { sizeof(ops), 4 /*max slots needed*/, false };
@@ -2257,15 +2212,15 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
                                          "zerospy-thread-exit", NULL, NULL,
                                          DRCCTLIB_THREAD_EVENT_PRI - 1 };
     drmgr_priority_t thread_exit_high_pri = { sizeof(thread_exit_pri),
-                                         "zerospy-thread-exit-drx", NULL, NULL,
-                                         DRMGR_PRIORITY_THREAD_EXIT_DRX_BUF - 1 };
+                                         "zerospy-thread-exit-trace", NULL, NULL,
+                                         DRMGR_PRIORITY_THREAD_EXIT_TRACE_BUF - 1 };
     drmgr_analysis_cb_t event_basic_block_ptr = op_enable_sampling.get_value()
         ? event_basic_block<true>
         : event_basic_block<false>;
     if (   !drmgr_register_bb_instrumentation_event(event_basic_block_ptr, NULL, NULL)
         || !drmgr_register_thread_init_event_ex(ClientThreadStart, &thread_init_pri) 
         || !drmgr_register_thread_exit_event_ex(ClientThreadEnd, &thread_exit_pri)
-        || !drmgr_register_thread_exit_event_ex(ClientThreadEndForDrx, &thread_exit_high_pri) ) {
+        || !drmgr_register_thread_exit_event_ex(ClientThreadEndFortrace, &thread_exit_high_pri) ) {
         ZEROSPY_EXIT_PROCESS("ERROR: zerospy unable to register events");
     }
 
@@ -2285,29 +2240,29 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
 
     // Tracing Buffer
     // Integer 1 B
-    trace_buffer_i1 = drx_buf_create_trace_buffer(MEM_BUF_SIZE(1), trace_fault);
+    trace_buffer_i1 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(1));
     // Integer 2 B
-    trace_buffer_i2 = drx_buf_create_trace_buffer(MEM_BUF_SIZE(2), trace_fault);
+    trace_buffer_i2 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(2));
     // Integer 4 B
-    trace_buffer_i4 = drx_buf_create_trace_buffer(MEM_BUF_SIZE(4), trace_fault);
+    trace_buffer_i4 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(4));
     // Integer 8 B
-    trace_buffer_i8 = drx_buf_create_trace_buffer(MEM_BUF_SIZE(8), trace_fault);
+    trace_buffer_i8 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(8));
     // Integer 16 B
-    trace_buffer_i16 = drx_buf_create_trace_buffer(MEM_BUF_SIZE(16), trace_fault);
+    trace_buffer_i16 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(16));
     // Integer 32 B
-    trace_buffer_i32 = drx_buf_create_trace_buffer(MEM_BUF_SIZE(32), trace_fault);
+    trace_buffer_i32 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(32));
     // Floating Point Single
-    trace_buffer_sp1 = drx_buf_create_trace_buffer(MEM_BUF_SIZE(4), trace_fault);
+    trace_buffer_sp1 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(4));
     // Floating Point Double
-    trace_buffer_dp1 = drx_buf_create_trace_buffer(MEM_BUF_SIZE(8), trace_fault);
+    trace_buffer_dp1 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(8));
     // Floating Point 4*Single
-    trace_buffer_sp4 = drx_buf_create_trace_buffer(MEM_BUF_SIZE(16), trace_fault);
+    trace_buffer_sp4 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(16));
     // Floating Point 2*Double
-    trace_buffer_dp2 = drx_buf_create_trace_buffer(MEM_BUF_SIZE(16), trace_fault);
+    trace_buffer_dp2 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(16));
     // Floating Point 8*Single
-    trace_buffer_sp8 = drx_buf_create_trace_buffer(MEM_BUF_SIZE(32), trace_fault);
+    trace_buffer_sp8 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(32));
     // Floating Point 4*Double
-    trace_buffer_dp4 = drx_buf_create_trace_buffer(MEM_BUF_SIZE(32), trace_fault);
+    trace_buffer_dp4 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(32));
 }
 
 #ifdef __cplusplus

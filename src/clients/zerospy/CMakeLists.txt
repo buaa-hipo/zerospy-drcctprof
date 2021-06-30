@@ -30,12 +30,13 @@ endif (UNIX)
 
 add_library(zerospy SHARED
   zerospy.cpp
+  trace.cpp
   )
 
 configure_DynamoRIO_client(zerospy)
 use_DynamoRIO_extension(zerospy drcctlib)
 use_DynamoRIO_extension(zerospy droption) 
-use_DynamoRIO_extension(zerospy drx) 
+# use_DynamoRIO_extension(zerospy drx) 
 place_shared_lib_in_lib_dir(zerospy)
 
 add_dependencies(zerospy api_headers)
