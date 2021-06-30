@@ -36,19 +36,18 @@ uint64_t get_miliseconds() {
 #include "utils.h"
 #include "drx.h"
 
-// #define USE_SIMD
-// #define USE_SSE
+// #ifdef X86
+//     #define USE_SIMD
+//     #define USE_SSE
+//     #if defined(USE_SIMD) || defined(USE_SSE)
+//         #include <nmmintrin.h>
+//         #include <immintrin.h>
+//         #include <emmintrin.h>
+//     #endif
+// #endif
 
-#if defined(USE_SIMD) || defined(USE_SSE)
-    #ifdef X86
-        #include <nmmintrin.h>
-        #include <immintrin.h>
-        #include <emmintrin.h>
-    #endif
-#endif
-
-// #define WINDOW_ENABLE 1000000
-// #define WINDOW_DISABLE 100000000
+#define WINDOW_ENABLE 1000000
+#define WINDOW_DISABLE 100000000
 // #define WINDOW_CLEAN 10
 
 int window_enable;
@@ -60,22 +59,17 @@ static droption_t<bool> op_enable_sampling
 (DROPTION_SCOPE_CLIENT, "enable_sampling", 0, 0, 64, "Enable Bursty Sampling",
  "Enable bursty sampling for lower overhead with less profiling accuracy.");
 
-static droption_t<bool> op_no_flush
-(DROPTION_SCOPE_CLIENT, "no_flush", 0, 0, 64, "Disable code flushing of Bursty Sampling",
- "Disable code flushing of Bursty Sampling.");
-
 static droption_t<bool> op_help
 (DROPTION_SCOPE_CLIENT, "help", 0, 0, 64, "Show this help",
  "Show this help.");
 
-static droption_t<int> op_rate
-(DROPTION_SCOPE_CLIENT, "rate", 10, 0, 1000, "Sampling rate configuration of bursty sampling",
- "Sampling rate configuration of bursty sampling. Only available when sampling is enabled."
- "The final sampling rate is specified times of 0.001. Default is 10 (0.010 sampling rate).");
-
 static droption_t<int> op_window
-(DROPTION_SCOPE_CLIENT, "window", 100000000, 0, INT32_MAX, "Window size configuration of sampling",
+(DROPTION_SCOPE_CLIENT, "window", WINDOW_DISABLE, 0, INT32_MAX, "Window size configuration of sampling",
  "Window size of sampling. Only available when sampling is enabled.");
+
+static droption_t<int> op_window_enable
+(DROPTION_SCOPE_CLIENT, "window", WINDOW_ENABLE, 0, INT32_MAX, "Window enabled size configuration of sampling",
+ "Window enabled size of sampling. Only available when sampling is enabled.");
 
 using namespace std;
 
@@ -232,12 +226,8 @@ file_t gFlagF;
  * ***************************************************************/
 
 // #include "detect.h"
-
-#ifdef USE_CLEANCALL
-#define IS_SAMPLED(pt, WINDOW_ENABLE) (pt->sampleFlag)
-#else
 #define IS_SAMPLED(pt, WINDOW_ENABLE) ((int64_t)(BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR))<(int64_t)WINDOW_ENABLE)
-#endif
+
 file_t gFile;
 static void *gLock;
 #ifndef _WERROR
@@ -702,7 +692,7 @@ void CheckAndInsertIntPage_impl(int32_t ctxt_hndl, void* addr, per_thread_t *pt)
         AddINTRedLog(ctxt_hndl, accessLen, redZero, redZero, redByteMap, pt);
     } else {
         // accessLen == elementSize
-        uint64_t redByteMap_2 = (~redByteMap) & ((1<<accessLen)-1);
+        uint64_t redByteMap_2 = (~redByteMap) & ((1LL<<accessLen)-1);
         uint64_t redZero = _lzcnt_u64(redByteMap_2) - (64-accessLen);
         AddINTRedLog(ctxt_hndl, accessLen, redZero, redZero==accessLen?1:0, redByteMap, pt);
     }
@@ -813,13 +803,18 @@ void CheckAndInsertFpPage(int slot, void* addr) {
 }
 
 #ifdef X86
-template<uint32_t AccessLen, uint32_t ElemLen, bool isApprox>
+template<uint32_t AccessLen, uint32_t ElemLen, bool isApprox, bool enable_sampling>
 void CheckNByteValueAfterVGather(int slot, instr_t* instr)
 {
     static_assert(ElemLen==4 || ElemLen==8);
     void *drcontext = dr_get_current_drcontext();
     context_handle_t ctxt_hndl = drcctlib_get_context_handle(drcontext, slot);
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+    if(enable_sampling) {
+        if(!IS_SAMPLED(pt, window_enable)) {
+            return ;
+        }
+    }
     dr_mcontext_t mcontext;
     mcontext.size = sizeof(mcontext);
     mcontext.flags= DR_MC_ALL;
@@ -841,8 +836,12 @@ void CheckNByteValueAfterVGather(int slot, instr_t* instr)
         assert(0 && "VGather should be a floating point operation!");
     }
 }
-#define HANDLE_VGATHER(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) \
-dr_insert_clean_call(drcontext, bb, ins, (void *)CheckNByteValueAfterVGather<(ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX)>, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone))
+#define HANDLE_VGATHER(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) do {\
+if(op_enable_sampling.get_value()) { \
+dr_insert_clean_call(drcontext, bb, ins, (void *)CheckNByteValueAfterVGather<(ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true>, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone)); \
+} else { \
+dr_insert_clean_call(drcontext, bb, ins, (void *)CheckNByteValueAfterVGather<(ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false>, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone)); \
+} } while(0)
 #endif
 /***************************************************************************************/
 
@@ -1069,11 +1068,17 @@ void trace_update_int() {
     }
     void* buf_base = drx_buf_get_buffer_base(drcontext, trace_buffer);
     void* buf_ptr = drx_buf_get_buffer_ptr(drcontext, trace_buffer);
-    //dr_fprintf(STDOUT, "TRIGGER UPDATE: INT, sz=%d, esize=%d, buffer size=%ld, cache element size=%ld\n", sz, esize, (uint64_t)buf_ptr-(uint64_t)buf_base, sizeof(cache_t<sz>));
     per_thread_t* pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
     cache_t<sz> *trace_base = (cache_t<sz> *)(char *)buf_base;
     cache_t<sz> *trace_ptr = (cache_t<sz> *)((char *)buf_ptr);
     cache_t<sz> *cache_ptr;
+    IF_DEBUG(dr_fprintf(
+        STDOUT,
+        "UPDATE INT: trace_ptr=%p, base=%p, end=%p, size=%ld, buf_size=%ld, buf_end=%p\n",
+        trace_ptr, trace_base,
+        (char *)trace_base + drx_buf_get_buffer_size(drcontext, trace_buffer),
+        trace_ptr - trace_base, drx_buf_get_buffer_size(drcontext, trace_buffer),
+        drx_buf_get_buffer_end(drcontext, trace_buffer)));
     for(cache_ptr=trace_base; cache_ptr<trace_ptr; ++cache_ptr) {
         CheckAndInsertIntPage_impl<sz, esize>(cache_ptr->ctxt_hndl, (void*)cache_ptr->val, pt);
     }
@@ -1107,11 +1112,14 @@ void trace_update_fp() {
     }
     void* buf_base = drx_buf_get_buffer_base(drcontext, trace_buffer);
     void* buf_ptr = drx_buf_get_buffer_ptr(drcontext, trace_buffer);
-    //dr_fprintf(STDOUT, "TRIGGER UPDATE: FP, sz=%d, esize=%d, buffer size=%ld, cache element size=%ld\n", sz, esize, (uint64_t)buf_ptr-(uint64_t)buf_base, sizeof(cache_t<sz>));
     per_thread_t* pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
     cache_t<sz> *trace_base = (cache_t<sz> *)(char *)buf_base;
     cache_t<sz> *trace_ptr = (cache_t<sz> *)((char *)buf_ptr);
     cache_t<sz> *cache_ptr;
+    IF_DEBUG(dr_fprintf(STDOUT,
+                        "UPDATE FP: trace_ptr=%p, base=%p, size=%ld, buf_size=%ld\n",
+                        trace_ptr, trace_base, trace_ptr - trace_base,
+                        drx_buf_get_buffer_size(drcontext, trace_buffer)));
     for(cache_ptr=trace_base; cache_ptr<trace_ptr; ++cache_ptr) {
         AddFPRedLog<esize, sz>(cache_ptr->ctxt_hndl, (void*)cache_ptr->val, pt);
     }
@@ -1119,110 +1127,20 @@ void trace_update_fp() {
     drx_buf_set_buffer_ptr(drcontext, trace_buffer, buf_base);
 }
 
-struct drx_buf_extra_t {
-    reg_id_t tls_seg;
-    uint tls_offs;
-};
-
-drx_buf_extra_t* init_drx_extra(drx_buf_t* trace_buffer) {
-    uint tls_offs;
-    reg_id_t tls_seg;
-    /* allocate raw TLS so we can access it from the code cache */
-    if (!dr_raw_tls_calloc(&tls_seg, &tls_offs, 1, 0))
-        return NULL;
-    drx_buf_extra_t* extra = (drx_buf_extra_t*)dr_global_alloc(sizeof(drx_buf_extra_t));
-    extra->tls_seg = tls_seg;
-    extra->tls_offs= tls_offs;
-    return extra;
-}
-
-void free_drx_extra(drx_buf_extra_t* extra) {
-    if (!dr_raw_tls_cfree(extra->tls_offs, 1)) {
-        ZEROSPY_EXIT_PROCESS(
-            "ERROR: zerospy dr_raw_tls_calloc fail");
-    }
-    dr_global_free(extra, sizeof(drx_buf_extra_t));
-}
-
-drx_buf_extra_t* extra_sp1;
-drx_buf_extra_t* extra_dp1;
-drx_buf_extra_t* extra_sp4;
-drx_buf_extra_t* extra_dp2;
-drx_buf_extra_t* extra_sp8;
-drx_buf_extra_t* extra_dp4;
-drx_buf_extra_t* extra_i1;
-drx_buf_extra_t* extra_i2;
-drx_buf_extra_t* extra_i4;
-drx_buf_extra_t* extra_i8;
-drx_buf_extra_t* extra_i16;
-drx_buf_extra_t* extra_i32;
-
-void init_drx_extra_all() {
-    extra_i1 = init_drx_extra(trace_buffer_i1);
-    extra_i2 = init_drx_extra(trace_buffer_i2);
-    extra_i4 = init_drx_extra(trace_buffer_i4);
-    extra_i8 = init_drx_extra(trace_buffer_i8);
-    extra_i16 = init_drx_extra(trace_buffer_i16);
-    extra_i32 = init_drx_extra(trace_buffer_i32);
-    
-    extra_sp1 = init_drx_extra(trace_buffer_sp1);
-    extra_sp4 = init_drx_extra(trace_buffer_sp4);
-    extra_sp8 = init_drx_extra(trace_buffer_sp8);
-    extra_dp1 = init_drx_extra(trace_buffer_dp1);
-    extra_dp2 = init_drx_extra(trace_buffer_dp2);
-    extra_dp4 = init_drx_extra(trace_buffer_dp4);
-}
-
-void free_drx_extra_all() {
-    free_drx_extra(extra_i1);
-    free_drx_extra(extra_i2);
-    free_drx_extra(extra_i4);
-    free_drx_extra(extra_i8);
-    free_drx_extra(extra_i16);
-    free_drx_extra(extra_i32);
-    free_drx_extra(extra_sp1);
-    free_drx_extra(extra_sp4);
-    free_drx_extra(extra_sp8);
-    free_drx_extra(extra_dp1);
-    free_drx_extra(extra_dp2);
-    free_drx_extra(extra_dp4);
-}
-
-void init_drx_extra_thread_with_tracebuff(void* drcontext, drx_buf_extra_t* extra, drx_buf_t* trace_buffer) {
-    BUF_PTR(dr_get_dr_segment_base(extra->tls_seg), void, extra->tls_offs) =
-        (uint8_t*)drx_buf_get_buffer_base(drcontext, trace_buffer) +
-        drx_buf_get_buffer_size(drcontext, trace_buffer);
-}
-
-void init_drx_extra_thread(void* drcontext) {
-    init_drx_extra_thread_with_tracebuff(drcontext, extra_i1, trace_buffer_i1);
-    init_drx_extra_thread_with_tracebuff(drcontext, extra_i2, trace_buffer_i2);
-    init_drx_extra_thread_with_tracebuff(drcontext, extra_i4, trace_buffer_i4);
-    init_drx_extra_thread_with_tracebuff(drcontext, extra_i8, trace_buffer_i8);
-    init_drx_extra_thread_with_tracebuff(drcontext, extra_i16, trace_buffer_i16);
-    init_drx_extra_thread_with_tracebuff(drcontext, extra_i32, trace_buffer_i32);
-    init_drx_extra_thread_with_tracebuff(drcontext, extra_sp1, trace_buffer_sp1);
-    init_drx_extra_thread_with_tracebuff(drcontext, extra_sp4, trace_buffer_sp4);
-    init_drx_extra_thread_with_tracebuff(drcontext, extra_sp8, trace_buffer_sp8);
-    init_drx_extra_thread_with_tracebuff(drcontext, extra_dp1, trace_buffer_dp1);
-    init_drx_extra_thread_with_tracebuff(drcontext, extra_dp2, trace_buffer_dp2);
-    init_drx_extra_thread_with_tracebuff(drcontext, extra_dp4, trace_buffer_dp4);
-}
-
 template<int size, int esize, bool is_float>
-void insertBufferCheck_impl(void* drcontext, instrlist_t *bb, instr_t* ins, ushort memRefCnt, drx_buf_t* trace_buffer, drx_buf_extra_t* extra, reg_id_t reg_ptr, reg_id_t reg_end) {
+void insertBufferCheck_impl(void* drcontext, instrlist_t *bb, instr_t* ins, ushort memRefCnt, drx_buf_t* trace_buffer, reg_id_t reg_ptr, reg_id_t reg_end) {
     // quick return without any instrumentation
     if(memRefCnt<=0) return ;
     instr_t* skip_update = INSTR_CREATE_label(drcontext);
     // when there may be overflow, we check and update the trace buffer if possible
+    // the end buffer pointer
+    drx_buf_insert_load_buf_end(drcontext, trace_buffer, bb, ins, reg_end);
     // current buffer pointer
     drx_buf_insert_load_buf_ptr(drcontext, trace_buffer, bb, ins, reg_ptr);
     // increament the buffer pointer with memRefCnt
     MINSERT(bb, ins,
             XINST_CREATE_add(drcontext, opnd_create_reg(reg_ptr),
                              OPND_CREATE_INT16(sizeof(cache_t<size>) * memRefCnt)));
-    // the end buffer pointer
-    dr_insert_read_raw_tls(drcontext, bb, ins, extra->tls_seg, extra->tls_offs, reg_end);
     // if buffer will not be full, we will skip the heavy update
     MINSERT(bb, ins, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), opnd_create_reg(reg_end)));
     MINSERT(bb, ins, XINST_CREATE_jump_cond(drcontext, DR_PRED_LT, opnd_create_instr(skip_update)));
@@ -1236,6 +1154,13 @@ void insertBufferCheck_impl(void* drcontext, instrlist_t *bb, instr_t* ins, usho
     MINSERT(bb, ins, skip_update);
 }
 
+void insertBufferClear_impl(void* drcontext, instrlist_t *bb, instr_t* ins, ushort memRefCnt, drx_buf_t* trace_buffer, reg_id_t reg_ptr) {
+    // quick return without any instrumentation
+    if(memRefCnt<=0) return ;
+    // current buffer pointer
+    drx_buf_insert_clear_buf(drcontext, trace_buffer, bb, ins, reg_ptr);
+}
+
 void insertBufferCheck(void* drcontext, instrlist_t *bb, instr_t* ins, ushort memRefCnt[12]) {
     bool willInsert = false;
     for(int i=0; i<12; ++i) willInsert = willInsert || (memRefCnt[i]>0);
@@ -1244,23 +1169,48 @@ void insertBufferCheck(void* drcontext, instrlist_t *bb, instr_t* ins, ushort me
     // reserve registers if not dead
     RESERVE_AFLAGS(drcontext, bb, ins);
     RESERVE_REG(drcontext, bb, ins, NULL, reg_ptr);
+    instr_t* skip_to_end = INSTR_CREATE_label(drcontext);
+    instr_t* skip_to_update = INSTR_CREATE_label(drcontext);
+    if(op_enable_sampling.get_value()) {
+        dr_insert_read_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
+        // Clear insCnt when insCnt > WINDOW_DISABLE
+        MINSERT(bb, ins, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(window_enable)));
+        MINSERT(bb, ins, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(skip_to_update)));
+        // FP
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[0], trace_buffer_sp1, reg_ptr);
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[1], trace_buffer_dp1, reg_ptr);
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[2], trace_buffer_sp4, reg_ptr);
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[3], trace_buffer_dp2, reg_ptr);
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[4], trace_buffer_sp8, reg_ptr);
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[5], trace_buffer_dp4, reg_ptr);
+        // INT
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[6], trace_buffer_i1, reg_ptr);
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[7], trace_buffer_i2, reg_ptr);
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[8], trace_buffer_i4, reg_ptr);
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[9], trace_buffer_i8, reg_ptr);
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[10], trace_buffer_i16, reg_ptr);
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[11], trace_buffer_i32, reg_ptr);
+        MINSERT(bb, ins, XINST_CREATE_jump(drcontext, opnd_create_instr(skip_to_end)));
+        MINSERT(bb, ins, skip_to_update);
+    }
     RESERVE_REG(drcontext, bb, ins, NULL, reg_end);
     // FP
-    insertBufferCheck_impl<4,4, true>(drcontext, bb, ins, memRefCnt[0], trace_buffer_sp1, extra_sp1, reg_ptr, reg_end);
-    insertBufferCheck_impl<8,8, true>(drcontext, bb, ins, memRefCnt[1], trace_buffer_dp1, extra_dp1, reg_ptr, reg_end);
-    insertBufferCheck_impl<16,4, true>(drcontext, bb, ins, memRefCnt[2], trace_buffer_sp4, extra_sp4, reg_ptr, reg_end);
-    insertBufferCheck_impl<16,8, true>(drcontext, bb, ins, memRefCnt[3], trace_buffer_dp2, extra_dp2, reg_ptr, reg_end);
-    insertBufferCheck_impl<32,4, true>(drcontext, bb, ins, memRefCnt[4], trace_buffer_sp8, extra_sp8, reg_ptr, reg_end);
-    insertBufferCheck_impl<32,8, true>(drcontext, bb, ins, memRefCnt[5], trace_buffer_dp4, extra_dp4, reg_ptr, reg_end);
+    insertBufferCheck_impl<4,4, true>(drcontext, bb, ins, memRefCnt[0], trace_buffer_sp1, reg_ptr, reg_end);
+    insertBufferCheck_impl<8,8, true>(drcontext, bb, ins, memRefCnt[1], trace_buffer_dp1, reg_ptr, reg_end);
+    insertBufferCheck_impl<16,4, true>(drcontext, bb, ins, memRefCnt[2], trace_buffer_sp4, reg_ptr, reg_end);
+    insertBufferCheck_impl<16,8, true>(drcontext, bb, ins, memRefCnt[3], trace_buffer_dp2, reg_ptr, reg_end);
+    insertBufferCheck_impl<32,4, true>(drcontext, bb, ins, memRefCnt[4], trace_buffer_sp8, reg_ptr, reg_end);
+    insertBufferCheck_impl<32,8, true>(drcontext, bb, ins, memRefCnt[5], trace_buffer_dp4, reg_ptr, reg_end);
     // INT
-    insertBufferCheck_impl<1,1, false>(drcontext, bb, ins, memRefCnt[6], trace_buffer_i1, extra_i1, reg_ptr, reg_end);
-    insertBufferCheck_impl<2,2, false>(drcontext, bb, ins, memRefCnt[7], trace_buffer_i2, extra_i2, reg_ptr, reg_end);
-    insertBufferCheck_impl<4,4, false>(drcontext, bb, ins, memRefCnt[8], trace_buffer_i4, extra_i4, reg_ptr, reg_end);
-    insertBufferCheck_impl<8,8, false>(drcontext, bb, ins, memRefCnt[9], trace_buffer_i8, extra_i8, reg_ptr, reg_end);
-    insertBufferCheck_impl<16,1, false>(drcontext, bb, ins, memRefCnt[10], trace_buffer_i16, extra_i16, reg_ptr, reg_end);
-    insertBufferCheck_impl<32,1, false>(drcontext, bb, ins, memRefCnt[11], trace_buffer_i32, extra_i32, reg_ptr, reg_end);
+    insertBufferCheck_impl<1,1, false>(drcontext, bb, ins, memRefCnt[6], trace_buffer_i1, reg_ptr, reg_end);
+    insertBufferCheck_impl<2,2, false>(drcontext, bb, ins, memRefCnt[7], trace_buffer_i2, reg_ptr, reg_end);
+    insertBufferCheck_impl<4,4, false>(drcontext, bb, ins, memRefCnt[8], trace_buffer_i4, reg_ptr, reg_end);
+    insertBufferCheck_impl<8,8, false>(drcontext, bb, ins, memRefCnt[9], trace_buffer_i8, reg_ptr, reg_end);
+    insertBufferCheck_impl<16,1, false>(drcontext, bb, ins, memRefCnt[10], trace_buffer_i16, reg_ptr, reg_end);
+    insertBufferCheck_impl<32,1, false>(drcontext, bb, ins, memRefCnt[11], trace_buffer_i32, reg_ptr, reg_end);
     // restore registers if reserved
     UNRESERVE_REG(drcontext, bb, ins, reg_end);
+    MINSERT(bb, ins, skip_to_end);
     UNRESERVE_REG(drcontext, bb, ins, reg_ptr);
     UNRESERVE_AFLAGS(drcontext, bb, ins);
 }
@@ -1368,7 +1318,44 @@ event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, b
                 dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *)BBInstrument::BBUpdate, false, 1, OPND_CREATE_CCT_INT(num_instructions));
             }
         }
-        insertBufferCheck(drcontext, bb, instrlist_first(bb), memRefCnt_detail);
+#ifdef TRY_ANALYSIS
+        // For better performance, we try to find a insert point, where it most satisfies the following attributes:
+        //      1. the aflags are dead;
+        //      2. there are no less than two free registers that we can use without any spilling.
+        //      3. all previous instructions do not access memory that can update the buffered trace
+        // If we find a point that satisfies the attributes, we can insert our instrumentation codes with less overhead;
+        // otherwise, we just insert before the first instruction of the basic block.
+        instr_t* instr;
+        instr_t* insert_pt = NULL;
+        for (instr = instrlist_first(bb); instr != NULL; instr = instr_get_next(instr)) {
+            if(!instr_is_app(instr)) continue;
+            if(drx_aflags_are_dead(instr)) {
+                insert_pt = instr;
+            }
+            int free_regs=0;
+            for(reg_id_t reg=DR_REG_START_GPR; reg <= DR_REG_STOP_GPR; ++reg) {
+                bool dead;
+                if(drreg_is_register_dead(drcontext, reg, instr, &dead)) {
+                    ++free_regs;
+                }
+            }
+            if(free_regs>=2) {
+                if(insert_pt==instr) break;
+                if(insert_pt==NULL) insert_pt=instr;
+            } else if(free_regs==1) {
+                // as we assume that the aflags is more heavy for spill and restore, 
+                // we only take this case when there are no other insert point is found.
+                if(insert_pt==NULL) insert_pt=instr;
+            }
+            if(instr_reads_memory(instr)) break;
+        }
+        if(insert_pt==NULL) {
+            insert_pt = instrlist_first(bb);
+        }
+#else
+        instr_t* insert_pt = instrlist_first(bb);
+#endif
+        insertBufferCheck(drcontext, bb, insert_pt, memRefCnt_detail);
     }
     return DR_EMIT_DEFAULT;
 }
@@ -1692,32 +1679,8 @@ InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, i
 
 void InstrumentMemAll(void* drcontext, instrlist_t *bb, instr_t* instr, int32_t slot)
 {
-    reg_id_t reg_addr, scratch;
+    reg_id_t reg_addr, scratch, reg_xchg=DR_REG_NULL;
     RESERVE_REG(drcontext, bb, instr, NULL, reg_addr);
-    instr_t* skipcall = INSTR_CREATE_label(drcontext);
-    if(op_enable_sampling.get_value()) {
-        assert(0);
-        RESERVE_AFLAGS(drcontext, bb, instr);
-        dr_insert_read_raw_tls(drcontext, bb, instr, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_addr);
-        // Clear insCnt when insCnt > WINDOW_DISABLE
-        MINSERT(bb, instr, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_addr), OPND_CREATE_CCT_INT(window_enable)));
-        MINSERT(bb, instr, XINST_CREATE_jump_cond(drcontext, DR_PRED_GT, opnd_create_instr(skipcall)));
-#ifdef X86
-        // if the XAX is used by memory operand, we need to early restore the app aflags and values
-        bool xax_needed = false;
-        for(int i=0, num_srcs=instr_num_srcs(instr); i<num_srcs; ++i) {
-            opnd_t opnd = instr_get_src(instr, i);
-            if(opnd_is_memory_reference(opnd)) {
-                xax_needed = xax_needed && opnd_uses_reg(opnd, DR_REG_XAX);
-            }
-        }
-        if (xax_needed &&
-            drreg_restore_app_aflags(drcontext, bb, instr) != DRREG_SUCCESS &&
-            drreg_get_app_value(drcontext, bb, instr, DR_REG_XAX, DR_REG_XAX) != DRREG_SUCCESS) {
-            ZEROSPY_EXIT_PROCESS("InstrumentMemAll drreg_get_app_value REG_XAX failed!");
-        }
-#endif
-    }
     RESERVE_REG(drcontext, bb, instr, NULL, scratch);
     int num_srcs = instr_num_srcs(instr);
     int memop = 0;
@@ -1731,37 +1694,33 @@ void InstrumentMemAll(void* drcontext, instrlist_t *bb, instr_t* instr, int32_t 
         }
     }
     UNRESERVE_REG(drcontext, bb, instr, scratch);
-    MINSERT(bb, instr, skipcall);
-    if(op_enable_sampling.get_value()) {
-        UNRESERVE_AFLAGS(drcontext, bb, instr);
-    }
     UNRESERVE_REG(drcontext, bb, instr, reg_addr);
 }
 
 #ifdef X86
 void InstrumentVGather(void* drcontext, instrlist_t *bb, instr_t* instr, int32_t slot)
 {
-    if(op_enable_sampling.get_value()) {
-        drvector_t vec;
-        reg_id_t reg_ctxt;
-        RESERVE_AFLAGS(drcontext, bb, instr);
-        instr_t* skipcall = INSTR_CREATE_label(drcontext);
-        getUnusedRegEntry(&vec, instr);
-        RESERVE_REG(drcontext, bb, instr, &vec, reg_ctxt);
-        dr_insert_read_raw_tls(drcontext, bb, instr, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ctxt);
-        // Clear insCnt when insCnt > WINDOW_DISABLE
-        MINSERT(bb, instr, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ctxt), OPND_CREATE_CCT_INT(window_enable)));
-        MINSERT(bb, instr, XINST_CREATE_jump_cond(drcontext, DR_PRED_GT, opnd_create_instr(skipcall)));
+    // if(op_enable_sampling.get_value()) {
+    //     drvector_t vec;
+    //     reg_id_t reg_ctxt;
+    //     RESERVE_AFLAGS(drcontext, bb, instr);
+    //     instr_t* skipcall = INSTR_CREATE_label(drcontext);
+    //     getUnusedRegEntry(&vec, instr);
+    //     RESERVE_REG(drcontext, bb, instr, &vec, reg_ctxt);
+    //     dr_insert_read_raw_tls(drcontext, bb, instr, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ctxt);
+    //     // Clear insCnt when insCnt > WINDOW_DISABLE
+    //     MINSERT(bb, instr, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ctxt), OPND_CREATE_CCT_INT(window_enable)));
+    //     MINSERT(bb, instr, XINST_CREATE_jump_cond(drcontext, DR_PRED_GT, opnd_create_instr(skipcall)));
+    //     // We use instr_compute_address_ex_pos to handle gather (with VSIB addressing)
+    //     ZerospyInstrument::InstrumentReadValueBeforeVGather(drcontext, bb, instr, slot);
+    //     MINSERT(bb, instr, skipcall);
+    //     UNRESERVE_REG(drcontext, bb, instr, reg_ctxt);
+    //     UNRESERVE_AFLAGS(drcontext, bb, instr);
+    //     drvector_delete(&vec);
+    // } else {
         // We use instr_compute_address_ex_pos to handle gather (with VSIB addressing)
         ZerospyInstrument::InstrumentReadValueBeforeVGather(drcontext, bb, instr, slot);
-        MINSERT(bb, instr, skipcall);
-        UNRESERVE_REG(drcontext, bb, instr, reg_ctxt);
-        UNRESERVE_AFLAGS(drcontext, bb, instr);
-        drvector_delete(&vec);
-    } else {
-        // We use instr_compute_address_ex_pos to handle gather (with VSIB addressing)
-        ZerospyInstrument::InstrumentReadValueBeforeVGather(drcontext, bb, instr, slot);
-    }
+    // }
 }
 #endif
 
@@ -1840,6 +1799,13 @@ ThreadOutputFileInit(per_thread_t *pt)
     }
 }
 
+#define DEBUG_PRINT_TB_INFO(tb) \
+    IF_DEBUG(dr_fprintf(STDOUT, #tb ": buf_ptr=%p, buf_base=%p, buf_end=%p, buf_size=%ld\n", \
+        drx_buf_get_buffer_ptr(drcontext, tb), \
+        drx_buf_get_buffer_base(drcontext, tb), \
+        drx_buf_get_buffer_end(drcontext, tb), \
+        drx_buf_get_buffer_size(drcontext, tb)))
+
 static void
 ClientThreadStart(void *drcontext)
 {
@@ -1856,10 +1822,21 @@ ClientThreadStart(void *drcontext)
     pt->numInsBuff = dr_get_dr_segment_base(tls_seg);
     BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR) = 0;
     drmgr_set_tls_field(drcontext, tls_idx, (void *)pt);
-    // init buffer
-    init_drx_extra_thread(drcontext);
     // init output files
     ThreadOutputFileInit(pt);
+    // check drx
+    DEBUG_PRINT_TB_INFO(trace_buffer_i1);
+    DEBUG_PRINT_TB_INFO(trace_buffer_i2);
+    DEBUG_PRINT_TB_INFO(trace_buffer_i4);
+    DEBUG_PRINT_TB_INFO(trace_buffer_i8);
+    DEBUG_PRINT_TB_INFO(trace_buffer_i16);
+    DEBUG_PRINT_TB_INFO(trace_buffer_i32);
+    DEBUG_PRINT_TB_INFO(trace_buffer_sp1);
+    DEBUG_PRINT_TB_INFO(trace_buffer_sp4);
+    DEBUG_PRINT_TB_INFO(trace_buffer_sp8);
+    DEBUG_PRINT_TB_INFO(trace_buffer_dp1);
+    DEBUG_PRINT_TB_INFO(trace_buffer_dp2);
+    DEBUG_PRINT_TB_INFO(trace_buffer_dp4);
 }
 
 /*******************************************************************/
@@ -2161,14 +2138,11 @@ ClientInit(int argc, const char *argv[])
     if (op_enable_sampling.get_value()) {
         dr_fprintf(STDOUT, "[ZEROSPY INFO] Sampling Enabled\n");
         dr_fprintf(gFile, "[ZEROSPY INFO] Sampling Enabled\n");
-        if(op_no_flush.get_value()) {
-            dr_fprintf(STDOUT, "[ZEROSPY INFO] Code flush is disabled.\n");
-            dr_fprintf(gFile,  "[ZEROSPY INFO] Code flush is disabled.\n");
-        }
-        dr_fprintf(STDOUT, "[ZEROSPU INFO] Sampling Rate: %.3f, Window Size: %ld\n", op_rate.get_value(), op_window.get_value());
-        dr_fprintf(gFile,  "[ZEROSPU INFO] Sampling Rate: %.3f, Window Size: %ld\n", op_rate.get_value(), op_window.get_value());
-        window_enable = op_rate.get_value() * op_window.get_value();
+        window_enable = op_window_enable.get_value();
         window_disable= op_window.get_value();
+        float rate = (float)window_enable / (float)window_disable;
+        dr_fprintf(STDOUT, "[ZEROSPU INFO] Sampling Rate: %.3f, Window Size: %ld\n", rate, window_disable);
+        dr_fprintf(gFile,  "[ZEROSPU INFO] Sampling Rate: %.3f, Window Size: %ld\n", rate, window_disable);
     } else {
         dr_fprintf(STDOUT, "[ZEROSPY INFO] Sampling Disabled\n");
         dr_fprintf(gFile, "[ZEROSPY INFO] Sampling Disabled\n");
@@ -2213,8 +2187,6 @@ ClientExit(void)
         ZEROSPY_EXIT_PROCESS(
             "ERROR: zerospy dr_raw_tls_calloc fail");
     }
-    // free extra info
-    free_drx_extra_all();
     // free trace buffers
     drx_buf_free(trace_buffer_i1);
     drx_buf_free(trace_buffer_i2);
@@ -2336,8 +2308,6 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     trace_buffer_sp8 = drx_buf_create_trace_buffer(MEM_BUF_SIZE(32), trace_fault);
     // Floating Point 4*Double
     trace_buffer_dp4 = drx_buf_create_trace_buffer(MEM_BUF_SIZE(32), trace_fault);
-    // extra info
-    init_drx_extra_all();
 }
 
 #ifdef __cplusplus
