@@ -1149,6 +1149,14 @@ void insertBufferClear_impl(void* drcontext, instrlist_t *bb, instr_t* ins, usho
     trace_buf_insert_clear_buf(drcontext, trace_buffer, bb, ins, reg_ptr);
 }
 
+void debug_output_line() {
+    dr_fprintf(STDOUT, "--------------\n"); fflush(stdout);
+}
+
+void debug_output(void* val) {
+    dr_fprintf(STDOUT, "loaded val=%p\n", val); fflush(stdout);
+}
+
 void insertBufferCheck(void* drcontext, instrlist_t *bb, instr_t* ins, ushort memRefCnt[12]) {
     bool willInsert = false;
     for(int i=0; i<12; ++i) willInsert = willInsert || (memRefCnt[i]>0);
@@ -1157,12 +1165,25 @@ void insertBufferCheck(void* drcontext, instrlist_t *bb, instr_t* ins, ushort me
     // reserve registers if not dead
     RESERVE_AFLAGS(drcontext, bb, ins);
     RESERVE_REG(drcontext, bb, ins, NULL, reg_ptr);
+#ifdef ARM_CCTLIB
+    // for ARM, we always need two register for the check of bursty sampling.
+    RESERVE_REG(drcontext, bb, ins, NULL, reg_end);
+#endif
     instr_t* skip_to_end = INSTR_CREATE_label(drcontext);
     instr_t* skip_to_update = INSTR_CREATE_label(drcontext);
     if(op_enable_sampling.get_value()) {
         dr_insert_read_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
         // Clear insCnt when insCnt > WINDOW_DISABLE
+#ifdef ARM_CCTLIB
+    #ifdef ARM64_CCTLIB
+        minstr_load_wwint_to_reg(drcontext, bb, ins, reg_end, window_enable);
+    #else
+        minstr_load_wint_to_reg(drcontext, bb, ins, reg_end, window_enable);
+    #endif
+        MINSERT(bb, ins, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), opnd_create_reg(reg_end)));
+#else
         MINSERT(bb, ins, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(window_enable)));
+#endif
         MINSERT(bb, ins, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(skip_to_update)));
         // FP
         insertBufferClear_impl(drcontext, bb, ins, memRefCnt[0], trace_buffer_sp1, reg_ptr);
@@ -1181,7 +1202,10 @@ void insertBufferCheck(void* drcontext, instrlist_t *bb, instr_t* ins, ushort me
         MINSERT(bb, ins, XINST_CREATE_jump(drcontext, opnd_create_instr(skip_to_end)));
         MINSERT(bb, ins, skip_to_update);
     }
+#ifndef ARM_CCTLIB
+    // for X86/64, we can lazily reserve the register to avoid unnecessary spilling.
     RESERVE_REG(drcontext, bb, ins, NULL, reg_end);
+#endif
     // FP
     insertBufferCheck_impl<4,4, true>(drcontext, bb, ins, memRefCnt[0], trace_buffer_sp1, reg_ptr, reg_end);
     insertBufferCheck_impl<8,8, true>(drcontext, bb, ins, memRefCnt[1], trace_buffer_dp1, reg_ptr, reg_end);
@@ -1197,8 +1221,13 @@ void insertBufferCheck(void* drcontext, instrlist_t *bb, instr_t* ins, ushort me
     insertBufferCheck_impl<16,1, false>(drcontext, bb, ins, memRefCnt[10], trace_buffer_i16, reg_ptr, reg_end);
     insertBufferCheck_impl<32,1, false>(drcontext, bb, ins, memRefCnt[11], trace_buffer_i32, reg_ptr, reg_end);
     // restore registers if reserved
+#ifdef ARM_CCTLIB
+    MINSERT(bb, ins, skip_to_end);
+    UNRESERVE_REG(drcontext, bb, ins, reg_end);
+#else
     UNRESERVE_REG(drcontext, bb, ins, reg_end);
     MINSERT(bb, ins, skip_to_end);
+#endif
     UNRESERVE_REG(drcontext, bb, ins, reg_ptr);
     UNRESERVE_AFLAGS(drcontext, bb, ins);
 }
@@ -1230,8 +1259,10 @@ int count_bb_info_detailed(void* drcontext, instrlist_t *bb, ushort memRefCnt[12
         num_instructions++;
         if(     instr_reads_memory(instr) 
             && (!instr_is_prefetch(instr)) 
-            && (!instr_is_ignorable(instr)) 
-            && (!instr_is_gather(instr))) 
+#ifdef X86
+            && (!instr_is_gather(instr))
+#endif
+            && (!instr_is_ignorable(instr))) 
         {
             int num_srcs = instr_num_srcs(instr);
             for(int i=0; i<num_srcs; ++i) {
