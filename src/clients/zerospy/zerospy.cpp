@@ -1,13 +1,19 @@
-#include <unordered_map>
+//#include <unordered_map>
+#include <map>
 #include <vector>
 #include <string>
 #include <sys/stat.h>
 #include <assert.h>
 #include <algorithm>
 
+#ifdef DEBUG
+#define IF_DEBUG(stat) stat
+#else
+#define IF_DEBUG(stat)
+#endif
 // #define USE_TIMER
 
-// #define ZEROSPY_DEBUG
+//#define ZEROSPY_DEBUG
 #define _WERROR
 
 #ifdef TIMING
@@ -28,43 +34,24 @@ uint64_t get_miliseconds() {
 #include "dr_tools.h"
 #include <sys/time.h>
 #include "utils.h"
-#include "drx.h"
+#include "trace.h"
 
-// #define USE_CLEANCALL
-#define ENABLE_SAMPLING 1
-#ifdef ENABLE_SAMPLING
-// different frequency configurations:
-//      Rate:   1/10, 1/100, 1/1000, 5/10, 5/100, 5/1000
-//      Window: 1e6, 1e7, 1e8, 1e9, 1e10 
-// #define WINDOW_ENABLE 1000000
-// #define WINDOW_DISABLE 100000000
+// #ifdef X86
+//     #define USE_SIMD
+//     #define USE_SSE
+//     #if defined(USE_SIMD) || defined(USE_SSE)
+//         #include <nmmintrin.h>
+//         #include <immintrin.h>
+//         #include <emmintrin.h>
+//     #endif
+// #endif
+
+#define WINDOW_ENABLE 1000000
+#define WINDOW_DISABLE 100000000
 // #define WINDOW_CLEAN 10
-// Enumuration of RATEs
-#define RATE_NUM 6
-#define RATE_0 (0.5)
-#define RATE_1 (0.1)
-#define RATE_2 (0.05)
-#define RATE_3 (0.01)
-#define RATE_4 (0.005)
-#define RATE_5 (0.001)
-// RATE -> WINDOW_ENABLE mapping
-#define RATE_0_WIN(WINDOW) ((int64_t)(RATE_0*WINDOW))
-#define RATE_1_WIN(WINDOW) ((int64_t)(RATE_1*WINDOW))
-#define RATE_2_WIN(WINDOW) ((int64_t)(RATE_2*WINDOW))
-#define RATE_3_WIN(WINDOW) ((int64_t)(RATE_3*WINDOW))
-#define RATE_4_WIN(WINDOW) ((int64_t)(RATE_4*WINDOW))
-#define RATE_5_WIN(WINDOW) ((int64_t)(RATE_5*WINDOW))
-// Enumuration of WINDOWs
-#define WINDOW_NUM 5
-#define WINDOW_0 (100000)
-#define WINDOW_1 (1000000)
-#define WINDOW_2 (10000000)
-#define WINDOW_3 (100000000)
-#define WINDOW_4 (1000000000)
 
 int window_enable;
 int window_disable;
-#endif
 
 // Client Options
 #include "droption.h"
@@ -72,51 +59,17 @@ static droption_t<bool> op_enable_sampling
 (DROPTION_SCOPE_CLIENT, "enable_sampling", 0, 0, 64, "Enable Bursty Sampling",
  "Enable bursty sampling for lower overhead with less profiling accuracy.");
 
-static droption_t<bool> op_no_flush
-(DROPTION_SCOPE_CLIENT, "no_flush", 0, 0, 64, "Disable code flushing of Bursty Sampling",
- "Disable code flushing of Bursty Sampling.");
-
 static droption_t<bool> op_help
 (DROPTION_SCOPE_CLIENT, "help", 0, 0, 64, "Show this help",
  "Show this help.");
 
-static droption_t<int> op_rate
-(DROPTION_SCOPE_CLIENT, "rate", 3, 0, RATE_NUM, "Sampling rate configuration of bursty sampling",
- "Sampling rate configuration of bursty sampling. Only available when sampling is enabled."
- "Only the following configurations are valid:\n"
- "\t0: 0.5\n"
- "\t1: 0.1\n"
- "\t2: 0.05\n"
- "\t3: 0.01\n"
- "\t4: 0.005\n"
- "\t5: 0.001\n");
-
-const float conf2rate[RATE_NUM] = {
-    RATE_0,
-    RATE_1,
-    RATE_2,
-    RATE_3,
-    RATE_4,
-    RATE_5
-};
-
 static droption_t<int> op_window
-(DROPTION_SCOPE_CLIENT, "window", 3, 0, WINDOW_NUM, "Window size configuration of sampling",
- "Window size of sampling. Only available when sampling is enabled."
- "Only the following configurations are valid:\n"
- "\t0: 100000\n"
- "\t1: 1000000\n"
- "\t2: 10000000\n"
- "\t3: 100000000\n"
- "\t4: 1000000000\n");
+(DROPTION_SCOPE_CLIENT, "window", WINDOW_DISABLE, 0, INT32_MAX, "Window size configuration of sampling",
+ "Window size of sampling. Only available when sampling is enabled.");
 
-const uint64_t conf2window[WINDOW_NUM] = {
-    WINDOW_0,
-    WINDOW_1,
-    WINDOW_2,
-    WINDOW_3,
-    WINDOW_4
-};
+static droption_t<int> op_window_enable
+(DROPTION_SCOPE_CLIENT, "window", WINDOW_ENABLE, 0, INT32_MAX, "Window enabled size configuration of sampling",
+ "Window enabled size of sampling. Only available when sampling is enabled.");
 
 using namespace std;
 
@@ -153,25 +106,59 @@ zerospy_filter_read_mem_access_instr(instr_t *instr)
 static string g_folder_name;
 static int tls_idx;
 
-struct INTRedLogs{
+#define MAKE_KEY(ctxt_hndl, elementSize, accessLen) \
+    ((((uint64_t)(ctxt_hndl))<<32) | ((((uint64_t)(elementSize))<<8)|(uint64_t)(accessLen)))
+#define DECODE_CTXT(key) (context_handle_t)(((key) >> 32) & 0xffffffff)
+#define DECODE_ACCESSLEN(key) ((uint8_t)((key) & 0xff))
+#define DECODE_ELEMENTSIZE(key) ((uint8_t)(((key)>>8) & 0xff))
+
+#define ENCODE_TO_UPPER(upper, src) ((((uint64_t)upper)<<56) | ((uint64_t)src))
+#define DECODE_UPPER(enc) (uint8_t)(((uint64_t)enc>>56) & 0xff)
+#define DECODE_SRC(enc) (uint64_t)((uint64_t)enc & 0xffffffffffffffLL)
+
+template<int size>
+struct cache_t {
+    int32_t ctxt_hndl;
+    int8_t val[size];
+};
+/* Max number of mem_ref a buffer can have. */
+#define MAX_NUM_MEM_REFS 4096
+/* The maximum size of buffer for holding mem_refs. */
+#define MEM_BUF_SIZE(size) (sizeof(cache_t<size>) * MAX_NUM_MEM_REFS)
+
+static trace_buf_t *trace_buffer_i1;
+static trace_buf_t *trace_buffer_i2;
+static trace_buf_t *trace_buffer_i4;
+static trace_buf_t *trace_buffer_i8;
+static trace_buf_t *trace_buffer_i16;
+static trace_buf_t *trace_buffer_i32;
+static trace_buf_t *trace_buffer_sp1;
+static trace_buf_t *trace_buffer_dp1;
+static trace_buf_t *trace_buffer_sp4;
+static trace_buf_t *trace_buffer_dp2;
+static trace_buf_t *trace_buffer_sp8;
+static trace_buf_t *trace_buffer_dp4;
+
+struct INTRedLog_t{
     uint64_t tot;
     uint64_t red;
-    uint64_t fred; // full redundancy
+    uint64_t fred;
     uint64_t redByteMap;
 };
 
-struct FPRedLogs{
-    uint64_t fred; // full redundancy
+// AVX2
+#define MAX_VLEN 4
+struct FPRedLog_t{
     uint64_t ftot;
+    uint64_t fred;
+    //uint64_t redByteMap[MAX_VLEN];
     uint64_t redByteMap;
-    uint8_t AccessLen;
-    uint8_t size;
 };
+
+typedef std::map<context_handle_t, INTRedLog_t> INTRedLogMap_t;
+typedef std::map<context_handle_t, FPRedLog_t> FPRedLogMap_t;
 
 #define MINSERT instrlist_meta_preinsert
-#define DECODE_DEAD(data) static_cast<uint8_t>(((data)  & 0xffffffffffffffff) >> 32 )
-#define DECODE_KILL(data) (static_cast<context_handle_t>( (data)  & 0x00000000ffffffff))
-#define MAKE_CONTEXT_PAIR(a, b) (((uint64_t)(a) << 32) | ((uint64_t)(b)))
 #define delta 0.01
 #define MAX_REDUNDANT_CONTEXTS_TO_LOG (1000)
 // maximum cct depth to print
@@ -179,7 +166,8 @@ struct FPRedLogs{
 
 enum {
     INSTRACE_TLS_OFFS_BUF_PTR,
-    INSTRACE_TLS_OFFS_VAL_CACHE_PTR,
+    INSTRACE_TLS_OFFS_INTLOG_PTR,
+    INSTRACE_TLS_OFFS_FPLOG_PTR,
     INSTRACE_TLS_COUNT, /* total number of TLS slots allocated */
 };
 
@@ -191,39 +179,13 @@ static uint tls_offs;
 // 1M
 #define MAX_CLONE_INS 1048576
 
-// AVX512: 64B
-#define MAX_VAL_LEN 64
-// maximum cache size: 1M
-#define MAX_CACHE_SIZE (1<<20)
-struct val_cache_t {
-    // isApprox (0,1) <7> | elementSize (1~64) <0-6> | accessLen | ctxt_hndl
-    uint32_t ctxt_hndl;
-    uint32_t info;
-    // uint8_t vals[MAX_VAL_LEN];
-    uint64_t redmap;
-};
-
 typedef struct _per_thread_t {
-    unordered_map<uint64_t, INTRedLogs> *INTRedMap;
-    unordered_map<uint64_t, FPRedLogs > *FPRedMap;
+    FPRedLogMap_t* FPRedLogMap;
+    INTRedLogMap_t* INTRedLogMap;
     file_t output_file;
-#ifdef ENABLE_SAMPLING
-    #ifdef USE_CLEANCALL
-        long long numIns;
-        bool sampleFlag;
-    #else
-        void* numInsBuff;
-        int   cache_val_num;
-        val_cache_t* cache_ptr;
-    #endif
-#endif
+    void* numInsBuff;
     vector<instr_t*> *instr_clones;
 } per_thread_t;
-
-#define ENCODE_CACHED_INFO(isApprox, elementSize, accessLen) ((((uint32_t)isApprox)<<31) | (((uint32_t)elementSize)<<24) | ((uint32_t)accessLen))
-#define DECODE_ISAPPROX_FROM_CACHED_INFO(info) ((uint32_t)(info)>>31)
-#define DECODE_ELEMSIZE_FROM_CACHED_INFO(info) (((uint32_t)(info)>>24)&0x7F)
-#define DECODE_ACCESSLEN_FROM_CACHED_INFO(info) (((uint32_t)(info))&0x00FFFFFF)
 
 #define IN
 #define INOUT
@@ -244,565 +206,28 @@ file_t gFlagF;
         ZEROSPY_EXIT_PROCESS("ERROR @ %s:%d: drreg_unreserve_register != DRREG_SUCCESS", __FILE__, __LINE__); \
     } } while(0)
 
-// reg_ctxt and scratch can overlap (same register)
-inline
-void insertSaveCachedKey(void* drcontext, instrlist_t *ilist, instr_t *where, 
-                         uint8_t elementSize, uint8_t accessLen, uint8_t isApprox, 
-                         reg_id_t reg_base, reg_id_t reg_ctxt, reg_id_t scratch) {
-    if(reg_is_64bit(scratch)) {
-        scratch = reg_64_to_32(scratch);
-    }
-    if(reg_is_64bit(reg_ctxt)) {
-        reg_ctxt = reg_64_to_32(reg_ctxt);
-    }
-    uint32_t info = ENCODE_CACHED_INFO(isApprox, elementSize, accessLen);
-    MINSERT(ilist, where, XINST_CREATE_store(drcontext,
-                    OPND_CREATE_MEM32(reg_base, offsetof(val_cache_t, ctxt_hndl)),
-                    opnd_create_reg(reg_ctxt)));
-    MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(scratch), OPND_CREATE_CCT_INT(info)));
-    MINSERT(ilist, where, XINST_CREATE_store(drcontext,
-                    OPND_CREATE_MEM32(reg_base, offsetof(val_cache_t, info)),
-                    opnd_create_reg(scratch)));
-}
+/******************************************************************
+ * Cached trace implementation of Zerospy for acceleration:
+ *  1. For each memory load, we only cache the cct, loaded value, 
+ * and the statically encoded information (size, isApprox, offset).
+ * If we use data-centric mode, we also record the target address.
+ *  2. Note that the previous tracing (caching) will not include any
+ * arithmetic operations with any changes to arithmetic flags, so we
+ * don't need to heavily reserve/restore the states. Even though it 
+ * may result in better data locality when we analyze the loaded data
+ * on the fly, we detect some existing bugs and lack of SIMD register
+ * reservation supports of drreg, we still directly cache these values
+ * for further offline/buffer-clearing analysis. And we can also 
+ * benifit from frequent spilling to reserve arithmetic flags when 
+ * register pressure is high.
+ *  3. For sampling, we will analyze and store the cached traces when
+ * the cache is full or the sampling flag is changed to inactive. We 
+ * will discard the cache when the sampling flag is not active.
+ * ***************************************************************/
 
-// reg_addr and reg_val may overlapped
-template<bool cache>
-void insertLoadAndComputeRedMap_1byte(  void* drcontext, instrlist_t *ilist, instr_t *where, IN reg_id_t reg_base, 
-                                        IN reg_id_t reg_addr, int offset, 
-                                        OUT reg_id_t reg_val, OUT reg_id_t scratch) 
-{
-    return ;
-    // printf("insertLoadAndComputeRedMap_1byte enter\n"); fflush(stdout);
-    assert(reg_is_64bit(reg_val));
-    MINSERT(ilist, where, XINST_CREATE_load_1byte(drcontext, 
-                    opnd_create_reg(reg_32_to_8(reg_64_to_32(reg_val))),
-                    OPND_CREATE_MEM8(reg_addr, offset)));
-    // cmp based: 4 operation (cmp + cmov + cmov)
-    // or based: 15 operation (7 or + 7 shr + 1 and)
-    // So we use CMP based approach for 1 byte case
-    // Compare value with 0
-    MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_val), OPND_CREATE_CCT_INT(0)));
-    // Condition move to set redmap as 1 when ZF is set (val==0)
-    MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(scratch), OPND_CREATE_CCT_INT(1)));
-    MINSERT(ilist, where, INSTR_PRED(instr_create_1dst_1src((drcontext), (OP_cmovz), (opnd_create_reg(reg_val)), (opnd_create_reg(scratch))), DR_PRED_Z));
-    // Condition move to set redmap as 0 when ZF is not set (val!=0)
-    MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(scratch), OPND_CREATE_CCT_INT(0)));
-    MINSERT(ilist, where, INSTR_PRED(instr_create_1dst_1src((drcontext), (OP_cmovnz), (opnd_create_reg(reg_val)), (opnd_create_reg(scratch))), DR_PRED_NZ));
-    // Store back
-    if(cache) {
-        MINSERT(ilist, where, XINST_CREATE_store(drcontext,
-                        OPND_CREATE_MEM64(reg_base, offsetof(val_cache_t, redmap)),
-                        opnd_create_reg(reg_val)));
-    }
-    // printf("insertLoadAndComputeRedMap_1byte exit\n"); fflush(stdout);
-}
+// #include "detect.h"
+#define IS_SAMPLED(pt, WINDOW_ENABLE) ((int64_t)(BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR))<(int64_t)WINDOW_ENABLE)
 
-template<bool cache>
-void insertLoadAndComputeRedMap_2bytes( void* drcontext, instrlist_t *ilist, instr_t* where, IN reg_id_t reg_base, 
-                                        IN reg_id_t reg_addr, int offset, 
-                                        OUT reg_id_t reg_val, OUT reg_id_t scratch) 
-{
-    return ;
-    // printf("insertLoadAndComputeRedMap_2bytes enter\n"); fflush(stdout);
-    assert(reg_is_64bit(reg_val));
-    MINSERT(ilist, where, XINST_CREATE_load_2bytes(drcontext, 
-                    opnd_create_reg(reg_32_to_16(reg_64_to_32(reg_val))),
-                    OPND_CREATE_MEM16(reg_addr, offset)));
-    // or based: 21 ops = 3 mov + 18 calc (7 or + 7 shr + 1 and + 1 or + 1 shr + 1 and)
-    // Merge all bits within a byte in parallel by binary merging: (7 + 7) => (3 * 3)
-    // 0x
-    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
-    MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(1)));
-    MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // 00xx
-    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
-    MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(2)));
-    MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // 0000xxxx
-    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
-    MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(4)));
-    MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // 1.1 x = (~x) & 0x101
-    MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(scratch), OPND_CREATE_CCT_INT(0x101)));
-    MINSERT(ilist, where, INSTR_CREATE_andn(drcontext, opnd_create_reg(reg_val), opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // x = (x>>7 | x)
-    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
-    MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(7)));
-    MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // x = x&0x3
-    MINSERT(ilist, where, INSTR_CREATE_and(drcontext, opnd_create_reg(reg_val), OPND_CREATE_INT8(0x3)));
-    // Store back
-    if(cache) {
-        MINSERT(ilist, where, XINST_CREATE_store(drcontext,
-                        OPND_CREATE_MEM64(reg_base, offsetof(val_cache_t, redmap)),
-                        opnd_create_reg(reg_val)));
-    }
-    // printf("insertLoadAndComputeRedMap_2bytes exit\n"); fflush(stdout);
-}
-template<bool cache>
-void insertLoadAndComputeRedMap_4bytes( void* drcontext, instrlist_t *ilist, instr_t *where, IN reg_id_t reg_base, 
-                                        IN reg_id_t reg_addr, int offset, 
-                                        OUT reg_id_t reg_val, OUT reg_id_t scratch) 
-{
-    // printf("insertLoadAndComputeRedMap_4bytes enter\n"); fflush(stdout);
-    assert(reg_is_64bit(reg_val));
-    MINSERT(ilist, where, XINST_CREATE_load(drcontext, 
-                    opnd_create_reg(reg_64_to_32(reg_val)),
-                    OPND_CREATE_MEM32(reg_addr, offset)));
-    // or based: 22 ops = (7 or + 7 shr + 1 and + 3 or + 3 shr + 1 and)
-    // Merge all bits within a byte in parallel by binary merging: (7 + 7) => (3 * 3)
-    bool dead; assert(drreg_are_aflags_dead(drcontext, where, &dead)==DRREG_SUCCESS);
-    dr_fprintf(gFlagF, "AFLAG is dead: %d (drreg) vs %d (drx): \n", dead, drx_aflags_are_dead(where));
-    for(instr_t* inst=where; inst!=NULL; inst=instr_get_next(inst)) {
-        dr_fprintf(gFlagF, "\t");
-        disassemble(drcontext, instr_get_app_pc(inst), gFlagF);
-    }
-    dr_fprintf(gFlagF, "======================\n"); 
-    assert(dead==drx_aflags_are_dead(where));
-    // 0x
-    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
-    MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(1)));
-    MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // 00xx
-    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
-    MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(2)));
-    MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // 0000xxxx
-    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
-    MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(4)));
-    MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // x = (~x) & 0x01010101
-    MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(scratch), OPND_CREATE_CCT_INT(0x1010101)));
-    MINSERT(ilist, where, INSTR_CREATE_andn(drcontext, opnd_create_reg(reg_val), opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // x = (x>>7 | x)
-    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
-    MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(7)));
-    MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // x = (x>>14 | x)
-    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
-    MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(14)));
-    MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // x = x&0xf
-    MINSERT(ilist, where, INSTR_CREATE_and(drcontext, opnd_create_reg(reg_val), OPND_CREATE_INT8(0xf)));
-    // Store back
-    if(cache) {
-        MINSERT(ilist, where, XINST_CREATE_store(drcontext,
-                        OPND_CREATE_MEM64(reg_base, offsetof(val_cache_t, redmap)),
-                        opnd_create_reg(reg_val)));
-    }
-    // printf("insertLoadAndComputeRedMap_4bytes exit\n"); fflush(stdout);
-}
-
-template<bool cache>
-void insertLoadAndComputeRedMap_8bytes( void* drcontext, instrlist_t *ilist, instr_t *where, IN reg_id_t reg_base, 
-                                        IN reg_id_t reg_addr, int offset, 
-                                        OUT reg_id_t reg_val, OUT reg_id_t scratch) 
-{
-    return ;
-    // printf("insertLoadAndComputeRedMap_8bytes enter\n"); fflush(stdout);
-    assert(dr_get_isa_mode(drcontext)==DR_ISA_AMD64 && "insertLoadAndComputeRedMap_8bytes only supports X64 ISA!");
-    if(reg_is_32bit(reg_val)) {
-        reg_val = reg_32_to_64(reg_val);
-        assert(0 && "REGISTER is 32 bit!");
-    }
-    MINSERT(ilist, where, XINST_CREATE_load(drcontext, 
-                    opnd_create_reg(reg_val),
-                    OPND_CREATE_MEM64(reg_addr, offset)));
-    // or based: 22 ops = (7 or + 7 shr + 1 and + 3 or + 3 shr + 1 and)
-    // Merge all bits within a byte in parallel by binary merging: (7 + 7) => (3 * 3)
-    // 0x
-    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
-    MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(1)));
-    MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // 00xx
-    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
-    MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(2)));
-    MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // 0000xxxx
-    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
-    MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(4)));
-    MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // x = (~x) & 0x0101010101010101LL
-    MINSERT(ilist, where, INSTR_CREATE_mov_imm(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT64(0x101010101010101LL)));
-    MINSERT(ilist, where, INSTR_CREATE_andn(drcontext, opnd_create_reg(reg_val), opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // x = (x>>7 | x)
-    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
-    MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(7)));
-    MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // x = (x>>14 | x)
-    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
-    MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(14)));
-    MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // x = (x>>28 | x)
-    MINSERT(ilist, where, XINST_CREATE_move(drcontext, opnd_create_reg(scratch), opnd_create_reg(reg_val)));
-    MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(scratch), OPND_CREATE_INT8(28)));
-    MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_val), opnd_create_reg(scratch)));
-    // x = x&0xff
-    MINSERT(ilist, where, INSTR_CREATE_and(drcontext, opnd_create_reg(reg_val), OPND_CREATE_INT32(0xff)));
-    // Store back
-    if(cache) {
-        // printf("Caching! 32bit: %d, 64bit: %d\n", reg_is_32bit(reg_val), reg_is_64bit(reg_val));
-        MINSERT(ilist, where, XINST_CREATE_store(drcontext,
-                        OPND_CREATE_MEM64(reg_base, offsetof(val_cache_t, redmap)),
-                        opnd_create_reg(reg_val)));
-    }
-    // printf("insertLoadAndComputeRedMap_8bytes exit\n"); fflush(stdout);
-}
-
-#define SIMD_REG_NUM (DR_REG_XMM31-DR_REG_XMM0+1)
-
-int simdAliveAnalysis(void* drcontext, instrlist_t *ilist, instr_t *where, bool simdIsDead[SIMD_REG_NUM]) {
-    int deadNum = 0;
-    // conservatively assume that all register is potentially alive
-    memset(simdIsDead, 0, sizeof(bool)*SIMD_REG_NUM);
-    bool simdUse[SIMD_REG_NUM] = {0};
-    // forward to find if there are any dead registers (define before use)
-    for(instr_t* instr = where; instr != NULL; instr = instr_get_next(instr)) {
-        int num_srcs = instr_num_srcs(instr);
-        for(int i=0; i<num_srcs; ++i) {
-            opnd_t opnd = instr_get_src(instr, i);
-            for(int j=0; j<opnd_num_regs_used(opnd); ++j) {
-                reg_id_t regUse = opnd_get_reg_used(opnd, j);
-                if(regUse >= DR_REG_XMM0 && regUse <= DR_REG_XMM31) {
-                    int index = regUse - DR_REG_XMM0;
-                    simdUse[index] = true;
-                    // printf("SIMD REG USED: %s\n", get_register_name(regUse)); fflush(stdout);
-                } else if(regUse >= DR_REG_YMM0 && regUse <= DR_REG_YMM31) {
-                    int index = regUse - DR_REG_YMM0;
-                    simdUse[index] = true;
-                    // printf("SIMD REG USED: %s\n", get_register_name(regUse)); fflush(stdout);
-                } else if(regUse >= DR_REG_ZMM0 && regUse <= DR_REG_ZMM31) {
-                    int index = regUse - DR_REG_ZMM0;
-                    simdUse[index] = true;
-                    // printf("SIMD REG USED: %s\n", get_register_name(regUse)); fflush(stdout);
-                }
-            }
-        }
-        int num_dsts = instr_num_dsts(instr);
-        for(int i=0; i<num_dsts; ++i) {
-            opnd_t opnd = instr_get_dst(instr, i);
-            for(int j=0; j<opnd_num_regs_used(opnd); ++j) {
-                reg_id_t regDef = opnd_get_reg_used(opnd, j);
-                if(regDef >= DR_REG_XMM0 && regDef <= DR_REG_XMM31) {
-                    int index = regDef - DR_REG_XMM0;
-                    if(!simdUse[index] && !simdIsDead[index]) {
-                        simdIsDead[index] = true;
-                        ++ deadNum;
-                        // printf("SIMD REG DEFINED: %s\n", get_register_name(regDef)); fflush(stdout);
-                    }
-                } else if(regDef >= DR_REG_YMM0 && regDef <= DR_REG_YMM31) {
-                    int index = regDef - DR_REG_YMM0;
-                    if(!simdUse[index] && !simdIsDead[index]) {
-                        simdIsDead[index] = true;
-                        ++ deadNum;
-                        // printf("SIMD REG DEFINED: %s\n", get_register_name(regDef)); fflush(stdout);
-                    }
-                } else if(regDef >= DR_REG_ZMM0 && regDef <= DR_REG_ZMM31) {
-                    int index = regDef - DR_REG_ZMM0;
-                    if(!simdUse[index] && !simdIsDead[index]) {
-                        simdIsDead[index] = true;
-                        ++ deadNum;
-                        // printf("SIMD REG DEFINED: %s\n", get_register_name(regDef)); fflush(stdout);
-                    }
-                }
-            }
-        }
-    }
-    // Aggressive assumption: all not future-used SIMD is dead
-    for(int i=0; i<SIMD_REG_NUM; ++i) {
-        if(!simdUse[i] && !simdIsDead[i]) {
-            simdIsDead[i] = true;
-            ++ deadNum;
-        }
-    }
-    return deadNum;
-}
-
-void reserve_simd_reg(void* drcontext, instrlist_t *ilist, instr_t *where, int size, bool simdIsDead[SIMD_REG_NUM], reg_id_t *reg) {
-    reg_id_t reg_simd_start;
-    switch(size) {
-        case 16:
-            reg_simd_start = DR_REG_XMM0;
-            break;
-        case 32:
-            reg_simd_start = DR_REG_YMM0;
-            break;
-        case 64:
-            reg_simd_start = DR_REG_ZMM0;
-            break;
-        default:
-            assert(0 && "Unknown SIMD size!\n");
-    }
-    for(int i=0; i<SIMD_REG_NUM; ++i) {
-        if(simdIsDead[i]) {
-            *reg = reg_simd_start + i;
-            simdIsDead[i] = false;
-            // printf("Lazy Reserve Success\n"); fflush(stdout);
-            return ;
-        }
-    }
-    assert(0 && "ALL SIMD REG is alive! Spilling has not been implemented!");
-}
-
-void unreserve_simd_reg(void* drcontext, instrlist_t *ilist, instr_t* where, reg_id_t reg) {
-    // TODO: if we spilled, restore the application value of the spilled SIMD register
-}
-
-uint8_t mask[64] __attribute__((aligned(64))) = {   0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
-                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
-                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
-                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
-                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
-                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
-                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
-                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1 };
-
-uint8_t mask_shuf[32] __attribute__((aligned(64))) = { 
-                                         0x00, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 
-                                         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                                         0x00, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 
-                                         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
-
-// SIMD needed
-template<int AccessLen>
-void insertLoadAndComputeRedMap_simd(void* drcontext, instrlist_t *ilist, instr_t *where, reg_id_t reg_base, reg_id_t reg_addr, reg_id_t scratch) {
-    return ;
-    static_assert(AccessLen==16 || AccessLen==32 || AccessLen==64);
-    // printf("insertLoadAndComputeRedMap_simd %d enter\n", AccessLen); fflush(stdout);
-    // disassemble(drcontext, instr_get_app_pc(where), STDOUT);
-    // fflush(stdout);
-    // If we do not use SIMD vectorization, we need AccessLen/64 (2/4/8 for 128/256/512) * 22 ops (for 8bytes computation) to obtain redmap
-    // Total: 28 Ops + (potentially SIMD register spill/restore ops)
-    reg_id_t reg_val, reg_scratch;
-    // Reserve 2 SIMD registers
-    // Here we simply spill two SIMD registers
-    // TODO: 2021/4/22: for better performance, try to track the latest drreg development to enable better lazy SIMD reservation.
-    bool simdIsDead[SIMD_REG_NUM];
-    int deadNum = simdAliveAnalysis(drcontext, ilist, where, simdIsDead);
-    // assert(deadNum >= 2);
-    reserve_simd_reg(drcontext, ilist, where, AccessLen, simdIsDead, &reg_val);
-    reserve_simd_reg(drcontext, ilist, where, AccessLen, simdIsDead, &reg_scratch);
-    // printf("RESERVED SIMD REG: %s\n", get_register_name(reg_val)); fflush(stdout);
-    // printf("RESERVED SIMD REG: %s\n", get_register_name(reg_scratch)); fflush(stdout);
-    // Load data from memory via SIMD instruction
-    // TODO: use aligned memory read if possible
-    switch(AccessLen) {
-        case 16:
-            MINSERT(ilist, where, INSTR_CREATE_vmovdqu(drcontext, opnd_create_reg(reg_val), 
-                opnd_create_base_disp(reg_addr, DR_REG_NULL, 0, 0, OPSZ_16)));
-            break;
-        case 32:
-            MINSERT(ilist, where, INSTR_CREATE_vmovdqu(drcontext, opnd_create_reg(reg_val), 
-                opnd_create_base_disp(reg_addr, DR_REG_NULL, 0, 0, OPSZ_32)));
-            break;
-        case 64:
-            MINSERT(ilist, where, INSTR_CREATE_vmovdqu(drcontext, opnd_create_reg(reg_val), 
-                opnd_create_base_disp(reg_addr, DR_REG_NULL, 0, 0, OPSZ_64)));
-            break;
-        default:
-            assert(0 && "Unknown AccessLen!");
-    }
-    MINSERT(ilist, where, INSTR_CREATE_vmovdqa(drcontext, opnd_create_reg(reg_scratch), opnd_create_reg(reg_val)));
-    // Merge all bits within a byte in parallel
-    // 0x
-    if(AccessLen==16) {
-        MINSERT(ilist, where, INSTR_CREATE_psrlq(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_INT8(1)));
-    } else {
-        MINSERT(ilist, where, INSTR_CREATE_vpsrlq(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_INT8(1), opnd_create_reg(reg_scratch)));
-    }
-    MINSERT(ilist, where, INSTR_CREATE_vpor(drcontext, opnd_create_reg(reg_val), opnd_create_reg(reg_val), opnd_create_reg(reg_scratch)));
-    // 00xx
-    if(AccessLen==16) {
-        MINSERT(ilist, where, INSTR_CREATE_psrlq(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_INT8(2)));
-    } else {
-        MINSERT(ilist, where, INSTR_CREATE_vpsrlq(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_INT8(2), opnd_create_reg(reg_scratch)));
-    }
-    MINSERT(ilist, where, INSTR_CREATE_vpor(drcontext, opnd_create_reg(reg_val), opnd_create_reg(reg_val), opnd_create_reg(reg_scratch)));
-    // 0000xxxx
-    if(AccessLen==16) {
-        MINSERT(ilist, where, INSTR_CREATE_psrlq(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_INT8(4)));
-    } else {
-        MINSERT(ilist, where, INSTR_CREATE_vpsrlq(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_INT8(4), opnd_create_reg(reg_scratch)));
-    }
-    MINSERT(ilist, where, INSTR_CREATE_vpor(drcontext, opnd_create_reg(reg_val), opnd_create_reg(reg_val), opnd_create_reg(reg_scratch)));
-    // x = (~x) & broadcast(0x01)
-    switch (AccessLen) {
-        case 16: {
-            // We directly load the simd mask from memory
-            MINSERT(ilist, where, INSTR_CREATE_vmovdqa(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_ABSMEM(mask, OPSZ_16)));
-            break ;
-        }
-        case 32: {
-            // We directly load the simd mask from memory
-            MINSERT(ilist, where, INSTR_CREATE_vmovdqa(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_ABSMEM(mask, OPSZ_32)));
-            break ;
-        }
-        case 64: {
-            // We directly load the simd mask from memory
-            MINSERT(ilist, where, INSTR_CREATE_vmovdqa(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_ABSMEM(mask, OPSZ_64)));
-            break ;
-        }
-    }
-    MINSERT(ilist, where, INSTR_CREATE_vpandn(drcontext, opnd_create_reg(reg_val), opnd_create_reg(reg_val), opnd_create_reg(reg_scratch)));
-    // Now SIMD reg_val contains the collected bitmap for each byte, we now narrow them into each 64-bit element in this packed SIMD register
-    // x = (x>>7 | x)
-    MINSERT(ilist, where, INSTR_CREATE_vmovdqa(drcontext, opnd_create_reg(reg_scratch), opnd_create_reg(reg_val)));
-    if(AccessLen==16) {
-        MINSERT(ilist, where, INSTR_CREATE_psrlq(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_INT8(7)));
-    } else {
-        MINSERT(ilist, where, INSTR_CREATE_vpsrlq(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_INT8(7), opnd_create_reg(reg_scratch)));
-    }
-    MINSERT(ilist, where, INSTR_CREATE_vpor(drcontext, opnd_create_reg(reg_val), opnd_create_reg(reg_val), opnd_create_reg(reg_scratch)));
-    // x = (x>>14 | x)
-    MINSERT(ilist, where, INSTR_CREATE_vmovdqa(drcontext, opnd_create_reg(reg_scratch), opnd_create_reg(reg_val)));
-    if(AccessLen==16) {
-        MINSERT(ilist, where, INSTR_CREATE_psrlq(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_INT8(14)));
-    } else {
-        MINSERT(ilist, where, INSTR_CREATE_vpsrlq(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_INT8(14), opnd_create_reg(reg_scratch)));
-    }
-    MINSERT(ilist, where, INSTR_CREATE_vpor(drcontext, opnd_create_reg(reg_val), opnd_create_reg(reg_val), opnd_create_reg(reg_scratch)));
-    // x = (x>>28 | x)
-    MINSERT(ilist, where, INSTR_CREATE_vmovdqa(drcontext, opnd_create_reg(reg_scratch), opnd_create_reg(reg_val)));
-    if(AccessLen==16) {
-        MINSERT(ilist, where, INSTR_CREATE_psrlq(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_INT8(28)));
-    } else {
-        MINSERT(ilist, where, INSTR_CREATE_vpsrlq(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_INT8(28), opnd_create_reg(reg_scratch)));
-    }
-    MINSERT(ilist, where, INSTR_CREATE_vpor(drcontext, opnd_create_reg(reg_val), opnd_create_reg(reg_val), opnd_create_reg(reg_scratch)));
-    // After narrowed them by 64-bit elementwise merging, the lowest byte of each element contains the collected redmap, so we can now narrow
-    // them by select (bytewise permutation).
-    // x = permuteb(x, {0,8,...})
-    switch (AccessLen) {
-        case 16: {
-            // shuffle: [...clear...] [72:64] [8:0]
-            // We directly load the simd mask from memory
-            MINSERT(ilist, where, INSTR_CREATE_vmovdqa(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_ABSMEM(mask_shuf, OPSZ_16)));
-            MINSERT(ilist, where, INSTR_CREATE_vpshufb(drcontext, opnd_create_reg(reg_val), opnd_create_reg(reg_val), opnd_create_reg(reg_scratch)));
-            // now store the lower 32-bits into target (INOUT) reg_addr register
-            MINSERT(ilist, where, INSTR_CREATE_vmovq(drcontext, opnd_create_reg(reg_addr), opnd_create_reg(reg_val)));
-            break;
-        }
-        case 32: {
-            // shuffle: [...clear...] [200:192] [136:128] | [...clear...] [72:64] [8:0]
-            // We directly load the simd mask from memory
-            MINSERT(ilist, where, INSTR_CREATE_vmovdqa(drcontext, opnd_create_reg(reg_scratch), OPND_CREATE_ABSMEM(mask_shuf, OPSZ_32)));
-            MINSERT(ilist, where, INSTR_CREATE_vpshufb(drcontext, opnd_create_reg(reg_val), opnd_create_reg(reg_val), opnd_create_reg(reg_scratch)));
-            // As shuffle is performed per lane, so we need further merging
-            // 1. permutation to merge two lanes into the first lane: 8 = (10) (00) -> [...] [192:128] [64:0]
-            MINSERT(ilist, where, INSTR_CREATE_vpermpd(drcontext, opnd_create_reg(reg_val), opnd_create_reg(reg_val), OPND_CREATE_INT8(8)));
-            // 2. shuffle again for narrowing into lower 64-bit value, here we reuse the previously loaded mask in simd scratch register
-            MINSERT(ilist, where, INSTR_CREATE_vpshufb(drcontext, opnd_create_reg(reg_val), opnd_create_reg(reg_val), opnd_create_reg(reg_scratch)));
-            // now store the lower 64-bits into target (INOUT) reg_addr register
-            MINSERT(ilist, where, INSTR_CREATE_vmovq(drcontext, opnd_create_reg(reg_addr), opnd_create_reg(reg_val-DR_REG_YMM0+DR_REG_XMM0)));
-            break;
-        }
-        case 64:
-            assert(0 && "Currently we do not support inlined operation for AVX512! Use cleancall!\n");
-            break;
-        default:
-            assert(0 && "Unknown AccessLen");
-            break;
-    }
-    // Store back
-    MINSERT(ilist, where, XINST_CREATE_store(drcontext,
-                OPND_CREATE_MEM64(reg_base, offsetof(val_cache_t, redmap)),
-                opnd_create_reg(reg_addr)));
-    // Unreserve 2 SIMD registers
-    unreserve_simd_reg(drcontext, ilist, where, reg_val);
-    unreserve_simd_reg(drcontext, ilist, where, reg_scratch);
-    // printf("insertLoadAndComputeRedMap_simd %d exit\n", AccessLen); fflush(stdout);
-}
-
-void insertComputeAndCacheRedmap_INT(void* drcontext, instrlist_t *ilist, instr_t *where, uint8_t accessLen,
-                         INOUT reg_id_t reg_base, INOUT reg_id_t reg_addr, OUT reg_id_t scratch) {
-    switch(accessLen) {
-        case 1:
-            // As we do not need reg_addr after loading values, we overlap the reg_addr and reg_val with the same register
-            insertLoadAndComputeRedMap_1byte<true>(drcontext, ilist, where, reg_base, reg_addr, 0, reg_addr, scratch);
-            break ;
-        case 2:
-            // As we do not need reg_addr after loading values, we overlap the reg_addr and reg_val with the same register
-            insertLoadAndComputeRedMap_2bytes<true>(drcontext, ilist, where, reg_base, reg_addr, 0, reg_addr, scratch);
-            break ;
-        case 4:
-            // As we do not need reg_addr after loading values, we overlap the reg_addr and reg_val with the same register
-            insertLoadAndComputeRedMap_4bytes<true>(drcontext, ilist, where, reg_base, reg_addr, 0, reg_addr, scratch);
-            break ;
-        case 8:
-            // As we do not need reg_addr after loading values, we overlap the reg_addr and reg_val with the same register
-            insertLoadAndComputeRedMap_8bytes<true>(drcontext, ilist, where, reg_base, reg_addr, 0, reg_addr, scratch);
-            break ;
-        case 16:
-            insertLoadAndComputeRedMap_simd<16>(drcontext, ilist, where, reg_base, reg_addr, scratch);
-            break;
-        case 32:
-            insertLoadAndComputeRedMap_simd<32>(drcontext, ilist, where, reg_base, reg_addr, scratch);
-            break;
-        case 64:
-            insertLoadAndComputeRedMap_simd<64>(drcontext, ilist, where, reg_base, reg_addr, scratch);
-            break;
-        default:
-            {
-                printf("insertComputeAndCacheRedmap_INT default: accessLen=%d enter\n", accessLen); fflush(stdout);
-                int i=0;
-                reg_id_t reg_val;
-                reg_id_t reg_redmap;
-                RESERVE_REG(drcontext, ilist, where, NULL, reg_val);
-                RESERVE_REG(drcontext, ilist, where, NULL, reg_redmap);
-                MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(reg_redmap), OPND_CREATE_CCT_INT(0)));
-                while(i+8<=accessLen) {
-                    insertLoadAndComputeRedMap_8bytes<false>(drcontext, ilist, where, reg_base, reg_addr, i, reg_val, scratch);
-                    if(i!=0) {
-                        MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(reg_val), OPND_CREATE_INT8(i)));
-                    }
-                    MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_redmap), opnd_create_reg(reg_val)));
-                    i+=8;
-                }
-                while(i+4<=accessLen) {
-                    insertLoadAndComputeRedMap_4bytes<false>(drcontext, ilist, where, reg_base, reg_addr, i, reg_val, scratch);
-                    if(i!=0) {
-                        MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(reg_val), OPND_CREATE_INT8(i)));
-                    }
-                    MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_redmap), opnd_create_reg(reg_val)));
-                    i+=4;
-                }
-                while(i+2<=accessLen) {
-                    insertLoadAndComputeRedMap_2bytes<false>(drcontext, ilist, where, reg_base, reg_addr, i, reg_val, scratch);
-                    if(i!=0) {
-                        MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(reg_val), OPND_CREATE_INT8(i)));
-                    }
-                    MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_redmap), opnd_create_reg(reg_val)));
-                    i+=2;
-                }
-                while(i+1<=accessLen) {
-                    insertLoadAndComputeRedMap_1byte<false>(drcontext, ilist, where, reg_base, reg_addr, i, reg_val, scratch);
-                    if(i!=0) {
-                        MINSERT(ilist, where, XINST_CREATE_slr_s(drcontext, opnd_create_reg(reg_val), OPND_CREATE_INT8(i)));
-                    }
-                    MINSERT(ilist, where, INSTR_CREATE_or(drcontext, opnd_create_reg(reg_redmap), opnd_create_reg(reg_val)));
-                    i++;
-                }
-                MINSERT(ilist, where, XINST_CREATE_store(drcontext,
-                            OPND_CREATE_MEM64(reg_base, offsetof(val_cache_t, redmap)),
-                            opnd_create_reg(reg_redmap)));
-                UNRESERVE_REG(drcontext, ilist, where, reg_val);
-                UNRESERVE_REG(drcontext, ilist, where, reg_redmap);
-                printf("insertComputeAndCacheRedmap_INT default: accessLen=%d exit\n", accessLen); fflush(stdout);
-            }
-    }
-    return ;
-}
-
-#ifdef USE_TIMER
-bool global_sample_flag = true;
-#define IS_SAMPLED(pt, a) (global_sample_flag)
-#else
-    #ifdef USE_CLEANCALL
-    #define IS_SAMPLED(pt, WINDOW_ENABLE) (pt->sampleFlag)
-    #else
-    #define IS_SAMPLED(pt, WINDOW_ENABLE) ((int64_t)(BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR))<(int64_t)WINDOW_ENABLE)
-    #endif
-#endif
 file_t gFile;
 static void *gLock;
 #ifndef _WERROR
@@ -818,42 +243,223 @@ uint64_t grandTotBytesLoad = 0;
 uint64_t grandTotBytesRedLoad = 0;
 uint64_t grandTotBytesApproxRedLoad = 0;
 
+/****************************************************************************************/
+inline __attribute__((always_inline)) uint64_t count_zero_bytemap_int8(uint8_t * addr) {
+    return addr[0]==0?1:0;
+    // register uint8_t xx = *((uint8_t*)addr);
+    // // reduce by bits until byte level
+    // // xx = xx | (xx>>1) | (xx>>2) | (xx>>3) | (xx>>4) | (xx>>5) | (xx>>6) | (xx>>7);
+    // xx = xx | (xx>>1);
+    // xx = xx | (xx>>2);
+    // xx = xx | (xx>>4);
+    // // now xx is byte level reduced, check if it is zero and mask the unused bits
+    // xx = (~xx) & 0x1;
+    // return xx;
+}
+inline __attribute__((always_inline)) uint64_t count_zero_bytemap_int16(uint8_t * addr) {
+    register uint16_t xx = *((uint16_t*)addr);
+    // reduce by bits until byte level
+    // xx = xx | (xx>>1) | (xx>>2) | (xx>>3) | (xx>>4) | (xx>>5) | (xx>>6) | (xx>>7);
+    xx = xx | (xx>>1);
+    xx = xx | (xx>>2);
+    xx = xx | (xx>>4);
+    // now xx is byte level reduced, check if it is zero and mask the unused bits
+    xx = (~xx) & 0x101;
+    // narrowing
+    xx = xx | (xx>>7);
+    xx = xx & 0x3;
+    return xx;
+}
+inline __attribute__((always_inline)) uint64_t count_zero_bytemap_int32(uint8_t * addr) {
+    register uint32_t xx = *((uint32_t*)addr);
+    // reduce by bits until byte level
+    // xx = xx | (xx>>1) | (xx>>2) | (xx>>3) | (xx>>4) | (xx>>5) | (xx>>6) | (xx>>7);
+    xx = xx | (xx>>1);
+    xx = xx | (xx>>2);
+    xx = xx | (xx>>4);
+    // now xx is byte level reduced, check if it is zero and mask the unused bits
+    xx = (~xx) & 0x1010101;
+    // narrowing
+    xx = xx | (xx>>7);
+    xx = xx | (xx>>14);
+    xx = xx & 0xf;
+    return xx;
+}
+inline __attribute__((always_inline)) uint64_t count_zero_bytemap_int64(uint8_t * addr) {
+    register uint64_t xx = *((uint64_t*)addr);
+    // reduce by bits until byte level
+    // xx = xx | (xx>>1) | (xx>>2) | (xx>>3) | (xx>>4) | (xx>>5) | (xx>>6) | (xx>>7);
+    xx = xx | (xx>>1);
+    xx = xx | (xx>>2);
+    xx = xx | (xx>>4);
+    // now xx is byte level reduced, check if it is zero and mask the unused bits
+    xx = (~xx) & 0x101010101010101LL;
+    // narrowing
+    xx = xx | (xx>>7);
+    xx = xx | (xx>>14);
+    xx = xx | (xx>>28);
+    xx = xx & 0xff;
+    return xx;
+}
+#ifdef USE_SIMD
+uint8_t mask[64] __attribute__((aligned(64))) = {   0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 
+                                                    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1 };
+
+uint8_t mask_shuf[32] __attribute__((aligned(64))) = { 
+                                         0x00, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 
+                                         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                                         0x00, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 
+                                         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+
+inline __attribute__((always_inline)) uint64_t count_zero_bytemap_int128(uint8_t * addr) {
+    uint64_t xx;
+    __m128i mmx, tmp;
+    // load 128-bit val
+    mmx = _mm_loadu_si128((__m128i*)addr);
+    // Merge all bits within a byte in parallel
+    // 0x
+    tmp = _mm_srli_epi64 (mmx, 1);
+    mmx = _mm_or_si128(mmx, tmp);
+    // 00xx
+    tmp = _mm_srli_epi64 (mmx, 2);
+    mmx = _mm_or_si128(mmx, tmp);
+    // 0000xxxx
+    tmp = _mm_srli_epi64 (mmx, 4);
+    mmx = _mm_or_si128(mmx, tmp);
+    // x = (~x) & broadcast(0x01)
+    // the mask is already aligned
+    tmp = _mm_load_si128((__m128i*)mask);
+    mmx = _mm_andnot_si128(mmx, tmp);
+    /* Now SIMD reg_val contains the collected bitmap for each byte, we now
+       narrow them into each 64-bit element in this packed SIMD register*/
+    // x = (x>>7 | x)
+    tmp = _mm_srli_epi64 (mmx, 7);
+    mmx = _mm_or_si128(mmx, tmp);
+    // x = (x>>14 | x)
+    tmp = _mm_srli_epi64 (mmx, 14);
+    mmx = _mm_or_si128(mmx, tmp);
+    // x = (x>>28 | x)
+    tmp = _mm_srli_epi64 (mmx, 28);
+    mmx = _mm_or_si128(mmx, tmp);
+    /* After narrowed them by 64-bit elementwise merging, the lowest byte of
+      each element contains the collected redmap, so we can now narrow them
+      by select (bytewise permutation).*/
+    // x = permuteb(x, {0,8,...})
+    // shuffle: [...clear...] [72:64] [8:0]
+    // We directly load the simd mask from memory
+    tmp = _mm_load_si128((__m128i*)mask_shuf);
+    mmx = _mm_shuffle_epi8(mmx, tmp);
+    // now store the lower 16-bits into target (INOUT) register
+    union U128I {
+        __m128i  v;
+        uint16_t e[8];
+    } cast;
+    cast.v = mmx;
+    xx = (uint64_t)cast.e[0];
+    return xx;
+}
+
+inline __attribute__((always_inline)) uint64_t count_zero_bytemap_int256(uint8_t * addr) {
+    uint64_t xx;
+    __m256i mmx, tmp;
+    // Load data from memory via SIMD instruction
+    mmx = _mm256_loadu_si256((__m256i*)addr);
+    // Merge all bits within a byte in parallel
+    // 0x
+    tmp = _mm256_srli_epi64(mmx, 1);
+    mmx = _mm256_or_si256(mmx, tmp);
+    // 00xx
+    tmp = _mm256_srli_epi64(mmx, 2);
+    mmx = _mm256_or_si256(mmx, tmp);
+    // 0000xxxx
+    tmp = _mm256_srli_epi64(mmx, 4);
+    mmx = _mm256_or_si256(mmx, tmp);
+    // x = (~x) & broadcast(0x01)
+    tmp = _mm256_load_si256((__m256i*)mask);
+    mmx = _mm256_andnot_si256(mmx, tmp);
+    /* Now SIMD reg_val contains the collected bitmap for each byte, we now
+       narrow them into each 64-bit element in this packed SIMD register*/
+    // x = (x>>7 | x)
+    tmp = _mm256_srli_epi64 (mmx, 7);
+    mmx = _mm256_or_si256(mmx, tmp);
+    // x = (x>>14 | x)
+    tmp = _mm256_srli_epi64 (mmx, 14);
+    mmx = _mm256_or_si256(mmx, tmp);
+    // x = (x>>28 | x)
+    tmp = _mm256_srli_epi64 (mmx, 28);
+    mmx = _mm256_or_si256(mmx, tmp);
+    /* After narrowed them by 64-bit elementwise merging, the lowest byte of
+      each element contains the collected redmap, so we can now narrow them
+      by select (bytewise permutation).*/
+    // x = permuteb(x, {0,8,...})
+    // shuffle: [...clear...] [200:192] [136:128] | [...clear...] [72:64] [8:0]
+    // We directly load the simd mask from memory
+    tmp = _mm256_load_si256((__m256i*)mask_shuf);
+    mmx = _mm256_shuffle_epi8(mmx, tmp);
+    // As shuffle is performed per lane, so we need further merging
+    // 1. permutation to merge two lanes into the first lane: 8 = (10) (00) -> [...] [192:128] [64:0]
+    mmx = _mm256_permute4x64_epi64(mmx, 8);
+    // 2. shuffle again for narrowing into lower 64-bit value, here we reuse the previously loaded mask in simd scratch register
+    mmx = _mm256_shuffle_epi8(mmx, tmp);
+    // now store the lower 32-bits into target (INOUT) register
+    union U256I {
+        __m256i  v;
+        uint32_t e[8];
+    } cast;
+    cast.v = mmx;
+    xx = (uint64_t)cast.e[0];
+    return xx;
+}
+#endif
 /*******************************************************************************************/
-static inline void AddToRedTable(uint64_t key,  uint16_t value, uint64_t byteMap, uint16_t total, per_thread_t *pt) __attribute__((always_inline,flatten));
-static inline void AddToRedTable(uint64_t key,  uint16_t value, uint64_t byteMap, uint16_t total, per_thread_t *pt) {
-    unordered_map<uint64_t, INTRedLogs>::iterator it = pt->INTRedMap->find(key);
-    if ( it  == pt->INTRedMap->end()) {
-        INTRedLogs log;
-        log.red = value;
-        log.tot = total;
-        log.fred= (value==total);
-        log.redByteMap = byteMap;
-        (*pt->INTRedMap)[key] = log;
+inline __attribute__((always_inline)) void AddINTRedLog(uint64_t ctxt_hndl, uint64_t accessLen, uint64_t redZero, uint64_t fred, uint64_t redByteMap, per_thread_t* pt) {
+    //uint64_t key = MAKE_KEY(ctxt_hndl, 0/*elementSize, not used*/, accessLen);
+    INTRedLogMap_t::iterator it = pt->INTRedLogMap->find(ctxt_hndl);
+    if(it==pt->INTRedLogMap->end()) {
+        INTRedLog_t log_ptr = { ENCODE_TO_UPPER(accessLen, accessLen), redZero, fred, redByteMap };
+        (*pt->INTRedLogMap)[ctxt_hndl] = log_ptr;
     } else {
-        it->second.red += value;
-        it->second.tot += total;
-        it->second.fred+= (value==total);
-        it->second.redByteMap &= byteMap;
+        it->second.tot += accessLen;
+        it->second.red += redZero;
+        it->second.fred += fred;
+        it->second.redByteMap &= redByteMap;
     }
 }
 
-static inline void AddToApproximateRedTable(uint64_t key, uint64_t byteMap, uint16_t total, uint16_t zeros, uint16_t nums, uint8_t size, per_thread_t *pt) __attribute__((always_inline,flatten));
-static inline void AddToApproximateRedTable(uint64_t key, uint64_t byteMap, uint16_t total, uint16_t zeros, uint16_t nums, uint8_t size, per_thread_t *pt) {
-    unordered_map<uint64_t, FPRedLogs>::iterator it = pt->FPRedMap->find(key);
-    if ( it  == pt->FPRedMap->end()) {
-        FPRedLogs log;
-        log.fred= zeros;
-        log.ftot= nums;
-        log.redByteMap = byteMap;
-        log.AccessLen = total;
-        log.size = size;
-        (*pt->FPRedMap)[key] = log;
-    } else {
-        it->second.fred+= zeros;
-        it->second.ftot+= nums;
-        it->second.redByteMap &= byteMap;
-    }
-}
+static const unsigned char BitCountTable4[] __attribute__ ((aligned(64))) = {
+    0, 0, 1, 2
+};
+
+static const unsigned char BitCountTable16[] __attribute__ ((aligned(64))) = {
+    0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 2, 2, 3, 4
+};
+
+static const unsigned char BitCountTable256[] __attribute__ ((aligned(64))) = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 
+    4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 7, 8
+};
+
 /*******************************************************************************************/
 // single floating point zero byte counter
 // 32-bit float: |sign|exp|mantissa| = | 1 | 8 | 23 |
@@ -911,185 +517,405 @@ inline __attribute__((always_inline)) bool hasRedundancy_dp(void * addr) {
     return (xx & 0x000f000000000000LL)==0;
 }
 /***************************************************************************************/
-/*********************** floating point full redundancy functions **********************/
+
+template<int start, int end, int step>
+struct UnrolledFunctions {
+    static inline __attribute__((always_inline)) int getFullyRedundantZeroFP(void* pval) {
+        switch(step) {
+            case 4:
+                return (((*reinterpret_cast<uint32_t*>(((uint8_t*)pval)+start))&0x7fffffffLL)==0?1:0)
+                    + UnrolledFunctions<start+step, end, step>::getFullyRedundantZeroFP(pval);
+            case 8:
+                return (((*reinterpret_cast<uint64_t*>(((uint8_t*)pval)+start))&0x7fffffffffffffffLL)==0?1:0)
+                    + UnrolledFunctions<start+step, end, step>::getFullyRedundantZeroFP(pval);
+        }
+        assert(0);
+        return 0;
+    }
+    static inline __attribute__((always_inline)) void mergeRedByteMapFP(void* redByteMap, void* pval) {
+        switch(step) {
+            case 4:
+                reinterpret_cast<uint32_t*>(redByteMap)[start] |= reinterpret_cast<uint32_t*>(pval)[start];
+                break;
+            case 8:
+                reinterpret_cast<uint64_t*>(redByteMap)[start] |= reinterpret_cast<uint64_t*>(pval)[start];
+                break;
+            default:
+                assert(0 && "Unknown type size!\n");
+        }
+        UnrolledFunctions<start+step, end, step>::mergeRedByteMapFP(redByteMap, pval);
+    }
+    static inline __attribute__((always_inline)) void memcpy(void* dst, void* src) {
+        switch(step) {
+            case 4:
+                reinterpret_cast<uint32_t*>(dst)[start] = reinterpret_cast<uint32_t*>(src)[start];
+                break;
+            case 8:
+                reinterpret_cast<uint64_t*>(dst)[start] = reinterpret_cast<uint64_t*>(src)[start];
+                break;
+            default:
+                assert(0 && "Unknown type size!\n");
+        }
+        UnrolledFunctions<start+step, end, step>::memcpy(dst, src);
+    }
+    static __attribute__((always_inline)) uint64_t BodyRedNum(uint64_t rmap){
+        static_assert(start < end);
+        if(step==1)
+            return ((start==0) ? (rmap&0x1) : ((rmap>>start)&0x1)) + (UnrolledFunctions<start+step,end,step>::BodyRedNum(rmap));
+        else if(step==2)
+            return ((start==0) ? BitCountTable4[rmap&0x3] : BitCountTable4[(rmap>>start)&0x3]) + (UnrolledFunctions<start+step,end,step>::BodyRedNum(rmap));
+        else if(step==4)
+            return ((start==0) ? BitCountTable16[rmap&0xf] : BitCountTable16[(rmap>>start)&0xf]) + (UnrolledFunctions<start+step,end,step>::BodyRedNum(rmap));
+        else if(step==8)
+            return ((start==0) ? BitCountTable256[rmap&0xff] : BitCountTable256[(rmap>>start)&0xff]) + (UnrolledFunctions<start+step,end,step>::BodyRedNum(rmap));
+        return 0;
+    }
+    static __attribute__((always_inline)) uint64_t BodyRedMapFP(uint8_t* addr){
+        if(step==4)
+            return count_zero_bytemap_fp((void*)(addr+start)) | (UnrolledFunctions<start+step,end,step>::BodyRedMapFP(addr)<<SP_MAP_SIZE);
+        else if(step==8)
+            return count_zero_bytemap_dp((void*)(addr+start)) | (UnrolledFunctions<start+step,end,step>::BodyRedMapFP(addr)<<DP_MAP_SIZE);
+        else
+            assert(0 && "Not Supportted floating size! now only support for FP32 or FP64.");
+        return 0;
+    }
+    static __attribute__((always_inline)) uint64_t BodyHasRedundancy(uint8_t* addr){
+        if(step==4)
+            return hasRedundancy_fp((void*)(addr+start)) || (UnrolledFunctions<start+step,end,step>::BodyHasRedundancy(addr));
+        else if(step==8)
+            return hasRedundancy_dp((void*)(addr+start)) || (UnrolledFunctions<start+step,end,step>::BodyHasRedundancy(addr));
+        else
+            assert(0 && "Not Supportted floating size! now only support for FP32 or FP64.");
+        return 0;
+    }
+};
+
+template<int end, int step>
+struct UnrolledFunctions<end, end, step> {
+    static inline __attribute__((always_inline)) int getFullyRedundantZeroFP(void* pval) {
+        return 0;
+    }
+    static inline __attribute__((always_inline)) void mergeRedByteMapFP(void* redByteMap, void* pval) {
+        return ;
+    }
+    static inline __attribute__((always_inline)) void memcpy(void* dst, void* src) {
+        return ;
+    }
+    static inline __attribute__((always_inline)) uint64_t BodyRedNum(uint64_t rmap) {
+        return 0;
+    }
+    static __attribute__((always_inline)) uint64_t BodyRedMapFP(uint8_t* addr){
+        return 0;
+    }
+    static __attribute__((always_inline)) uint64_t BodyHasRedundancy(uint8_t* addr){
+        return 0;
+    }
+};
+
+template<int esize, int size>
+inline __attribute__((always_inline)) void AddFPRedLog(uint64_t ctxt_hndl, void* pval, per_thread_t* pt) {
+    //uint64_t key = MAKE_KEY(ctxt_hndl, esize, size);
+    FPRedLogMap_t::iterator it = pt->FPRedLogMap->find(ctxt_hndl);
+    bool hasRedundancy = UnrolledFunctions<0, size, esize>::BodyHasRedundancy((uint8_t*)pval);
+    if(it==pt->FPRedLogMap->end()) {
+        FPRedLog_t log_ptr;
+        log_ptr.ftot = ENCODE_TO_UPPER(size, size/esize);
+        if(hasRedundancy) {
+            uint64_t fred = UnrolledFunctions<0, size, esize>::getFullyRedundantZeroFP(pval);
+            log_ptr.fred = ENCODE_TO_UPPER(esize, fred);
+            log_ptr.redByteMap = UnrolledFunctions<0,size,esize>::BodyRedMapFP((uint8_t*)pval);
+        } else {
+            log_ptr.fred = ENCODE_TO_UPPER(esize, 0);
+            log_ptr.redByteMap = 0;
+        }
+        //UnrolledFunctions<0, size, esize>::memcpy(log_ptr.redByteMap, pval);
+        (*pt->FPRedLogMap)[ctxt_hndl] = log_ptr;
+    } else {
+        it->second.ftot += size/esize;
+        if(hasRedundancy) {
+            it->second.fred += UnrolledFunctions<0, size, esize>::getFullyRedundantZeroFP(pval);
+            if(it->second.redByteMap) {
+                it->second.redByteMap &= UnrolledFunctions<0,size,esize>::BodyRedMapFP((uint8_t*)pval);
+            }
+        }
+    }
+}
+
+template<int accessLen, int elementSize>
+inline __attribute__((always_inline))
+void CheckAndInsertIntPage_impl(int32_t ctxt_hndl, void* addr, per_thread_t *pt) {
+    // update info
+    uint8_t* bytes = reinterpret_cast<uint8_t*>(addr);
+    if(bytes[accessLen-1]!=0) {
+        // the log have already been clear to 0, so we do nothing here and quick return.
+        AddINTRedLog(ctxt_hndl, accessLen, 0, 0, 0, pt);
+        return ;
+    }
+    uint64_t redByteMap;
+    switch(accessLen) {
+        case 1:
+            redByteMap = count_zero_bytemap_int8(bytes);
+            break;
+        case 2:
+            redByteMap = count_zero_bytemap_int16(bytes);
+            break;
+        case 4:
+            redByteMap = count_zero_bytemap_int32(bytes);
+            break;
+        case 8:
+            redByteMap = count_zero_bytemap_int64(bytes);
+            break;
+        case 16:
+#ifdef USE_SIMD
+            redByteMap = count_zero_bytemap_int128(bytes);
+#else
+            redByteMap = count_zero_bytemap_int64(bytes) |
+                        (count_zero_bytemap_int64(bytes+8)<<8);
+#endif
+            break;
+        case 32:
+#ifdef USE_SIMD
+            redByteMap = count_zero_bytemap_int256(bytes);
+#else
+            redByteMap = count_zero_bytemap_int64(bytes) |
+                        (count_zero_bytemap_int64(bytes+8)<<8) |
+                        (count_zero_bytemap_int64(bytes+16)<<16) |
+                        (count_zero_bytemap_int64(bytes+24)<<24);
+#endif
+            break;
+        default:
+            assert(0 && "UNKNOWN ACCESSLEN!\n");
+    }
+#ifdef USE_SSE
+    if(elementSize==1) {
+        uint64_t redZero = _mm_popcnt_u64(redByteMap);
+        AddINTRedLog(ctxt_hndl, accessLen, redZero, redZero, redByteMap, pt);
+    } else {
+        // accessLen == elementSize
+        uint64_t redByteMap_2 = (~redByteMap) & ((1LL<<accessLen)-1);
+        uint64_t redZero = _lzcnt_u64(redByteMap_2) - (64-accessLen);
+        AddINTRedLog(ctxt_hndl, accessLen, redZero, redZero==accessLen?1:0, redByteMap, pt);
+    }
+#else
+    uint64_t redZero = UnrolledFunctions<0, accessLen, elementSize>::BodyRedNum(redByteMap);
+    if(elementSize==1) {
+        AddINTRedLog(ctxt_hndl, accessLen, redZero, redZero, redByteMap, pt);
+    } else {
+        AddINTRedLog(ctxt_hndl, accessLen, redZero, redZero==accessLen?1:0, redByteMap, pt);
+    }
+#endif
+}
+
+template<int accessLen, int elementSize, bool enable_cache>
+void CheckAndInsertIntPage(int slot, void* addr) {
+    static_assert(  accessLen==1 || 
+                    accessLen==2 || 
+                    accessLen==4 || 
+                    accessLen==8 || 
+                    accessLen==16 || 
+                    accessLen==32);
+    static_assert(  accessLen==elementSize || elementSize==1  );
+    void *drcontext = dr_get_current_drcontext();
+    per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+    context_handle_t ctxt_hndl = drcctlib_get_context_handle(drcontext, slot);
+    CheckAndInsertIntPage_impl<accessLen, elementSize>(ctxt_hndl, addr, pt);
+}
+
+template<bool enable_cache>
+void CheckLargeAndInsertIntPage(int slot, void* addr, int accessLen) {
+    void *drcontext = dr_get_current_drcontext();
+    per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+    context_handle_t ctxt_hndl = drcctlib_get_context_handle(drcontext, slot);
+    uint64_t redByteMap=0;
+    uint8_t* bytes = reinterpret_cast<uint8_t*>(addr);
+    int i=0;
+    while(i<accessLen) {
+        redByteMap |= count_zero_bytemap_int64(&bytes[i])<<i;
+        i += 8;
+    }
+    while(i<accessLen) {
+        redByteMap |= count_zero_bytemap_int32(&bytes[i])<<i;
+        i += 4;
+    }
+    while(i<accessLen) {
+        redByteMap |= count_zero_bytemap_int16(&bytes[i])<<i;
+        i += 2;
+    }
+    while(i<accessLen) {
+        redByteMap |= count_zero_bytemap_int8(&bytes[i])<<i;
+        i += 1;
+    }
+#ifdef USE_SSE
+    uint64_t redZero = _mm_popcnt_u64(redByteMap);
+#else
+    // now redmap is calculated, count for redundancy
+    bool counting = true;
+    register uint64_t redZero = 0;
+    int restLen = accessLen;
+    while(counting && restLen>=8) {
+        restLen -= 8;
+        register uint8_t t = BitCountTable256[(redByteMap>>restLen)&0xff];
+        redZero += t;
+        if(t!=8) {
+            counting = false;
+            break;
+        }
+    }
+    while(counting && restLen>=4) {
+        restLen -= 4;
+        register uint8_t t = BitCountTable16[(redByteMap>>restLen)&0xf];
+        redZero += t;
+        if(t!=4) {
+            counting = false;
+            break;
+        }
+    }
+    while(counting && restLen>=2) {
+        restLen -= 2;
+        register uint8_t t = BitCountTable4[(redByteMap>>restLen)&0x3];
+        redZero += t;
+        if(t!=8) {
+            counting = false;
+            break;
+        }
+    }
+    // dont check here as this loop must execute only once
+    while(counting && restLen>=1) {
+        restLen -= 1;
+        register uint8_t t = (redByteMap>>restLen)&0x1;
+        redZero += t;
+    }
+#endif
+    AddINTRedLog(ctxt_hndl, accessLen, redZero, redZero, redByteMap, pt);
+}
+
+template<int accessLen, int elementSize, bool enable_cache>
+void CheckAndInsertFpPage(int slot, void* addr) {
+    static_assert(  accessLen==4 || 
+                    accessLen==8 || 
+                    accessLen==16 || 
+                    accessLen==32);
+    static_assert(  elementSize==4 || elementSize==8  );
+    void *drcontext = dr_get_current_drcontext();
+    per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+    context_handle_t ctxt_hndl = drcctlib_get_context_handle(drcontext, slot);
+    AddFPRedLog<elementSize, accessLen>(ctxt_hndl, addr, pt);
+}
+
+#ifdef X86
+template<uint32_t AccessLen, uint32_t ElemLen, bool isApprox, bool enable_sampling>
+void CheckNByteValueAfterVGather(int slot, instr_t* instr)
+{
+    static_assert(ElemLen==4 || ElemLen==8);
+    void *drcontext = dr_get_current_drcontext();
+    context_handle_t ctxt_hndl = drcctlib_get_context_handle(drcontext, slot);
+    per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+    if(enable_sampling) {
+        if(!IS_SAMPLED(pt, window_enable)) {
+            return ;
+        }
+    }
+    dr_mcontext_t mcontext;
+    mcontext.size = sizeof(mcontext);
+    mcontext.flags= DR_MC_ALL;
+    DR_ASSERT(dr_get_mcontext(drcontext, &mcontext));
+#ifdef DEBUG_VGATHER
+    printf("\n^^ CheckNByteValueAfterVGather: ");
+    disassemble(drcontext, instr_get_app_pc(instr), 1/*sdtout file desc*/);
+    printf("\n");
+#endif
+    if(isApprox) {
+        app_pc addr;
+        bool is_write;
+        uint32_t pos;
+        for( int index=0; instr_compute_address_ex_pos(instr, &mcontext, index, &addr, &is_write, &pos); ++index ) {
+            DR_ASSERT(!is_write);
+            AddFPRedLog<ElemLen, ElemLen>(ctxt_hndl, addr, pt);
+        }
+    } else {
+        assert(0 && "VGather should be a floating point operation!");
+    }
+}
+#define HANDLE_VGATHER(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) do {\
+if(op_enable_sampling.get_value()) { \
+dr_insert_clean_call(drcontext, bb, ins, (void *)CheckNByteValueAfterVGather<(ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true>, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone)); \
+} else { \
+dr_insert_clean_call(drcontext, bb, ins, (void *)CheckNByteValueAfterVGather<(ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false>, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone)); \
+} } while(0)
+#endif
 /***************************************************************************************/
 
-#if __BYTE_ORDER == __BIG_ENDIAN
-typedef union {
-  float f;
-  struct {
-    uint32_t sign : 1;
-    uint32_t exponent : 8;
-    uint32_t mantisa : 23;
-  } parts;
-  struct {
-    uint32_t sign : 1;
-    uint32_t value : 31;
-  } vars;
-} float_cast;
-
-typedef union {
-  double f;
-  struct {
-    uint64_t sign : 1;
-    uint64_t exponent : 11;
-    uint64_t mantisa : 52;
-  } parts;
-  struct {
-    uint64_t sign : 1;
-    uint64_t value : 63;
-  } vars;
-} double_cast;
-#elif __BYTE_ORDER == __LITTLE_ENDIAN
-typedef union {
-  float f;
-  struct {
-    uint32_t mantisa : 23;
-    uint32_t exponent : 8;
-    uint32_t sign : 1;
-  } parts;
-  struct {
-    uint32_t value : 31;
-    uint32_t sign : 1;
-  } vars;
-} float_cast;
-
-typedef union {
-  double f;
-  struct {
-    uint64_t mantisa : 52;
-    uint64_t exponent : 11;
-    uint64_t sign : 1;
-  } parts;
-  struct {
-    uint64_t value : 63;
-    uint64_t sign : 1;
-  } vars;
-} double_cast;
-#else
-    #error Known Byte Order
-#endif
-
-template<int start, int end, int incr>
-struct UnrolledConjunctionApprox{
-    // if the mantisa is 0, the value of the double/float var must be 0
-    static __attribute__((always_inline)) uint64_t BodyZeros(uint8_t* addr){
-        if(incr==4)
-            return ((*(reinterpret_cast<float_cast*>(&addr[start]))).vars.value==0) + (UnrolledConjunctionApprox<start+incr,end,incr>::BodyZeros(addr));
-        else if(incr==8)
-            return ((*(reinterpret_cast<double_cast*>(&addr[start]))).vars.value==0) + (UnrolledConjunctionApprox<start+incr,end,incr>::BodyZeros(addr));
-        return 0;
+static inline int
+compute_log2(int value)
+{
+    int i;
+    for (i = 0; i < 31; i++) {
+        if (value == 1 << i)
+            return i;
     }
-    static __attribute__((always_inline)) uint64_t BodyRedMap(uint8_t* addr){
-        if(incr==4)
-            return count_zero_bytemap_fp((void*)(addr+start)) | (UnrolledConjunctionApprox<start+incr,end,incr>::BodyRedMap(addr)<<SP_MAP_SIZE);
-        else if(incr==8)
-            return count_zero_bytemap_dp((void*)(addr+start)) | (UnrolledConjunctionApprox<start+incr,end,incr>::BodyRedMap(addr)<<DP_MAP_SIZE);
-        else
-            assert(0 && "Not Supportted floating size! now only support for FP32 or FP64.");
-        return 0;
-    }
-    static __attribute__((always_inline)) uint64_t BodyHasRedundancy(uint8_t* addr){
-        if(incr==4)
-            return hasRedundancy_fp((void*)(addr+start)) || (UnrolledConjunctionApprox<start+incr,end,incr>::BodyHasRedundancy(addr));
-        else if(incr==8)
-            return hasRedundancy_dp((void*)(addr+start)) || (UnrolledConjunctionApprox<start+incr,end,incr>::BodyHasRedundancy(addr));
-        else
-            assert(0 && "Not Supportted floating size! now only support for FP32 or FP64.");
-        return 0;
-    }
-};
-
-template<int end,  int incr>
-struct UnrolledConjunctionApprox<end , end , incr>{
-    static __attribute__((always_inline)) uint64_t BodyZeros(uint8_t* addr){
-        return 0;
-    }
-    static __attribute__((always_inline)) uint64_t BodyRedMap(uint8_t* addr){
-        return 0;
-    }
-    static __attribute__((always_inline)) uint64_t BodyHasRedundancy(uint8_t* addr){
-        return 0;
-    }
-};
-
-/****************************************************************************************/
-inline __attribute__((always_inline)) uint64_t count_zero_bytemap_int8(uint8_t * addr) {
-    register uint8_t xx = *((uint8_t*)addr);
-    // reduce by bits until byte level
-    xx = xx | (xx>>1) | (xx>>2) | (xx>>3) | (xx>>4) | (xx>>5) | (xx>>6) | (xx>>7);
-    // now xx is byte level reduced, check if it is zero and mask the unused bits
-    xx = (~xx) & 0x1;
-    return xx;
-}
-inline __attribute__((always_inline)) uint64_t count_zero_bytemap_int16(uint8_t * addr) {
-    register uint16_t xx = *((uint16_t*)addr);
-    // reduce by bits until byte level
-    xx = xx | (xx>>1) | (xx>>2) | (xx>>3) | (xx>>4) | (xx>>5) | (xx>>6) | (xx>>7);
-    // now xx is byte level reduced, check if it is zero and mask the unused bits
-    xx = (~xx) & 0x101;
-    // narrowing
-    xx = xx | (xx>>7);
-    xx = xx & 0x3;
-    return xx;
-}
-inline __attribute__((always_inline)) uint64_t count_zero_bytemap_int32(uint8_t * addr) {
-    register uint32_t xx = *((uint32_t*)addr);
-    // reduce by bits until byte level
-    xx = xx | (xx>>1) | (xx>>2) | (xx>>3) | (xx>>4) | (xx>>5) | (xx>>6) | (xx>>7);
-    // now xx is byte level reduced, check if it is zero and mask the unused bits
-    xx = (~xx) & 0x1010101;
-    // narrowing
-    xx = xx | (xx>>7);
-    xx = xx | (xx>>14);
-    xx = xx & 0xf;
-    return xx;
-}
-inline __attribute__((always_inline)) uint64_t count_zero_bytemap_int64(uint8_t * addr) {
-    register uint64_t xx = *((uint64_t*)addr);
-    // reduce by bits until byte level
-    xx = xx | (xx>>1) | (xx>>2) | (xx>>3) | (xx>>4) | (xx>>5) | (xx>>6) | (xx>>7);
-    // now xx is byte level reduced, check if it is zero and mask the unused bits
-    xx = (~xx) & 0x101010101010101LL;
-    // narrowing
-    xx = xx | (xx>>7);
-    xx = xx | (xx>>14);
-    xx = xx | (xx>>28);
-    xx = xx & 0xff;
-    return xx;
+    // returns -1 if value is not a power of 2.
+    return -1;
 }
 
-static const unsigned char BitCountTable4[] __attribute__ ((aligned(64))) = {
-    0, 0, 1, 2
-};
+template<bool enable_cache>
+void insertCheckAndUpdateInt(void* drcontext, instrlist_t* ilist, instr_t* where, int accessLen, int elemLen, int32_t slot, reg_id_t reg_addr, reg_id_t scratch) {
+    // quick check
+    //assert((accessLen<=8 && accessLen==elemLen) || elemLen==1);
+    // start check and update
+    switch(accessLen) {
+        case 1:
+            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertIntPage<1,1,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
+            break;
+        case 2:
+            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertIntPage<2,2,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
+            break;
+        case 4:
+            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertIntPage<4,4,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
+            break;
+        case 8:
+            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertIntPage<8,8,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
+            break;
+        case 16:
+            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertIntPage<16,1,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
+            break;
+        case 32:
+            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertIntPage<32,1,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
+            break;
+        default:
+            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckLargeAndInsertIntPage<enable_cache>, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr), OPND_CREATE_CCT_INT(accessLen));
+            break;
+    }
+}
 
-static const unsigned char BitCountTable8[] __attribute__ ((aligned(64))) = {
-    0, 0, 0, 0, 1, 1, 2, 3
-};
-
-static const unsigned char BitCountTable16[] __attribute__ ((aligned(64))) = {
-    0, 0, 0, 0, 0, 0, 0, 0,
-    1, 1, 1, 1, 2, 2, 3, 4
-};
-
-static const unsigned char BitCountTable256[] __attribute__ ((aligned(64))) = {
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 
-    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 
-    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 
-    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 
-    4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 7, 8
-};
+template<bool enable_cache>
+void insertCheckAndUpdateFp(void* drcontext, instrlist_t* ilist, instr_t* where, int accessLen, int elemLen, int32_t slot, reg_id_t reg_addr, reg_id_t scratch) {
+    // quick check
+    //assert(elemLen==4 || elemLen==8);
+    switch(accessLen) {
+        case 4:
+            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertFpPage<4,4,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
+            break;
+        case 8:
+            dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertFpPage<8,8,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
+            break;
+        case 16:
+            if(elemLen==4) {
+                dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertFpPage<16,4,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
+            } else {
+                dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertFpPage<16,8,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
+            }
+            break;
+        case 32:
+            if(elemLen==4) {
+                dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertFpPage<32,4,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
+            } else {
+                dr_insert_clean_call(drcontext, ilist, where, (void*)CheckAndInsertFpPage<32,8,enable_cache>, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(reg_addr));
+            }
+            break;
+        default:
+            assert(0 && "Unknown accessLen");
+    }
+}
 
 // accessLen & eleSize are size in bits
 template<uint32_t AccessLen, uint32_t EleSize>
@@ -1144,274 +970,7 @@ string getFpRedMapString(uint64_t redmap, uint64_t accessLen) {
 
 #define getFpRedMapString_SP(redmap, num) getFpRedMapString<1,3>(redmap, num*5)
 #define getFpRedMapString_DP(redmap, num) getFpRedMapString<2,7>(redmap, num*10)
-
-template<int start, int end, int incr>
-struct UnrolledConjunction{
-    // if the mantisa is 0, the value of the double/float var must be 0
-    static __attribute__((always_inline)) uint64_t BodyRedNum(uint64_t rmap){
-        // static_assert(start < end);
-        if(incr==1)
-            return ((start==0) ? (rmap&0x1) : ((rmap>>start)&0x1)) + (UnrolledConjunction<start+incr,end,incr>::BodyRedNum(rmap));
-        else if(incr==2)
-            return ((start==0) ? BitCountTable8[rmap&0x3] : BitCountTable8[(rmap>>start)&0x3]) + (UnrolledConjunction<start+incr,end,incr>::BodyRedNum(rmap));
-        else if(incr==4)
-            return ((start==0) ? BitCountTable16[rmap&0xf] : BitCountTable16[(rmap>>start)&0xf]) + (UnrolledConjunction<start+incr,end,incr>::BodyRedNum(rmap));
-        else if(incr==8)
-            return ((start==0) ? BitCountTable256[rmap&0xff] : BitCountTable256[(rmap>>start)&0xff]) + (UnrolledConjunction<start+incr,end,incr>::BodyRedNum(rmap));
-        return 0;
-    }
-    static __attribute__((always_inline)) uint64_t BodyRedMap(uint8_t* addr){
-        // static_assert(start < end);
-        if(incr==1)
-            return count_zero_bytemap_int8(addr+start) | (UnrolledConjunction<start+incr,end,incr>::BodyRedMap(addr)<<1);
-        else if(incr==2)
-            return count_zero_bytemap_int16(addr+start) | (UnrolledConjunction<start+incr,end,incr>::BodyRedMap(addr)<<2);
-        else if(incr==4)
-            return count_zero_bytemap_int32(addr+start) | (UnrolledConjunction<start+incr,end,incr>::BodyRedMap(addr)<<4);
-        else if(incr==8)
-            return count_zero_bytemap_int64(addr+start) | (UnrolledConjunction<start+incr,end,incr>::BodyRedMap(addr)<<8);
-        else
-            assert(0 && "Not Supportted integer size! now only support for INT8, INT16, INT32 or INT64.");
-        return 0;
-    }
-    static __attribute__((always_inline)) bool BodyHasRedundancy(uint8_t* addr){
-        if(incr==1)
-            return (addr[start]==0) || (UnrolledConjunction<start+incr,end,incr>::BodyHasRedundancy(addr));
-        else if(incr==2)
-            return (((*((uint16_t*)(&addr[start])))&0xff00)==0) || (UnrolledConjunction<start+incr,end,incr>::BodyRedMap(addr));
-        else if(incr==4)
-            return (((*((uint32_t*)(&addr[start])))&0xff000000)==0) || (UnrolledConjunction<start+incr,end,incr>::BodyRedMap(addr));
-        else if(incr==8)
-            return (((*((uint64_t*)(&addr[start])))&0xff00000000000000LL)==0) || (UnrolledConjunction<start+incr,end,incr>::BodyRedMap(addr));
-        else
-            assert(0 && "Not Supportted integer size! now only support for INT8, INT16, INT32 or INT64.");
-        return 0;
-    }
-};
-
-template<int end,  int incr>
-struct UnrolledConjunction<end , end , incr>{
-    static __attribute__((always_inline)) uint64_t BodyRedNum(uint64_t rmap){
-        return 0;
-    }
-    static __attribute__((always_inline)) uint64_t BodyRedMap(uint8_t* addr){
-        return 0;
-    }
-    static __attribute__((always_inline)) uint64_t BodyHasRedundancy(uint8_t* addr){
-        return 0;
-    }
-};
 /*******************************************************************************************/
-#ifdef ENABLE_SAMPLING
-#ifdef USE_CLEANCALL
-uint64_t global_sample_mask = 0;
-template<int64_t WINDOW_ENABLE, int64_t WINDOW_DISABLE, bool sampleFlag>
-struct BBSample {
-    static void update_per_bb(uint instruction_count, app_pc src)
-    {
-        void *drcontext = dr_get_current_drcontext();
-        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-        // if(drcctlib_get_thread_id()!=0)
-        // printf("[THREAD %d] BB UPDATE %lld, ins count=%d, %d == %d!\n", drcctlib_get_thread_id(), pt->numIns, instruction_count, pt->sampleFlag, sampleFlag);
-        pt->numIns += instruction_count;
-        if(sampleFlag) {
-            if(pt->numIns > WINDOW_ENABLE) {
-                pt->sampleFlag = false;
-            }
-        } else {
-            if(pt->numIns > WINDOW_DISABLE) {
-                pt->sampleFlag = true;
-                pt->numIns = 0;
-            }
-        }
-        // If the sample flag is changed, flush the region and re-instrument
-        if(pt->sampleFlag != sampleFlag) {
-            // printf("[THREAD %d] BB FLUSH %d %lld, ins count=%d!\n", drcctlib_get_thread_id(), pt->sampleFlag, pt->numIns, instruction_count);
-            // assert(pt->numIns==0 || (pt->numIns > WINDOW_ENABLE && pt->numIns <= WINDOW_ENABLE+instruction_count) );
-            dr_mcontext_t mcontext;
-            mcontext.size = sizeof(mcontext);
-            mcontext.flags = DR_MC_ALL;
-            // // flush all fragments in code cache
-            // dr_flush_region(0, ~((ptr_uint_t)0));
-            dr_flush_region(src, 1);
-            dr_get_mcontext(drcontext, &mcontext);
-            mcontext.pc = src;
-            dr_redirect_execution(&mcontext);
-        }
-    }
-
-    static void update_per_bb_shared(uint instruction_count, app_pc src)
-    {
-        void *drcontext = dr_get_current_drcontext();
-        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-        pt->numIns += instruction_count;
-        assert("NOT IMPLEMENTED!");
-        // if(sampleFlag) {
-        //     if(pt->numIns > WINDOW_ENABLE) {
-        //         pt->sampleFlag = false;
-        //         uint64_t updateBit = 1 << (drcctlib_get_thread_id());
-        //         uint64_t sampled = __sync_and_and_fetch(global_sample_mask, (~updateBit));
-        //         if(!sampled) {
-        //             assert(dr_unlink_flush_region(0, ~((ptr_uint_t)0)));
-        //         }
-        //     }
-        // } else {
-        //     pt->sampleFlag = (pt->numIns > WINDOW_DISABLE);
-        // }
-        // // If the sample flag is changed, flush the region and re-instrument
-        // if(pt->sampleFlag != sampleFlag) {
-        //     if(sampleFlag /*pt->sampleFlag==false*/) {
-        //         pt->numIns = WINDOW_ENABLE;
-        //     } else {
-        //         pt->numIns = 0;
-        //     }
-        //     // assert(dr_unlink_flush_region(0, ~((ptr_uint_t)0)));
-            
-        // }
-    }
-};
-
-void (*BBSampleTable[RATE_NUM][WINDOW_NUM][2])(uint, app_pc) = {
-    {   {BBSample<RATE_0_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
-        {BBSample<RATE_0_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
-        {BBSample<RATE_0_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
-        {BBSample<RATE_0_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
-        {BBSample<RATE_0_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_0_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
-    },
-    {   {BBSample<RATE_1_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
-        {BBSample<RATE_1_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
-        {BBSample<RATE_1_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
-        {BBSample<RATE_1_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
-        {BBSample<RATE_1_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_1_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
-    },
-    {   {BBSample<RATE_2_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
-        {BBSample<RATE_2_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
-        {BBSample<RATE_2_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
-        {BBSample<RATE_2_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
-        {BBSample<RATE_2_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_2_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
-    },
-    {   {BBSample<RATE_3_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
-        {BBSample<RATE_3_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
-        {BBSample<RATE_3_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
-        {BBSample<RATE_3_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
-        {BBSample<RATE_3_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_3_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
-    },
-    {   {BBSample<RATE_4_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
-        {BBSample<RATE_4_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
-        {BBSample<RATE_4_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
-        {BBSample<RATE_4_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
-        {BBSample<RATE_4_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_4_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
-    },
-    {   {BBSample<RATE_5_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb},
-        {BBSample<RATE_5_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb},
-        {BBSample<RATE_5_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb},
-        {BBSample<RATE_5_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb},
-        {BBSample<RATE_5_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb, BBSample<RATE_5_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb},
-    },
-};
-
-void (*BBSampleTableShared[RATE_NUM][WINDOW_NUM][2])(uint, app_pc) = {
-    {   {BBSample<RATE_0_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb_shared, BBSample<RATE_0_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb_shared},
-        {BBSample<RATE_0_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb_shared, BBSample<RATE_0_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb_shared},
-        {BBSample<RATE_0_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb_shared, BBSample<RATE_0_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb_shared},
-        {BBSample<RATE_0_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb_shared, BBSample<RATE_0_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb_shared},
-        {BBSample<RATE_0_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb_shared, BBSample<RATE_0_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb_shared},
-    },
-    {   {BBSample<RATE_1_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb_shared, BBSample<RATE_1_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb_shared},
-        {BBSample<RATE_1_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb_shared, BBSample<RATE_1_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb_shared},
-        {BBSample<RATE_1_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb_shared, BBSample<RATE_1_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb_shared},
-        {BBSample<RATE_1_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb_shared, BBSample<RATE_1_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb_shared},
-        {BBSample<RATE_1_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb_shared, BBSample<RATE_1_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb_shared},
-    },
-    {   {BBSample<RATE_2_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb_shared, BBSample<RATE_2_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb_shared},
-        {BBSample<RATE_2_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb_shared, BBSample<RATE_2_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb_shared},
-        {BBSample<RATE_2_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb_shared, BBSample<RATE_2_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb_shared},
-        {BBSample<RATE_2_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb_shared, BBSample<RATE_2_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb_shared},
-        {BBSample<RATE_2_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb_shared, BBSample<RATE_2_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb_shared},
-    },
-    {   {BBSample<RATE_3_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb_shared, BBSample<RATE_3_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb_shared},
-        {BBSample<RATE_3_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb_shared, BBSample<RATE_3_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb_shared},
-        {BBSample<RATE_3_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb_shared, BBSample<RATE_3_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb_shared},
-        {BBSample<RATE_3_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb_shared, BBSample<RATE_3_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb_shared},
-        {BBSample<RATE_3_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb_shared, BBSample<RATE_3_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb_shared},
-    },
-    {   {BBSample<RATE_4_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb_shared, BBSample<RATE_4_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb_shared},
-        {BBSample<RATE_4_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb_shared, BBSample<RATE_4_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb_shared},
-        {BBSample<RATE_4_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb_shared, BBSample<RATE_4_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb_shared},
-        {BBSample<RATE_4_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb_shared, BBSample<RATE_4_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb_shared},
-        {BBSample<RATE_4_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb_shared, BBSample<RATE_4_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb_shared},
-    },
-    {   {BBSample<RATE_5_WIN(WINDOW_0), WINDOW_0, false>::update_per_bb_shared, BBSample<RATE_5_WIN(WINDOW_0), WINDOW_0, true>::update_per_bb_shared},
-        {BBSample<RATE_5_WIN(WINDOW_1), WINDOW_1, false>::update_per_bb_shared, BBSample<RATE_5_WIN(WINDOW_1), WINDOW_1, true>::update_per_bb_shared},
-        {BBSample<RATE_5_WIN(WINDOW_2), WINDOW_2, false>::update_per_bb_shared, BBSample<RATE_5_WIN(WINDOW_2), WINDOW_2, true>::update_per_bb_shared},
-        {BBSample<RATE_5_WIN(WINDOW_3), WINDOW_3, false>::update_per_bb_shared, BBSample<RATE_5_WIN(WINDOW_3), WINDOW_3, true>::update_per_bb_shared},
-        {BBSample<RATE_5_WIN(WINDOW_4), WINDOW_4, false>::update_per_bb_shared, BBSample<RATE_5_WIN(WINDOW_4), WINDOW_4, true>::update_per_bb_shared},
-    },
-};
-
-void (*BBSample_target[2])(uint, app_pc);
-
-template<int64_t WINDOW_ENABLE, int64_t WINDOW_DISABLE>
-struct BBSampleNoFlush {
-    static void update_per_bb(uint instruction_count)
-    {
-        void *drcontext = dr_get_current_drcontext();
-        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-        pt->numIns += instruction_count;
-        if(pt->sampleFlag) {
-            if(pt->numIns > WINDOW_ENABLE) {
-                pt->sampleFlag = false;
-            }
-        } else {
-            if(pt->numIns > WINDOW_DISABLE) {
-                pt->sampleFlag = true;
-                pt->numIns = 0;
-            }
-        }
-    }
-};
-
-void (*BBSampleNoFlushTable[RATE_NUM][WINDOW_NUM])(uint) {
-    {   BBSampleNoFlush<RATE_0_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
-        BBSampleNoFlush<RATE_0_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
-        BBSampleNoFlush<RATE_0_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
-        BBSampleNoFlush<RATE_0_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
-        BBSampleNoFlush<RATE_0_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
-    },
-    {   BBSampleNoFlush<RATE_1_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
-        BBSampleNoFlush<RATE_1_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
-        BBSampleNoFlush<RATE_1_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
-        BBSampleNoFlush<RATE_1_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
-        BBSampleNoFlush<RATE_1_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
-    },
-    {   BBSampleNoFlush<RATE_2_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
-        BBSampleNoFlush<RATE_2_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
-        BBSampleNoFlush<RATE_2_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
-        BBSampleNoFlush<RATE_2_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
-        BBSampleNoFlush<RATE_2_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
-    },
-    {   BBSampleNoFlush<RATE_3_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
-        BBSampleNoFlush<RATE_3_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
-        BBSampleNoFlush<RATE_3_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
-        BBSampleNoFlush<RATE_3_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
-        BBSampleNoFlush<RATE_3_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
-    },
-    {   BBSampleNoFlush<RATE_4_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
-        BBSampleNoFlush<RATE_4_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
-        BBSampleNoFlush<RATE_4_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
-        BBSampleNoFlush<RATE_4_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
-        BBSampleNoFlush<RATE_4_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
-    },
-    {   BBSampleNoFlush<RATE_5_WIN(WINDOW_0), WINDOW_0>::update_per_bb,
-        BBSampleNoFlush<RATE_5_WIN(WINDOW_1), WINDOW_1>::update_per_bb,
-        BBSampleNoFlush<RATE_5_WIN(WINDOW_2), WINDOW_2>::update_per_bb,
-        BBSampleNoFlush<RATE_5_WIN(WINDOW_3), WINDOW_3>::update_per_bb,
-        BBSampleNoFlush<RATE_5_WIN(WINDOW_4), WINDOW_4>::update_per_bb,
-    },
-};
-void (*BBSampleNoFlush_target)(uint);
-
-#else
 
 #    ifdef ARM_CCTLIB
 #        define DRCCTLIB_LOAD_IMM32_0(dc, Rt, imm) \
@@ -1467,299 +1026,221 @@ minstr_load_wwint_to_reg(void *drcontext, instrlist_t *ilist, instr_t *where,
 #endif
 #    endif
 
-uint64_t getRedZeroNum(int accessLen, uint64_t redbyteMap) {
-    bool counting = true;
-    register uint64_t redbytesNum = 0;
-    int restLen = accessLen;
-    while(counting && restLen>=8) {
-        restLen -= 8;
-        register uint8_t t = BitCountTable256[(redbyteMap>>restLen)&0xff];
-        redbytesNum += t;
-        if(t!=8) {
-            counting = false;
-            break;
-        }
-    }
-    while(counting && restLen>=4) {
-        restLen -= 4;
-        register uint8_t t = BitCountTable16[(redbyteMap>>restLen)&0xf];
-        redbytesNum += t;
-        if(t!=4) {
-            counting = false;
-            break;
-        }
-    }
-    while(counting && restLen>=2) {
-        restLen -= 2;
-        register uint8_t t = BitCountTable4[(redbyteMap>>restLen)&0x3];
-        redbytesNum += t;
-        if(t!=8) {
-            counting = false;
-            break;
-        }
-    }
-    // dont check here as this loop must execute only once
-    while(counting && restLen>=1) {
-        restLen -= 1;
-        register uint8_t t = (redbyteMap>>restLen)&0x1;
-        redbytesNum += t;
-    }
-    return redbytesNum;
-}
-
-struct BBSampleInstrument {
-    static void bb_flush_code(int memRefCnt) {
+// This clean call will be automatically inlined by -opt_cleancall as it only has one argument
+struct BBInstrument {
+    static void BBUpdate(int insCnt) {
         void *drcontext = dr_get_current_drcontext();
-        per_thread_t* pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-        // If sampled, merge the metrics from the cached record
-        int next_cache_val_num = pt->cache_val_num + memRefCnt;
-        // printf("[Flush] memRefCnt=%d, current cache num: %d, next: %d\n", memRefCnt, pt->cache_val_num, next_cache_val_num);
-        if(next_cache_val_num > MAX_CACHE_SIZE) {
-            // flush_cache(pt);
-// #if 0
-            for(int i=0; i<pt->cache_val_num; ++i) {
-                context_handle_t ctxt = pt->cache_ptr[i].ctxt_hndl;
-                //assert(ctxt!=0);
-                uint32_t info = pt->cache_ptr[i].info;
-                uint64_t redmap = pt->cache_ptr[i].redmap;
-                bool isApprox = DECODE_ISAPPROX_FROM_CACHED_INFO(info);
-                uint elemSize = DECODE_ELEMSIZE_FROM_CACHED_INFO(info);
-                uint accessLen= DECODE_ACCESSLEN_FROM_CACHED_INFO(info);
-                assert(elemSize<=8 || elemSize==accessLen);
-                int zeros = getRedZeroNum(accessLen, redmap);
-                // printf("[Flush] isApprox=%d, elemSize=%d, accessLen=%d, zeros=%d, redmap=%lx\n", isApprox, elemSize, accessLen, zeros, redmap); fflush(stdout);
-                if(isApprox) {
-                    AddToApproximateRedTable((uint64_t)ctxt, redmap, accessLen, zeros, accessLen/elemSize, elemSize, pt);
-                } else {
-                    AddToRedTable((uint64_t)MAKE_CONTEXT_PAIR(accessLen, ctxt), zeros, redmap, accessLen, pt);
-                }
-            }
-//             memset(pt->cache_ptr, 0, sizeof(val_cache_t)*MAX_CACHE_SIZE);
-// #endif
-            pt->cache_val_num = 0;
-            BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_VAL_CACHE_PTR) = pt->cache_ptr;
-        } else {
-            pt->cache_val_num = next_cache_val_num;
-        }
-    }
-
-#ifdef ARM_CCTLIB
-    static void insertBBUpdate(void* drcontext, instrlist_t *ilist, instr_t *where, int insCnt, reg_id_t reg_ptr, reg_id_t reg_val) {
-        dr_insert_read_raw_tls(drcontext, ilist, where, tls_seg,
-                            tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
-        MINSERT(ilist, where, XINST_CREATE_add(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(insCnt)));
-        // Clear insCnt when insCnt > WINDOW_DISABLE
-        minstr_load_wint_to_reg(drcontext, ilist, where, reg_val, window_disable);
-        MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), opnd_create_reg(reg_val)));
-        instr_t* skipclear = INSTR_CREATE_label(drcontext);
-        MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(skipclear)));
-        MINSERT(ilist, where, XINST_CREATE_load_int(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(0)));
-        MINSERT(ilist, where, skipclear);
-        dr_insert_write_raw_tls(drcontext, ilist, where, tls_seg,
-                            tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
-    }
-    static void insertBBSample(void* drcontext, instrlist_t *ilist, instr_t *where, int insCnt) {
-        static_assert(sizeof(void*)==8);
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-        bool af_dead=false, reg_dead=false; 
-        reg_id_t reg_ptr;
-        RESERVE_AFLAGS(drcontext, ilist, where);
-        assert(drreg_reserve_register(drcontext, ilist, where, NULL, &reg_ptr)==DRREG_SUCCESS);
-        reg_id_t reg_val;
-        bool regVal_dead = false;
-        assert(drreg_reserve_register(drcontext, ilist, where, NULL, &reg_val)==DRREG_SUCCESS);
-        assert(drreg_is_register_dead(drcontext, reg_val, where, &regVal_dead)==DRREG_SUCCESS);
-        assert(drreg_is_register_dead(drcontext, reg_ptr, where, &reg_dead)==DRREG_SUCCESS);
-
-        insertBBUpdate(drcontext, ilist, where, insCnt, reg_ptr, reg_val);
-
-        instr_t* restore = INSTR_CREATE_label(drcontext);
-        // printf("%ld: %d\n", (int64_t)(BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR)), IS_SAMPLED(pt, window_enable));
-        if(IS_SAMPLED(pt, window_enable)) {
-            // fall to code flush when insCnt > WINDOW_ENABLE
-            minstr_load_wint_to_reg(drcontext, ilist, where, reg_val, window_enable);
-            MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), opnd_create_reg(reg_val)));
-            MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(restore)));
-        } else {
-            // fall to code flush when insCnt > WINDOW_DISABLE (check if cleared)
-            MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_IMMEDIATE_INT(0)));
-            MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_NE, opnd_create_instr(restore)));
-        }
-        if(!regVal_dead) assert(drreg_get_app_value(drcontext, ilist, where, reg_val, reg_val)==DRREG_SUCCESS);
-        if(!reg_dead) assert(drreg_get_app_value(drcontext, ilist, where, reg_ptr, reg_ptr)==DRREG_SUCCESS);
-        assert(drreg_restore_app_aflags(drcontext, ilist, where)==DRREG_SUCCESS);
-        dr_insert_clean_call(drcontext, ilist, where, (void *)BBSampleInstrument::bb_flush_code, false, 1, OPND_CREATE_INTPTR(instr_get_app_pc(where)));
-        MINSERT(ilist, where, restore);
-        assert(drreg_unreserve_register(drcontext, ilist, where, reg_ptr)==DRREG_SUCCESS);
-        assert(drreg_unreserve_register(drcontext, ilist, where, reg_val)==DRREG_SUCCESS);
-        UNRESERVE_AFLAGS(drcontext, ilist, where);
+        uint64_t val = reinterpret_cast<uint64_t>(BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR));
+        val += insCnt;
+        BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR) = reinterpret_cast<void*>(val);
     }
 
-    static void insertBBSampleNoFlush(void* drcontext, instrlist_t *ilist, instr_t *where, int insCnt) {
-        static_assert(sizeof(void*)==8);
-        bool dead; 
-        reg_id_t reg_ptr; 
-        RESERVE_AFLAGS(drcontext, ilist, where);
-        reg_id_t reg_val;
-        bool regVal_dead = false;
-        assert(drreg_reserve_register(drcontext, ilist, where, NULL, &reg_val)==DRREG_SUCCESS);
-        assert(drreg_is_register_dead(drcontext, reg_val, where, &regVal_dead)==DRREG_SUCCESS);
-        assert(drreg_reserve_register(drcontext, ilist, where, NULL, &reg_ptr)==DRREG_SUCCESS);
-
-        insertBBUpdate(drcontext, ilist, where, insCnt, reg_ptr, reg_val);
-
-        assert(drreg_unreserve_register(drcontext, ilist, where, reg_ptr)==DRREG_SUCCESS);
-        assert(drreg_unreserve_register(drcontext, ilist, where, reg_val)==DRREG_SUCCESS);
-        UNRESERVE_AFLAGS(drcontext, ilist, where);
-    }
-#else
-    static void insertBBSample(void* drcontext, instrlist_t *ilist, instr_t *where, int insCnt, int memRefCnt) {
-        static_assert(sizeof(void*)==8);
+    static void BBUpdateAndCheck(int insCnt) {
+        void *drcontext = dr_get_current_drcontext();
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-        reg_id_t reg_ptr;
-        RESERVE_AFLAGS(drcontext, ilist, where);
-        assert(drreg_reserve_register(drcontext, ilist, where, NULL, &reg_ptr)==DRREG_SUCCESS);
-        dr_insert_read_raw_tls(drcontext, ilist, where, tls_seg,
-                            tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
-        MINSERT(ilist, where, XINST_CREATE_add(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(insCnt)));
-        // Clear insCnt when insCnt > WINDOW_DISABLE
-        MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(window_disable)));
-        instr_t* skipclear = INSTR_CREATE_label(drcontext);
-        MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(skipclear)));
-        MINSERT(ilist, where, INSTR_CREATE_xor(drcontext, opnd_create_reg(reg_ptr), opnd_create_reg(reg_ptr)));
-        MINSERT(ilist, where, skipclear);
-        dr_insert_write_raw_tls(drcontext, ilist, where, tls_seg,
-                            tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
-        if(memRefCnt>0) {
-            MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(window_enable)));
-            instr_t* skipflush = INSTR_CREATE_label(drcontext);
-            MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_GT, opnd_create_instr(skipflush)));
-            dr_insert_clean_call(drcontext, ilist, where, (void *)BBSampleInstrument::bb_flush_code, false, 1, OPND_CREATE_CCT_INT(memRefCnt));
-            MINSERT(ilist, where, skipflush);
-        }
-        assert(drreg_unreserve_register(drcontext, ilist, where, reg_ptr)==DRREG_SUCCESS);
-        UNRESERVE_AFLAGS(drcontext, ilist, where);
+        uint64_t val = reinterpret_cast<uint64_t>(BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR));
+        val += insCnt;
+        if(val>=(uint64_t)window_disable) { val=val-(uint64_t)window_disable; }
+        BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR) = reinterpret_cast<void*>(val);
     }
-
-    static void insertBBSampleNoFlush(void* drcontext, instrlist_t *ilist, instr_t *where, int insCnt) {
-        static_assert(sizeof(void*)==8);
-        reg_id_t reg_ptr; 
-        RESERVE_AFLAGS(drcontext, ilist, where);
-        assert(drreg_reserve_register(drcontext, ilist, where, NULL, &reg_ptr)==DRREG_SUCCESS);
-        dr_insert_read_raw_tls(drcontext, ilist, where, tls_seg,
-                            tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
-        MINSERT(ilist, where, XINST_CREATE_add(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(insCnt)));
-        MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(window_disable)));
-        instr_t* skipclear = INSTR_CREATE_label(drcontext);
-        MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(skipclear)));
-        MINSERT(ilist, where, INSTR_CREATE_xor(drcontext, opnd_create_reg(reg_ptr), opnd_create_reg(reg_ptr)));
-        MINSERT(ilist, where, skipclear);
-        dr_insert_write_raw_tls(drcontext, ilist, where, tls_seg,
-                            tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
-        assert(drreg_unreserve_register(drcontext, ilist, where, reg_ptr)==DRREG_SUCCESS);
-        UNRESERVE_AFLAGS(drcontext, ilist, where);
-    }
-#endif
 };
-// endif USE_CLEANCALL
-#endif
 
-bool marked = false;
-
-#ifdef USE_TIMER
-void callback(int flush_id) {
-    fprintf(stderr, "[Thread %d] Code Cache Flushed!\n", drcctlib_get_thread_id()); fflush(stderr);
+template<int sz, int esize>
+void trace_update_int() {
+    void* drcontext = dr_get_current_drcontext();
+    // here we don't need to pass in the trace buffer pointer as we can statically know
+    // which buffer will be updated at compile time.
+    trace_buf_t* trace_buffer;
+    switch (sz) {
+        case 1:
+            trace_buffer = trace_buffer_i1; break;
+        case 2:
+            trace_buffer = trace_buffer_i2; break;
+        case 4:
+            trace_buffer = trace_buffer_i4; break;
+        case 8:
+            trace_buffer = trace_buffer_i8; break;
+        case 16:
+            trace_buffer = trace_buffer_i16; break;
+        case 32:
+            trace_buffer = trace_buffer_i32; break;
+    }
+    void* buf_base = trace_buf_get_buffer_base(drcontext, trace_buffer);
+    void* buf_ptr = trace_buf_get_buffer_ptr(drcontext, trace_buffer);
+    per_thread_t* pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+    cache_t<sz> *trace_base = (cache_t<sz> *)(char *)buf_base;
+    cache_t<sz> *trace_ptr = (cache_t<sz> *)((char *)buf_ptr);
+    cache_t<sz> *cache_ptr;
+    IF_DEBUG(dr_fprintf(
+        STDOUT,
+        "UPDATE INT: trace_ptr=%p, base=%p, end=%p, size=%ld, buf_size=%ld, buf_end=%p\n",
+        trace_ptr, trace_base,
+        (char *)trace_base + trace_buf_get_buffer_size(drcontext, trace_buffer),
+        trace_ptr - trace_base, trace_buf_get_buffer_size(drcontext, trace_buffer),
+        trace_buf_get_buffer_end(drcontext, trace_buffer)));
+    for(cache_ptr=trace_base; cache_ptr<trace_ptr; ++cache_ptr) {
+        CheckAndInsertIntPage_impl<sz, esize>(cache_ptr->ctxt_hndl, (void*)cache_ptr->val, pt);
+    }
+    // all buffered trace is updated, reset the buffer
+    trace_buf_set_buffer_ptr(drcontext, trace_buffer, buf_base);
 }
 
-// static dr_signal_action_t
-// code_flush_callback(void *drcontext, dr_siginfo_t *siginfo)
-// {
-//     if(siginfo->sig == SIGUSR1) {
-//         fprintf(stderr, "[Thread %d] SIGUSR1 Detected! Flush Code Cache!\n", drcctlib_get_thread_id()); fflush(stderr);
-//         dr_flush_region(0, ~((ptr_uint_t)0));
-//         return DR_SIGNAL_REDIRECT;
-//     }
-//     return DR_SIGNAL_DELIVER;
-// }
+template<int sz, int esize>
+void trace_update_fp() {
+    void* drcontext = dr_get_current_drcontext();
+    // here we don't need to pass in the trace buffer pointer as we can statically know
+    // which buffer will be updated at compile time.
+    trace_buf_t* trace_buffer;
+    switch (sz) {
+        case 4:
+            trace_buffer = trace_buffer_sp1; break;
+        case 8:
+            trace_buffer = trace_buffer_dp1; break;
+        case 16:
+            if(esize==4) {
+                trace_buffer = trace_buffer_sp4; break;
+            } else if(esize==8) {
+                trace_buffer = trace_buffer_dp2; break;
+            }
+        case 32:
+            if(esize==4) {
+                trace_buffer = trace_buffer_sp8; break;
+            } else if(esize==8) {
+                trace_buffer = trace_buffer_dp4; break;
+            }
+    }
+    void* buf_base = trace_buf_get_buffer_base(drcontext, trace_buffer);
+    void* buf_ptr = trace_buf_get_buffer_ptr(drcontext, trace_buffer);
+    per_thread_t* pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+    cache_t<sz> *trace_base = (cache_t<sz> *)(char *)buf_base;
+    cache_t<sz> *trace_ptr = (cache_t<sz> *)((char *)buf_ptr);
+    cache_t<sz> *cache_ptr;
+    IF_DEBUG(dr_fprintf(STDOUT,
+                        "UPDATE FP: trace_ptr=%p, base=%p, size=%ld, buf_size=%ld\n",
+                        trace_ptr, trace_base, trace_ptr - trace_base,
+                        trace_buf_get_buffer_size(drcontext, trace_buffer)));
+    for(cache_ptr=trace_base; cache_ptr<trace_ptr; ++cache_ptr) {
+        AddFPRedLog<esize, sz>(cache_ptr->ctxt_hndl, (void*)cache_ptr->val, pt);
+    }
+    // all buffered trace is updated, reset the buffer
+    trace_buf_set_buffer_ptr(drcontext, trace_buffer, buf_base);
+}
 
-int num;
-
-void handler(void *drcontext, dr_mcontext_t *mcontext)
-{
-    global_sample_flag = !global_sample_flag;
-    fprintf(stderr,"[Thread %d] Timer triggered! Sample=%d\n", drcctlib_get_thread_id(), global_sample_flag); fflush(stderr);
-    if(global_sample_flag) {
-        if(!dr_set_itimer(ITIMER_REAL, 1, handler)) {
-            ZEROSPY_EXIT_PROCESS("HANDLER: DR_SET_ITIMER  ENABLE FAILED!\n");
-        }
+template<int size, int esize, bool is_float>
+void insertBufferCheck_impl(void* drcontext, instrlist_t *bb, instr_t* ins, ushort memRefCnt, trace_buf_t* trace_buffer, reg_id_t reg_ptr, reg_id_t reg_end) {
+    // quick return without any instrumentation
+    if(memRefCnt<=0) return ;
+    instr_t* skip_update = INSTR_CREATE_label(drcontext);
+    // when there may be overflow, we check and update the trace buffer if possible
+    // the end buffer pointer
+    trace_buf_insert_load_buf_end(drcontext, trace_buffer, bb, ins, reg_end);
+    // current buffer pointer
+    trace_buf_insert_load_buf_ptr(drcontext, trace_buffer, bb, ins, reg_ptr);
+    // increament the buffer pointer with memRefCnt
+    MINSERT(bb, ins,
+            XINST_CREATE_add(drcontext, opnd_create_reg(reg_ptr),
+                             OPND_CREATE_INT16(sizeof(cache_t<size>) * memRefCnt)));
+    // if buffer will not be full, we will skip the heavy update
+    MINSERT(bb, ins, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), opnd_create_reg(reg_end)));
+    MINSERT(bb, ins, XINST_CREATE_jump_cond(drcontext, DR_PRED_LT, opnd_create_instr(skip_update)));
+    // insert cleancall for updating the buffered trace
+    if(is_float) {
+        dr_insert_clean_call(drcontext, bb, ins, (void*)trace_update_fp<size, esize>, false, 0);
     } else {
-        if(!dr_set_itimer(ITIMER_REAL, 999, handler)) {
-            ZEROSPY_EXIT_PROCESS("HANDLER: DR_SET_ITIMER DISABLE FAILED!\n");
-        }
+        dr_insert_clean_call(drcontext, bb, ins, (void*)trace_update_int<size, esize>, false, 0);
     }
-    marked = false;
-//    fprintf(stderr,"[Thread %d] Timer triggered: Sending flush region request...\n", drcctlib_get_thread_id()); fflush(stderr);
-//    dr_delay_flush_region(0, ~((ptr_uint_t)0), 0, callback);
-//    fprintf(stderr,"[Thread %d] Timer triggered: flush region request send!\n", drcctlib_get_thread_id()); fflush(stderr);
+    // skip to here
+    MINSERT(bb, ins, skip_update);
 }
 
-template<bool ref_sampleFlag>
-void bb_flush_code(app_pc src) {
-    if(global_sample_flag!=ref_sampleFlag) {
-        if(!marked) {
-            marked = true;
-            dr_unlink_flush_region(0, ~((ptr_uint_t)0));
-        }
-        // // Only the thread successfully get the lock will flush the code cache to avoid data race
-        // bool willFlush = dr_mutex_trylock(gLock);
-        // // printf("[THREAD %d] WILL FLUSH? %s(%d)\n", drcctlib_get_thread_id(), willFlush?"YES":"NO", willFlush); fflush(stdout);
-        // if(willFlush) {
-        //     if(!isFlushing) {
-        //         isFlushing = true;
-        //         dr_mutex_unlock(gLock);
-        //         printf("[THREAD %d] FLUSH!\n", drcctlib_get_thread_id()); fflush(stdout);
-        //         // flush all fragments in code cache
-        //         dr_flush_region(0, ~((ptr_uint_t)0));
-        //         // dr_unlink_flush_region(0, ~((ptr_uint_t)0));
-        //         // dr_flush_region(src, 1);
-        //         dr_mutex_lock(gLock);
-        //         isFlushing = false;
-        //         dr_mutex_unlock(gLock);
-        //         printf("[THREAD %d] FLUSHED!\n", drcctlib_get_thread_id()); fflush(stdout);
-        //         // if(global_sample_flag) {
-        //         //     if(!dr_set_itimer(ITIMER_REAL, 10, handler)) {
-        //         //         ZEROSPY_EXIT_PROCESS("HANDLER: DR_SET_ITIMER  ENABLE FAILED!\n");
-        //         //     }
-        //         // } else {
-        //         //     if(!dr_set_itimer(ITIMER_REAL, 990, handler)) {
-        //         //         ZEROSPY_EXIT_PROCESS("HANDLER: DR_SET_ITIMER DISABLE FAILED!\n");
-        //         //     }
-        //         // }
-        //         // dr_mcontext_t mcontext;
-        //         // mcontext.size = sizeof(mcontext);
-        //         // mcontext.flags = DR_MC_ALL;
-        //         // dr_get_mcontext(drcontext, &mcontext);
-        //         // mcontext.pc = src;
-        //         // dr_redirect_execution(&mcontext);
-        //     } else {
-        //         dr_mutex_unlock(gLock);
-        //     }
-        // }
-    }
+void insertBufferClear_impl(void* drcontext, instrlist_t *bb, instr_t* ins, ushort memRefCnt, trace_buf_t* trace_buffer, reg_id_t reg_ptr) {
+    // quick return without any instrumentation
+    if(memRefCnt<=0) return ;
+    // current buffer pointer
+    trace_buf_insert_clear_buf(drcontext, trace_buffer, bb, ins, reg_ptr);
 }
-#endif
 
-static dr_emit_flags_t
-event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, bool translating, OUT void **user_data)
-{
-    int num_instructions = 0;
-    int memRefCnt = 0;
+void insertBufferCheck(void* drcontext, instrlist_t *bb, instr_t* ins, ushort memRefCnt[12]) {
+    bool willInsert = false;
+    for(int i=0; i<12; ++i) willInsert = willInsert || (memRefCnt[i]>0);
+    if(!willInsert) return ;
+    reg_id_t reg_ptr, reg_end;
+    // reserve registers if not dead
+    RESERVE_AFLAGS(drcontext, bb, ins);
+    RESERVE_REG(drcontext, bb, ins, NULL, reg_ptr);
+    instr_t* skip_to_end = INSTR_CREATE_label(drcontext);
+    instr_t* skip_to_update = INSTR_CREATE_label(drcontext);
+    if(op_enable_sampling.get_value()) {
+        dr_insert_read_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
+        // Clear insCnt when insCnt > WINDOW_DISABLE
+        MINSERT(bb, ins, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(window_enable)));
+        MINSERT(bb, ins, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(skip_to_update)));
+        // FP
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[0], trace_buffer_sp1, reg_ptr);
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[1], trace_buffer_dp1, reg_ptr);
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[2], trace_buffer_sp4, reg_ptr);
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[3], trace_buffer_dp2, reg_ptr);
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[4], trace_buffer_sp8, reg_ptr);
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[5], trace_buffer_dp4, reg_ptr);
+        // INT
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[6], trace_buffer_i1, reg_ptr);
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[7], trace_buffer_i2, reg_ptr);
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[8], trace_buffer_i4, reg_ptr);
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[9], trace_buffer_i8, reg_ptr);
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[10], trace_buffer_i16, reg_ptr);
+        insertBufferClear_impl(drcontext, bb, ins, memRefCnt[11], trace_buffer_i32, reg_ptr);
+        MINSERT(bb, ins, XINST_CREATE_jump(drcontext, opnd_create_instr(skip_to_end)));
+        MINSERT(bb, ins, skip_to_update);
+    }
+    RESERVE_REG(drcontext, bb, ins, NULL, reg_end);
+    // FP
+    insertBufferCheck_impl<4,4, true>(drcontext, bb, ins, memRefCnt[0], trace_buffer_sp1, reg_ptr, reg_end);
+    insertBufferCheck_impl<8,8, true>(drcontext, bb, ins, memRefCnt[1], trace_buffer_dp1, reg_ptr, reg_end);
+    insertBufferCheck_impl<16,4, true>(drcontext, bb, ins, memRefCnt[2], trace_buffer_sp4, reg_ptr, reg_end);
+    insertBufferCheck_impl<16,8, true>(drcontext, bb, ins, memRefCnt[3], trace_buffer_dp2, reg_ptr, reg_end);
+    insertBufferCheck_impl<32,4, true>(drcontext, bb, ins, memRefCnt[4], trace_buffer_sp8, reg_ptr, reg_end);
+    insertBufferCheck_impl<32,8, true>(drcontext, bb, ins, memRefCnt[5], trace_buffer_dp4, reg_ptr, reg_end);
+    // INT
+    insertBufferCheck_impl<1,1, false>(drcontext, bb, ins, memRefCnt[6], trace_buffer_i1, reg_ptr, reg_end);
+    insertBufferCheck_impl<2,2, false>(drcontext, bb, ins, memRefCnt[7], trace_buffer_i2, reg_ptr, reg_end);
+    insertBufferCheck_impl<4,4, false>(drcontext, bb, ins, memRefCnt[8], trace_buffer_i4, reg_ptr, reg_end);
+    insertBufferCheck_impl<8,8, false>(drcontext, bb, ins, memRefCnt[9], trace_buffer_i8, reg_ptr, reg_end);
+    insertBufferCheck_impl<16,1, false>(drcontext, bb, ins, memRefCnt[10], trace_buffer_i16, reg_ptr, reg_end);
+    insertBufferCheck_impl<32,1, false>(drcontext, bb, ins, memRefCnt[11], trace_buffer_i32, reg_ptr, reg_end);
+    // restore registers if reserved
+    UNRESERVE_REG(drcontext, bb, ins, reg_end);
+    MINSERT(bb, ins, skip_to_end);
+    UNRESERVE_REG(drcontext, bb, ins, reg_ptr);
+    UNRESERVE_AFLAGS(drcontext, bb, ins);
+}
+
+void handleBufferUpdate() {
+    // update int
+    trace_update_int<1, 1>();
+    trace_update_int<2, 2>();
+    trace_update_int<4, 4>();
+    trace_update_int<8, 8>();
+    trace_update_int<16, 1>();
+    trace_update_int<32, 1>();
+    // update fp
+    trace_update_fp<4, 4>();
+    trace_update_fp<8, 8>();
+    trace_update_fp<16, 4>();
+    trace_update_fp<16, 8>();
+    trace_update_fp<32, 4>();
+    trace_update_fp<32, 8>();
+}
+
+int count_bb_info_detailed(void* drcontext, instrlist_t *bb, ushort memRefCnt[12]) {
     instr_t *instr;
-    /* count the number of instructions in this block */
+    int num_instructions = 0;
+    for(int i=0; i<12; ++i) memRefCnt[i] = 0;
+    IF_DEBUG(dr_fprintf(gFile, "^^ INFO: Disassembled Instruction ^^^\n"));
     for (instr = instrlist_first(bb); instr != NULL; instr = instr_get_next(instr)) {
+        if(!instr_is_app(instr)) continue;
         num_instructions++;
-        if(    (!op_no_flush.get_value()) 
-            &&   instr_reads_memory(instr) 
+        if(     instr_reads_memory(instr) 
             && (!instr_is_prefetch(instr)) 
             && (!instr_is_ignorable(instr)) 
             && (!instr_is_gather(instr))) 
@@ -1768,302 +1249,269 @@ event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, b
             for(int i=0; i<num_srcs; ++i) {
                 opnd_t opnd = instr_get_src(instr, i);
                 if(opnd_is_memory_reference(opnd)) {
-                    // TODO: support floating point caching
-                    if(!instr_is_floating(instr)) {
-                        memRefCnt++;
+                    uint32_t refSize = opnd_size_in_bytes(opnd_get_size(opnd));
+                    if (refSize!=0) {
+                        if(instr_is_floating(instr)) {
+                            uint32_t operSize = FloatOperandSizeTable(instr, opnd);
+                            switch (refSize) {
+                                case 4:
+                                    ++memRefCnt[0]; break;
+                                case 8:
+                                    ++memRefCnt[1]; break;
+                                case 16:
+                                    if(operSize==4) {
+                                        ++memRefCnt[2]; break;
+                                    } else if(operSize==8) {
+                                        ++memRefCnt[3]; break;
+                                    }
+                                case 32:
+                                    if(operSize==4) {
+                                        ++memRefCnt[4]; break;
+                                    } else if(operSize==8) {
+                                        ++memRefCnt[5]; break;
+                                    }
+                            }
+                        } else {
+                            switch (refSize) {
+                                case 1:
+                                    ++memRefCnt[6]; break;
+                                case 2:
+                                    ++memRefCnt[7]; break;
+                                case 4:
+                                    ++memRefCnt[8]; break;
+                                case 8:
+                                    ++memRefCnt[9]; break;
+                                case 16:
+                                    ++memRefCnt[10]; break;
+                                case 32:
+                                    ++memRefCnt[11]; break;
+                            }
+                        }
                     }
                 }
             }
+            IF_DEBUG(dr_fprintf(gFile, "[memcnt=%d] ", memRefCnt));
         }
+        IF_DEBUG(disassemble(drcontext, instr_get_app_pc(instr), gFile));
     }
+    IF_DEBUG(dr_fprintf(gFile, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"));
+    return num_instructions;
+}
+
+template<bool is_sampling>
+static dr_emit_flags_t
+event_basic_block(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, bool translating, OUT void **user_data)
+{
+    int num_instructions = 0;
+    ushort memRefCnt_detail[12];
+    /* count the number of instructions in this block */
+    num_instructions = count_bb_info_detailed(drcontext, bb, memRefCnt_detail);
     assert(num_instructions>=0);
-    if(num_instructions==0) {
-        return DR_EMIT_DEFAULT;
-    }
-    /* insert clean call */
-#ifdef USE_CLEANCALL
-    if(op_no_flush.get_value()) {
-        dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSampleNoFlush_target, false, 1, 
-                            OPND_CREATE_INT32(num_instructions));
-    } else {
-        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-        if(pt->sampleFlag) {
-            dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSample_target[1], false, 2, 
-                            OPND_CREATE_INT32(num_instructions), 
-                            OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
-        } else {
-            dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *) BBSample_target[0], false, 2, 
-                            OPND_CREATE_INT32(num_instructions), 
-                            OPND_CREATE_INTPTR(instr_get_app_pc(instrlist_first(bb))));
+    if(num_instructions!=0) {
+        /* insert clean call */
+        if(is_sampling) {
+            ushort memRefCnt = memRefCnt_detail[0];
+            for(int i=1; i<12; ++i) memRefCnt += memRefCnt_detail[i];
+            if(memRefCnt) {
+                dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *)BBInstrument::BBUpdateAndCheck, false, 1, OPND_CREATE_CCT_INT(num_instructions));
+            } else {
+                dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *)BBInstrument::BBUpdate, false, 1, OPND_CREATE_CCT_INT(num_instructions));
+            }
         }
+        instr_t* insert_pt = instrlist_first(bb);
+        insertBufferCheck(drcontext, bb, insert_pt, memRefCnt_detail);
     }
-#else
-    if(op_enable_sampling.get_value()) {
-        if(op_no_flush.get_value()) {
-            BBSampleInstrument::insertBBSampleNoFlush(drcontext, bb, instrlist_first(bb), num_instructions);
-        } else {
-            BBSampleInstrument::insertBBSample(drcontext, bb, instrlist_first(bb), num_instructions, memRefCnt);
-        }
-    } else {
-        if(memRefCnt) {
-            dr_insert_clean_call(drcontext, bb, instrlist_first(bb), (void *)BBSampleInstrument::bb_flush_code, false, 1, OPND_CREATE_CCT_INT(memRefCnt));
-        }
-    }
-    
-#endif
     return DR_EMIT_DEFAULT;
 }
-#endif
 
-template<class T, uint32_t AccessLen, uint32_t ElemLen, bool isApprox, bool enable_sampling>
-struct ZeroSpyAnalysis{
-#ifdef ZEROSPY_DEBUG
-    static __attribute__((always_inline)) void CheckNByteValueAfterRead(int32_t slot, void* addr, instr_t* instr)
-#else
-    static __attribute__((always_inline)) void CheckNByteValueAfterRead(int32_t slot, void* addr)
-#endif
-    {
-        void *drcontext = dr_get_current_drcontext();
-        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-#ifdef ENABLE_SAMPLING
-#ifdef USE_CLEANCALL
-        if(enable_sampling) {
-            if(!pt->sampleFlag) {
-                return ;
-            }
-        }
-#endif
-#endif
-// #ifdef ZEROSPY_DEBUG
-//         byte* base;
-//         size_t size;
-//         uint prot; 
-//         bool printDisassemble = false;
-//         if(!dr_query_memory((byte*)addr, &base, &size, &prot)) {
-//             dr_fprintf(STDERR, "\nWARNING: dr_query_memory failed!\n");
-//             printDisassemble = true;
-//         } else if((prot&DR_MEMPROT_READ)==0) {
-//             dr_fprintf(STDERR, "\nWARNING: memory address %p is protected and cannot read!\n", addr);
-//             printDisassemble = true;
-//         }
-//         if(printDisassemble) {
-//             dr_fprintf(STDERR, "^^ Disassembled Instruction instr=%p, PC=%p ^^^\n", instr, instr_get_app_pc(instr));
-//             dr_fprintf(STDERR, "addr=%p, AccessLen=%d, ElemLen=%d, isApprox=%d\n", addr, AccessLen, ElemLen, isApprox);
-//             disassemble(drcontext, instr_get_app_pc(instr), STDERR);
-//             dr_fprintf(STDERR, "ADDR[0]: %d\n", *((uint8_t*)addr));
-//             dr_fprintf(STDERR, "ADDR[%d]: %d\n", AccessLen-1, *((uint8_t*)addr+AccessLen-1));
-//             dr_fprintf(STDERR, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
-//         }
-// #endif
-        context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
-        uint8_t* bytes = static_cast<uint8_t*>(addr);
-        if(isApprox) {
-            bool hasRedundancy = UnrolledConjunctionApprox<0,AccessLen,sizeof(T)>::BodyHasRedundancy(bytes);
-            if(hasRedundancy) {
-                uint64_t map = UnrolledConjunctionApprox<0,AccessLen,sizeof(T)>::BodyRedMap(bytes);
-                uint32_t zeros = UnrolledConjunctionApprox<0,AccessLen,sizeof(T)>::BodyZeros(bytes);        
-                AddToApproximateRedTable((uint64_t)curCtxtHandle, map, AccessLen, zeros, AccessLen/sizeof(T), sizeof(T), pt);
-            } else {
-                AddToApproximateRedTable((uint64_t)curCtxtHandle, 0, AccessLen, 0, AccessLen/sizeof(T), sizeof(T), pt);
-            }
-        } else {
-            bool hasRedundancy = UnrolledConjunction<0,AccessLen,sizeof(T)>::BodyHasRedundancy(bytes);
-            if(hasRedundancy) {
-                uint64_t redbyteMap = UnrolledConjunction<0,AccessLen,sizeof(T)>::BodyRedMap(bytes);
-                uint32_t redbyteNum = UnrolledConjunction<0,AccessLen,sizeof(T)>::BodyRedNum(redbyteMap);
-                AddToRedTable((uint64_t)MAKE_CONTEXT_PAIR(AccessLen, curCtxtHandle), redbyteNum, redbyteMap, AccessLen, pt);
-            } else {
-                AddToRedTable((uint64_t)MAKE_CONTEXT_PAIR(AccessLen, curCtxtHandle), 0, 0, AccessLen, pt);
-            }
-        }
-    }
-#ifdef X86
-    static __attribute__((always_inline)) void CheckNByteValueAfterVGather(int32_t slot, instr_t* instr)
-    {
-        void *drcontext = dr_get_current_drcontext();
-        per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-#ifdef ENABLE_SAMPLING
-#ifdef USE_CLEANCALL
-        if(enable_sampling) {
-            if(!pt->sampleFlag) {
-                return ;
-            }
-        }
-#endif
-#endif
-        dr_mcontext_t mcontext;
-        mcontext.size = sizeof(mcontext);
-        mcontext.flags= DR_MC_ALL;
-        DR_ASSERT(dr_get_mcontext(drcontext, &mcontext));
-        context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
-#ifdef DEBUG_VGATHER
-        printf("\n^^ CheckNByteValueAfterVGather: ");
-        disassemble(drcontext, instr_get_app_pc(instr), 1/*sdtout file desc*/);
-        printf("\n");
-#endif
-        if(isApprox) {
-            uint32_t zeros=0;
-            uint64_t map=0;
-            app_pc addr;
-            bool is_write;
-            uint32_t pos;
-            for( int index=0; instr_compute_address_ex_pos(instr, &mcontext, index, &addr, &is_write, &pos); ++index ) {
-                DR_ASSERT(!is_write);
-                uint8_t* bytes = reinterpret_cast<uint8_t*>(addr);
-                bool hasRedundancy = (bytes[sizeof(T)-1]==0);
-                if(hasRedundancy) {
-                    if(sizeof(T)==4) { map = map | (UnrolledConjunctionApprox<0,sizeof(T),sizeof(T)>::BodyRedMap(bytes) << (SP_MAP_SIZE * pos) ); }
-                    else if(sizeof(T)==8) { map = map |  (UnrolledConjunctionApprox<0,sizeof(T),sizeof(T)>::BodyRedMap(bytes) << (DP_MAP_SIZE * pos) ); }
-                    zeros = zeros + UnrolledConjunctionApprox<0,sizeof(T),sizeof(T)>::BodyZeros(bytes);
-                }
-            }
-            AddToApproximateRedTable((uint64_t)curCtxtHandle, map, AccessLen, zeros, AccessLen/sizeof(T), sizeof(T), pt);
-        } else {
-            assert(0 && "VGather should be a floating point operation!");
-        }
-    }
-#endif
-};
-
-template<bool enable_sampling>
-static inline void CheckAfterLargeRead(int32_t slot, void* addr, uint32_t accessLen)
+static void
+insert_load(void *drcontext, instrlist_t *ilist, instr_t *where, reg_id_t dst,
+            reg_id_t src, ushort offset, opnd_size_t opsz)
 {
-    void *drcontext = dr_get_current_drcontext();
-    per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-#ifdef ENABLE_SAMPLING
-#ifdef USE_CLEANCALL
-    if(enable_sampling) {
-        if(!pt->sampleFlag) {
-            return ;
-        }
-    }
+    instr_t* ins_clone = instr_clone(drcontext, where);
+    switch (opsz) {
+    case OPSZ_1:
+        MINSERT(ilist, where,
+                XINST_CREATE_load_1byte(
+                    drcontext, opnd_create_reg(reg_resize_to_opsz(dst, opsz)),
+                    opnd_create_base_disp(src, DR_REG_NULL, 0, offset, opsz)));
+        break;
+    case OPSZ_2:
+        MINSERT(ilist, where,
+                XINST_CREATE_load_2bytes(
+                    drcontext, opnd_create_reg(reg_resize_to_opsz(dst, opsz)),
+                    opnd_create_base_disp(src, DR_REG_NULL, 0, offset, opsz)));
+        break;
+    case OPSZ_4:
+#if defined(X86_64) || defined(AARCH64)
+    case OPSZ_8:
 #endif
-#endif
-    context_handle_t curCtxtHandle = drcctlib_get_context_handle(drcontext, slot);
-    uint8_t* bytes = static_cast<uint8_t*>(addr);
-    // quick check whether the most significant byte of the read memory is redundant zero or not
-    bool hasRedundancy = (bytes[accessLen-1]==0);
-    if(hasRedundancy) {
-        // calculate redmap by binary reduction with bitwise operation
-        register uint64_t redbyteMap = 0;
-        int restLen = accessLen;
-        int index = 0;
-        while(restLen>=8) {
-            redbyteMap = (redbyteMap<<8) | count_zero_bytemap_int64(bytes+index);
-            restLen -= 8;
-            index += 8;
-        }
-        while(restLen>=4) {
-            redbyteMap = (redbyteMap<<4) | count_zero_bytemap_int32(bytes+index);
-            restLen -= 4;
-            index += 4;
-        }
-        while(restLen>=2) {
-            redbyteMap = (redbyteMap<<2) | count_zero_bytemap_int16(bytes+index);
-            restLen -= 2;
-            index += 2;
-        }
-        while(restLen>=1) {
-            redbyteMap = (redbyteMap<<1) | count_zero_bytemap_int8(bytes+index);
-            restLen -= 1;
-            index += 1;
-        }
-        // now redmap is calculated, count for redundancy
-        bool counting = true;
-        register uint64_t redbytesNum = 0;
-        restLen = accessLen;
-        while(counting && restLen>=8) {
-            restLen -= 8;
-            register uint8_t t = BitCountTable256[(redbyteMap>>restLen)&0xff];
-            redbytesNum += t;
-            if(t!=8) {
-                counting = false;
-                break;
-            }
-        }
-        while(counting && restLen>=4) {
-            restLen -= 4;
-            register uint8_t t = BitCountTable16[(redbyteMap>>restLen)&0xf];
-            redbytesNum += t;
-            if(t!=4) {
-                counting = false;
-                break;
-            }
-        }
-        while(counting && restLen>=2) {
-            restLen -= 2;
-            register uint8_t t = BitCountTable4[(redbyteMap>>restLen)&0x3];
-            redbytesNum += t;
-            if(t!=8) {
-                counting = false;
-                break;
-            }
-        }
-        // dont check here as this loop must execute only once
-        while(counting && restLen>=1) {
-            restLen -= 1;
-            register uint8_t t = (redbyteMap>>restLen)&0x1;
-            redbytesNum += t;
-        }
-        // report in RedTable
-        AddToRedTable((uint64_t)MAKE_CONTEXT_PAIR(accessLen, curCtxtHandle), redbytesNum, redbyteMap, accessLen, pt);
-    }
-    else {
-        AddToRedTable((uint64_t)MAKE_CONTEXT_PAIR(accessLen, curCtxtHandle), 0, 0, accessLen, pt);
+        MINSERT(ilist, where,
+                XINST_CREATE_load(drcontext,
+                                  opnd_create_reg(reg_resize_to_opsz(dst, opsz)),
+                                  opnd_create_base_disp(src, DR_REG_NULL, 0, offset, opsz)));
+        break;
+    default: DR_ASSERT(false); break;
     }
 }
-#ifdef ENABLE_SAMPLING
-/* Check if sampling is enabled */
-#ifdef ZEROSPY_DEBUG
-#define HANDLE_CASE(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) \
-do { \
-if(op_no_flush.get_value()) \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_INTPTR(ins_clone))); } else \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_INTPTR(ins_clone)); } } while(0)
-#else
-#define HANDLE_CASE(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) \
-do { \
-if(op_no_flush.get_value()) \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterRead, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg)); } else \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterRead, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg)); } } while(0)
 
-#endif
-
-#define HANDLE_LARGE() \
-do { \
-if(op_no_flush.get_value()) \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead<true/*sample*/>, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize)); } else \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead<false/* not */>, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize)); } } while(0)
-
-#ifdef X86
-#define HANDLE_VGATHER(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX, ins) \
-do { \
-if(op_no_flush.get_value()) \
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), true/*sample*/>::CheckNByteValueAfterVGather, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone)); } else\
-{ dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX), false/* not */>::CheckNByteValueAfterVGather, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone)); } } while (0)
-#endif
-
-#else
-/* NO SAMPLING */
-#ifdef ZEROSPY_DEBUG
-#define HANDLE_CASE(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) \
-dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX)>::CheckNByteValueAfterRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg),  OPND_CREATE_INTPTR(instr_get_app_pc(ins)))
-#else
-#define HANDLE_CASE(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX) \
-dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX)>::CheckNByteValueAfterRead, false, 2, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg))
-#endif
-
-#define HANDLE_LARGE() \
-dr_insert_clean_call(drcontext, bb, ins, (void *)CheckAfterLargeRead, false, 3, OPND_CREATE_CCT_INT(slot), opnd_create_reg(addr_reg), OPND_CREATE_CCT_INT(refSize))
-
-#ifdef X86
-#define HANDLE_VGATHER(T, ACCESS_LEN, ELEMENT_LEN, IS_APPROX, ins) \
-dr_insert_clean_call(drcontext, bb, ins, (void *)ZeroSpyAnalysis<T, (ACCESS_LEN), (ELEMENT_LEN), (IS_APPROX)>::CheckNByteValueAfterVGather, false, 2, OPND_CREATE_CCT_INT(slot), OPND_CREATE_INTPTR(ins_clone))
-#endif
-#endif /*ENABLE_SAMPLING*/
+template<int size>
+inline __attribute__((always_inline)) void insertStoreTraceBuffer(void *drcontext, instrlist_t *ilist, instr_t *where, int32_t slot, reg_id_t reg_addr, reg_id_t reg_ptr, trace_buf_t* trace_buffer)
+{
+    trace_buf_insert_load_buf_ptr(drcontext, trace_buffer, ilist, where, reg_ptr);
+    switch(size) {
+        case 1: {
+            reg_id_t reg_val = reg_resize_to_opsz(reg_addr,OPSZ_1);
+            insert_load(drcontext, ilist, where, reg_val, reg_addr, 0, OPSZ_1);
+            trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+                             opnd_create_reg(reg_val), OPSZ_1,
+                             offsetof(cache_t<size>, val));
+            break;
+        }
+        case 2: {
+            reg_id_t reg_val = reg_resize_to_opsz(reg_addr,OPSZ_2);
+            insert_load(drcontext, ilist, where, reg_val, reg_addr, 0, OPSZ_2);
+            trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+                             opnd_create_reg(reg_val), OPSZ_2,
+                             offsetof(cache_t<size>, val));
+            break;
+        }
+        case 4: {
+            reg_id_t reg_val = reg_resize_to_opsz(reg_addr,OPSZ_4);
+            insert_load(drcontext, ilist, where, reg_val, reg_addr, 0, OPSZ_4);
+            trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+                             opnd_create_reg(reg_val), OPSZ_4,
+                             offsetof(cache_t<size>, val));
+            break;
+        }
+        case 8: {
+            insert_load(drcontext, ilist, where, reg_addr, reg_addr, 0, OPSZ_8);
+            trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+                             opnd_create_reg(reg_addr), OPSZ_8,
+                             offsetof(cache_t<size>, val));
+            break;
+        }
+        case 16: {
+            reg_id_t scratch;
+            RESERVE_REG(drcontext, ilist, where, NULL, scratch);
+            // 0-7B
+            insert_load(drcontext, ilist, where, scratch, reg_addr, 0, OPSZ_8);
+            trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+                             opnd_create_reg(scratch), OPSZ_8,
+                             offsetof(cache_t<size>, val));
+            // 8-15B
+            insert_load(drcontext, ilist, where, scratch, reg_addr, 8, OPSZ_8);
+            trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+                             opnd_create_reg(scratch), OPSZ_8,
+                             offsetof(cache_t<size>, val)+8);
+            UNRESERVE_REG(drcontext, ilist, where, scratch);
+            break;
+        }
+        case 32: {
+            reg_id_t scratch;
+            RESERVE_REG(drcontext, ilist, where, NULL, scratch);
+            // 0-7B
+            insert_load(drcontext, ilist, where, scratch, reg_addr, 0, OPSZ_8);
+            trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+                             opnd_create_reg(scratch), OPSZ_8,
+                             offsetof(cache_t<size>, val));
+            // 8-15B
+            insert_load(drcontext, ilist, where, scratch, reg_addr, 8, OPSZ_8);
+            trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+                             opnd_create_reg(scratch), OPSZ_8,
+                             offsetof(cache_t<size>, val)+8);
+            // 16-23B
+            insert_load(drcontext, ilist, where, scratch, reg_addr, 16, OPSZ_8);
+            trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+                             opnd_create_reg(scratch), OPSZ_8,
+                             offsetof(cache_t<size>, val)+16);
+            // 24-31B
+            insert_load(drcontext, ilist, where, scratch, reg_addr, 24, OPSZ_8);
+            trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+                             opnd_create_reg(scratch), OPSZ_8,
+                             offsetof(cache_t<size>, val)+24);
+            UNRESERVE_REG(drcontext, ilist, where, scratch);
+            break;
+        }
+    }
+    drcctlib_get_context_handle_in_reg(drcontext, ilist, where, slot, reg_addr, reg_ptr);
+    trace_buf_insert_load_buf_ptr(drcontext, trace_buffer, ilist, where, reg_ptr);
+    trace_buf_insert_buf_store(drcontext, trace_buffer, ilist, where, reg_ptr, DR_REG_NULL,
+                             opnd_create_reg(reg_64_to_32(reg_addr)), OPSZ_4, offsetof(cache_t<size>, ctxt_hndl));
+    // update trace buffer
+    trace_buf_insert_update_buf_ptr(drcontext, trace_buffer, ilist, where, reg_ptr,
+                                  DR_REG_NULL, sizeof(cache_t<size>));
+}
 
 struct ZerospyInstrument{
-    static __attribute__((always_inline)) void InstrumentReadValueBeforeAndAfterLoading(void *drcontext, instrlist_t *bb, instr_t *ins, opnd_t opnd, reg_id_t addr_reg, reg_id_t scratch, int32_t slot)
+    static __attribute__((always_inline)) void InstrumentForTracing(void *drcontext, instrlist_t *bb, instr_t *ins, opnd_t opnd, int32_t slot, reg_id_t addr_reg, reg_id_t scratch)
+    {
+        uint32_t refSize = opnd_size_in_bytes(opnd_get_size(opnd));
+        if (refSize==0) {
+            // Something strange happened, so ignore it
+            return ;
+        }
+#ifdef ARM_CCTLIB
+        // Currently, we cannot identify the difference between floating point operand 
+        // and inter operand from instruction type (both is LD), so just ignore the fp
+        // FIXME i#4: to identify the floating point through data flow analysis.
+        if (false)
+#else
+        if (instr_is_floating(ins))
+#endif
+        {
+            uint32_t operSize = FloatOperandSizeTable(ins, opnd);
+            switch(refSize) {
+                case 4:
+                    insertStoreTraceBuffer<4>(drcontext, bb, ins, slot, addr_reg, scratch, trace_buffer_sp1);
+                    break;
+                case 8:
+                    insertStoreTraceBuffer<8>(drcontext, bb, ins, slot, addr_reg, scratch, trace_buffer_dp1);
+                    break;
+                case 16:
+                    if(operSize==4) {
+                        insertStoreTraceBuffer<16>(drcontext, bb, ins, slot, addr_reg, scratch, trace_buffer_sp4);
+                    } else if(operSize==8) {
+                        insertStoreTraceBuffer<16>(drcontext, bb, ins, slot, addr_reg, scratch, trace_buffer_dp2);
+                    }
+                    break;
+                case 32:
+                    if(operSize==4) {
+                        insertStoreTraceBuffer<32>(drcontext, bb, ins, slot, addr_reg, scratch, trace_buffer_sp8);
+                    } else if(operSize==8) {
+                        insertStoreTraceBuffer<32>(drcontext, bb, ins, slot, addr_reg, scratch, trace_buffer_dp4);
+                    }
+                    break;
+                default:
+                    assert(0 && "Unknown refSize\n");
+            }
+        } else {
+            switch(refSize) {
+                case 1:
+                    insertStoreTraceBuffer<1>(drcontext, bb, ins, slot, addr_reg, scratch, trace_buffer_i1);
+                    break;
+                case 2:
+                    insertStoreTraceBuffer<2>(drcontext, bb, ins, slot, addr_reg, scratch, trace_buffer_i2);
+                    break;
+                case 4:
+                    insertStoreTraceBuffer<4>(drcontext, bb, ins, slot, addr_reg, scratch, trace_buffer_i4);
+                    break;
+                case 8:
+                    insertStoreTraceBuffer<8>(drcontext, bb, ins, slot, addr_reg, scratch, trace_buffer_i8);
+                    break;
+                case 16:
+                    insertStoreTraceBuffer<16>(drcontext, bb, ins, slot, addr_reg, scratch, trace_buffer_i16);
+                    break;
+                case 32:
+                    insertStoreTraceBuffer<32>(drcontext, bb, ins, slot, addr_reg, scratch, trace_buffer_i32);
+                    break;
+                default:
+                    assert(0 && "Unknown refSize\n");
+            }
+        }
+    }
+
+    static __attribute__((always_inline)) void InstrumentReadValueBeforeAndAfterLoading(void *drcontext, instrlist_t *bb, instr_t *ins, opnd_t opnd, int32_t slot, reg_id_t addr_reg, reg_id_t scratch)
     {
         uint32_t refSize = opnd_size_in_bytes(opnd_get_size(opnd));
         if (refSize==0) {
@@ -2093,104 +1541,10 @@ struct ZerospyInstrument{
         {
             uint32_t operSize = FloatOperandSizeTable(ins, opnd);
             if(operSize>0) {
-                switch(refSize) {
-                    case 1:
-                    case 2:
-#ifdef _WERROR
-                        printf("\nERROR: refSize for floating point instruction is too small: %d!\n", refSize);
-                        printf("^^ Disassembled Instruction ^^^\n");
-                        disassemble(drcontext, instr_get_app_pc(ins), 1/*sdtout file desc*/);
-                        printf("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
-                        fflush(stdout);
-                        assert(0 && "memory read floating data with unexptected small size");
-#else
-                        dr_mutex_lock(gLock);
-                        dr_fprintf(fwarn, "\nERROR: refSize for floating point instruction is too small: %d!\n", refSize);
-                        dr_fprintf(fwarn, "^^ Disassembled Instruction ^^^\n");
-                        disassemble(drcontext, instr_get_app_pc(ins), fwarn);
-                        dr_fprintf(fwarn, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
-                        warned = true;
-                        dr_mutex_unlock(gLock);
-                        /* Do nothing, just report warning */
-                        break;
-#endif
-                    case 4: HANDLE_CASE(float, 4, 4, true); break;
-                    case 8: HANDLE_CASE(double, 8, 8, true); break;
-                    case 10: HANDLE_CASE(uint8_t, 10, 1, true); break;
-                    case 16: {
-                        switch (operSize) {
-                            case 4: HANDLE_CASE(float, 16, 4, true); break;
-                            case 8: HANDLE_CASE(double, 16, 8, true); break;
-                            default: assert(0 && "handle large mem read with unexpected operand size\n"); break;
-                        }
-                    }break;
-                    case 32: {
-                        switch (operSize) {
-                            case 4: HANDLE_CASE(float, 32, 4, true); break;
-                            case 8: HANDLE_CASE(double, 32, 8, true); break;
-                            default: assert(0 && "handle large mem read with unexpected operand size\n"); break;
-                        }
-                    }break;
-                    default: 
-#ifdef _WERROR
-                        printf("\nERROR: refSize for floating point instruction is too large: %d!\n", refSize);
-                        printf("^^ Disassembled Instruction ^^^\n");
-                        disassemble(drcontext, instr_get_app_pc(ins), 1/*sdtout file desc*/);
-                        printf("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
-                        fflush(stdout);
-                        assert(0 && "unexpected large memory read\n"); break;
-#else
-                        dr_mutex_lock(gLock);
-                        dr_fprintf(fwarn, "\nERROR: refSize for floating point instruction is too large: %d!\n", refSize);
-                        dr_fprintf(fwarn, "^^ Disassembled Instruction ^^^\n");
-                        disassemble(drcontext, instr_get_app_pc(ins), fwarn);
-                        dr_fprintf(fwarn, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
-                        warned = true;
-                        dr_mutex_unlock(gLock);
-                        /* Do nothing, just report warning */
-                        break;
-#endif
-                }
+                insertCheckAndUpdateFp<false>(drcontext, bb, ins, refSize, operSize, slot, addr_reg, scratch);
             }
         } else {
-            if(op_no_flush.get_value()) {
-                switch(refSize) {
-#ifdef SKIP_SMALLCASE
-                    // do nothing when access is small
-                    case 1: break;
-                    case 2: break;
-#else
-                    case 1: HANDLE_CASE(uint8_t, 1, 1, false); break;
-                    case 2: HANDLE_CASE(uint16_t, 2, 2, false); break;
-#endif
-                    case 4: HANDLE_CASE(uint32_t, 4, 4, false); break;
-                    case 8: HANDLE_CASE(uint64_t, 8, 8, false); break;
-                        
-                    default: {
-                        HANDLE_LARGE();
-                    }
-                }
-            } else {
-                reg_id_t reg_ctxt, reg_base;
-                // We use the scratch to store the calling context value from drcctlib
-                reg_ctxt = scratch;
-                bool is_saved = !drx_aflags_are_dead(ins);
-                if(is_saved) {
-                    MINSERT(bb, ins, INSTR_CREATE_pushf(ins));
-                }
-                RESERVE_REG(drcontext, bb, ins, NULL, reg_base);
-                drcctlib_get_context_handle_in_reg(drcontext, bb, ins, slot, reg_ctxt, reg_base);
-                dr_insert_read_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_VAL_CACHE_PTR, reg_base);
-                insertSaveCachedKey(drcontext, bb, ins, /*elemSize=*/refSize, /*accesslen=*/refSize, /*isApprox=*/0, reg_base, reg_ctxt, scratch);
-                insertComputeAndCacheRedmap_INT(drcontext, bb, ins, refSize, reg_base, addr_reg, scratch);
-                // store the new cache pointer to the TLS field
-                MINSERT(bb, ins, XINST_CREATE_add(drcontext, opnd_create_reg(reg_base), OPND_CREATE_CCT_INT(sizeof(val_cache_t))));
-                dr_insert_write_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_VAL_CACHE_PTR, reg_base);
-                UNRESERVE_REG(drcontext, bb, ins, reg_base);
-                if(is_saved) {
-                    MINSERT(bb, ins, INSTR_CREATE_popf(ins));
-                }
-            }
+            insertCheckAndUpdateInt<false>(drcontext, bb, ins, refSize, refSize>8?1:refSize, slot, addr_reg, scratch);
         }
     }
 #ifdef X86
@@ -2214,57 +1568,33 @@ struct ZerospyInstrument{
             case 4: 
             case 8: 
             case 10: 
-#ifdef _WERROR
-                    printf("\nERROR: refSize for floating point instruction is too small: %d!\n", refSize);
-                    printf("^^ Disassembled Instruction ^^^\n");
-                    disassemble(drcontext, instr_get_app_pc(ins), 1/*sdtout file desc*/);
-                    printf("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
-                    fflush(stdout);
-                    assert(0 && "memory read floating data with unexptected small size");
-#else
-                    dr_mutex_lock(gLock);
-                    dr_fprintf(fwarn, "\nERROR: refSize for floating point instruction is too small: %d!\n", refSize);
-                    dr_fprintf(fwarn, "^^ Disassembled Instruction ^^^\n");
-                    disassemble(drcontext, instr_get_app_pc(ins), fwarn);
-                    dr_fprintf(fwarn, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
-                    warned = true;
-                    dr_mutex_unlock(gLock);
-                    /* Do nothing, just report warning */
-                    break;
-#endif
+                printf("\nERROR: refSize for floating point instruction is too small: %d!\n", refSize);
+                printf("^^ Disassembled Instruction ^^^\n");
+                disassemble(drcontext, instr_get_app_pc(ins), 1/*sdtout file desc*/);
+                printf("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                fflush(stdout);
+                assert(0 && "memory read floating data with unexptected small size");
             case 16: {
                 switch (operSize) {
-                    case 4: HANDLE_VGATHER(float, 16, 4, true, ins); break;
-                    case 8: HANDLE_VGATHER(double, 16, 8, true, ins); break;
+                    case 4: HANDLE_VGATHER(float, 16, 4, true); break;
+                    case 8: HANDLE_VGATHER(double, 16, 8, true); break;
                     default: assert(0 && "handle large mem read with unexpected operand size\n"); break;
                 }
             }break;
             case 32: {
                 switch (operSize) {
-                    case 4: HANDLE_VGATHER(float, 32, 4, true, ins); break;
-                    case 8: HANDLE_VGATHER(double, 32, 8, true, ins); break;
+                    case 4: HANDLE_VGATHER(float, 32, 4, true); break;
+                    case 8: HANDLE_VGATHER(double, 32, 8, true); break;
                     default: assert(0 && "handle large mem read with unexpected operand size\n"); break;
                 }
             }break;
             default: 
-#ifdef _WERROR
-                    printf("\nERROR: refSize for floating point instruction is too large: %d!\n", refSize);
-                    printf("^^ Disassembled Instruction ^^^\n");
-                    disassemble(drcontext, instr_get_app_pc(ins), 1/*sdtout file desc*/);
-                    printf("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
-                    fflush(stdout);
-                    assert(0 && "unexpected large memory read\n"); break;
-#else
-                    dr_mutex_lock(gLock);
-                    dr_fprintf(fwarn, "\nERROR: refSize for floating point instruction is too large: %d!\n", refSize);
-                    dr_fprintf(fwarn, "^^ Disassembled Instruction ^^^\n");
-                    disassemble(drcontext, instr_get_app_pc(ins), fwarn);
-                    dr_fprintf(fwarn, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
-                    warned = true;
-                    dr_mutex_unlock(gLock);
-                    /* Do nothing, just report warning */
-                    break;
-#endif
+                printf("\nERROR: refSize for floating point instruction is too large: %d!\n", refSize);
+                printf("^^ Disassembled Instruction ^^^\n");
+                disassemble(drcontext, instr_get_app_pc(ins), 1/*sdtout file desc*/);
+                printf("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                fflush(stdout);
+                assert(0 && "unexpected large memory read\n"); break;
         }
     }
 #endif
@@ -2282,45 +1612,80 @@ inline void getUnusedRegEntry(drvector_t* vec, instr_t* instr) {
 }
 
 static void
-InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, int32_t slot, reg_id_t reg1, reg_id_t reg2)
+InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, int32_t slot, reg_id_t reg_addr, reg_id_t scratch, bool need_restore_0, bool need_restore_1)
 {
-    if (!drutil_insert_get_mem_addr(drcontext, ilist, where, ref, reg1/*addr*/,
-                                    reg2/*scratch*/)) {
-#ifdef _WERROR
+    if (need_restore_0) {
+        if (opnd_uses_reg(ref, reg_addr) &&
+            drreg_get_app_value(drcontext, ilist, where, reg_addr, reg_addr) != DRREG_SUCCESS) {
+            ZEROSPY_EXIT_PROCESS("InstrumentMemAll drreg_get_app_value reg_addr failed!");
+        }
+    }
+    if (need_restore_1) {
+        if (opnd_uses_reg(ref, scratch) &&
+            drreg_get_app_value(drcontext, ilist, where, scratch, scratch) != DRREG_SUCCESS) {
+            ZEROSPY_EXIT_PROCESS("InstrumentMemAll drreg_get_app_value scratch failed!");
+        }
+    }
+    if (!drutil_insert_get_mem_addr(drcontext, ilist, where, ref, reg_addr/*addr*/,
+                                    scratch/*scratch*/)) {
         dr_fprintf(STDERR, "\nERROR: drutil_insert_get_mem_addr failed!\n");
         dr_fprintf(STDERR, "^^ Disassembled Instruction ^^^\n");
         disassemble(drcontext, instr_get_app_pc(where), STDERR);
         dr_fprintf(STDERR, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
         ZEROSPY_EXIT_PROCESS("InstrumentMem drutil_insert_get_mem_addr failed!");
-#else
-        dr_mutex_lock(gLock);
-        dr_fprintf(fwarn, "\nERROR: drutil_insert_get_mem_addr failed!\n");
-        dr_fprintf(fwarn, "^^ Disassembled Instruction ^^^\n");
-        disassemble(drcontext, instr_get_app_pc(where), fwarn);
-        dr_fprintf(fwarn, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
-        warned = true;
-        dr_mutex_unlock(gLock);
-#endif
     } else {
-        drvector_t vec;
-        getUnusedRegEntry(&vec, where);
-        instr_t* skipcall = NULL;
-        // RESERVE_AFLAGS(drcontext, ilist, where);
-        if(op_enable_sampling.get_value()) {
-            dr_insert_read_raw_tls(drcontext, ilist, where, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg2);
-            // Clear insCnt when insCnt > WINDOW_DISABLE
-            MINSERT(ilist, where, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg2), OPND_CREATE_CCT_INT(window_enable)));
-            skipcall = INSTR_CREATE_label(drcontext);
-            MINSERT(ilist, where, XINST_CREATE_jump_cond(drcontext, DR_PRED_GT, opnd_create_instr(skipcall)));
-        }
-        ZerospyInstrument::InstrumentReadValueBeforeAndAfterLoading(drcontext, ilist, where, ref, reg1, reg2, slot);
-        if(op_enable_sampling.get_value()) {
-            assert(skipcall!=NULL);
-            MINSERT(ilist, where, skipcall);
+        // ZerospyInstrument::InstrumentReadValueBeforeAndAfterLoading(drcontext, ilist, where, ref, slot, reg_addr, scratch);
+        ZerospyInstrument::InstrumentForTracing(drcontext, ilist, where, ref, slot, reg_addr, scratch);
+    }
+}
+
+void InstrumentMemAll(void* drcontext, instrlist_t *bb, instr_t* instr, int32_t slot)
+{
+    reg_id_t reg_addr, scratch, reg_xchg=DR_REG_NULL;
+    RESERVE_REG(drcontext, bb, instr, NULL, reg_addr);
+    RESERVE_REG(drcontext, bb, instr, NULL, scratch);
+    int num_srcs = instr_num_srcs(instr);
+    int memop = 0;
+    for(int i=0; i<num_srcs; ++i) {
+        opnd_t opnd = instr_get_src(instr, i);
+        if(opnd_is_memory_reference(opnd)) {
+            bool need_restore_1 = memop>0;
+            bool need_restore_0 = op_enable_sampling.get_value() || need_restore_1;
+            InstrumentMem(drcontext, bb, instr, opnd, slot, reg_addr, scratch, need_restore_0, need_restore_1);
+            ++memop;
         }
         // UNRESERVE_AFLAGS(drcontext, ilist, where);
     }
+    UNRESERVE_REG(drcontext, bb, instr, scratch);
+    UNRESERVE_REG(drcontext, bb, instr, reg_addr);
 }
+
+#ifdef X86
+void InstrumentVGather(void* drcontext, instrlist_t *bb, instr_t* instr, int32_t slot)
+{
+    // if(op_enable_sampling.get_value()) {
+    //     drvector_t vec;
+    //     reg_id_t reg_ctxt;
+    //     RESERVE_AFLAGS(drcontext, bb, instr);
+    //     instr_t* skipcall = INSTR_CREATE_label(drcontext);
+    //     getUnusedRegEntry(&vec, instr);
+    //     RESERVE_REG(drcontext, bb, instr, &vec, reg_ctxt);
+    //     dr_insert_read_raw_tls(drcontext, bb, instr, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ctxt);
+    //     // Clear insCnt when insCnt > WINDOW_DISABLE
+    //     MINSERT(bb, instr, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ctxt), OPND_CREATE_CCT_INT(window_enable)));
+    //     MINSERT(bb, instr, XINST_CREATE_jump_cond(drcontext, DR_PRED_GT, opnd_create_instr(skipcall)));
+    //     // We use instr_compute_address_ex_pos to handle gather (with VSIB addressing)
+    //     ZerospyInstrument::InstrumentReadValueBeforeVGather(drcontext, bb, instr, slot);
+    //     MINSERT(bb, instr, skipcall);
+    //     UNRESERVE_REG(drcontext, bb, instr, reg_ctxt);
+    //     UNRESERVE_AFLAGS(drcontext, bb, instr);
+    //     drvector_delete(&vec);
+    // } else {
+        // We use instr_compute_address_ex_pos to handle gather (with VSIB addressing)
+        ZerospyInstrument::InstrumentReadValueBeforeVGather(drcontext, bb, instr, slot);
+    // }
+}
+#endif
 
 void
 InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
@@ -2337,7 +1702,6 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
     // If this instr is prefetch, the memory address is not guaranteed to be valid, and it may be also ignored by hardware
     // Besides, prefetch instructions are not the actual memory access instructions, so we also ignore them
     if(instr_is_prefetch(instr)) return;
-
     // Currently, we mark x87 control instructions handling FPU states are ignorable (not insterested)
     if(instr_is_ignorable(instr)) {
         return ;
@@ -2373,107 +1737,14 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
         if(ignore) return ;
     }
 
-    // store cct in tls filed
-    // InstrumentIns(drcontext, bb, instr, slot);
-    /* We need two scratch registers to get the value */
-    reg_id_t reg1, reg2;
-#ifdef USE_CLEANCALL
 #ifdef X86
-    // gather may result in failure, need special care
     if(instr_is_gather(instr)) {
-        // We use instr_compute_address_ex_pos to handle gather (with VSIB addressing)
-        ZerospyInstrument::InstrumentReadValueBeforeVGather(drcontext, bb, instr, slot);
+        InstrumentVGather(drcontext, bb, instr, slot);
     } else
 #endif
     {
-        drvector_t vec;
-        getUnusedRegEntry(&vec, instr);
-        RESERVE_REG(drcontext, bb, instr, &vec, reg1);
-        RESERVE_REG(drcontext, bb, instr, &vec, reg2);
-        int num_srcs = instr_num_srcs(instr);
-        for(int i=0; i<num_srcs; ++i) {
-            opnd_t opnd = instr_get_src(instr, i);
-            if(opnd_is_memory_reference(opnd)) {
-                InstrumentMem(drcontext, bb, instr, opnd, slot, reg1, reg2);
-            }
-        }
-        UNRESERVE_REG(drcontext, bb, instr, reg1);
-        UNRESERVE_REG(drcontext, bb, instr, reg2);
+        InstrumentMemAll(drcontext, bb, instr, slot);
     }
-#else
-// ELSE USE_CLEANCALL
-#ifdef ARM_CCTLIB
-    drvector_t vec;
-    getUnusedRegEntry(&vec, instr);
-    RESERVE_REG(drcontext, bb, instr, &vec, reg1);
-    RESERVE_REG(drcontext, bb, instr, &vec, reg2);
-    instr_t* skipcall = NULL;
-    bool dead = false;
-    if(op_no_flush.get_value()) {
-        RESERVE_AFLAGS(drcontext, bb, instr);
-        dr_insert_read_raw_tls(drcontext, bb, instr, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg1);
-        // Clear insCnt when insCnt > WINDOW_DISABLE
-        minstr_load_wint_to_reg(drcontext, bb, instr, reg2, window_enable);
-        MINSERT(bb, instr, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg1), opnd_create_reg(reg2)));
-        skipcall = INSTR_CREATE_label(drcontext);
-        MINSERT(bb, instr, XINST_CREATE_jump_cond(drcontext, DR_PRED_GT, opnd_create_instr(skipcall)));
-    }
-    int num_srcs = instr_num_srcs(instr);
-    for(int i=0; i<num_srcs; ++i) {
-        opnd_t opnd = instr_get_src(instr, i);
-        if(opnd_is_memory_reference(opnd)) {
-            InstrumentMem(drcontext, bb, instr, opnd, slot, reg1, reg2);
-        }
-    }
-    if(op_no_flush.get_value()) {
-        assert(skipcall!=NULL);
-        MINSERT(bb, instr, skipcall);
-        UNRESERVE_AFLAGS(drcontext, bb, instr);
-    }
-    UNRESERVE_REG(drcontext, bb, instr, reg1);
-    UNRESERVE_REG(drcontext, bb, instr, reg2);
-#else
-// X86 architecture
-    drvector_t vec;
-    getUnusedRegEntry(&vec, instr);
-#ifdef X86
-    // gather may result in failure, need special care
-    if(instr_is_gather(instr)) {
-        instr_t* skipcall = NULL;
-        if(op_enable_sampling.get_value()) {
-            RESERVE_AFLAGS(drcontext, bb, instr);
-            RESERVE_REG(drcontext, bb, instr, &vec, reg1);
-            dr_insert_read_raw_tls(drcontext, bb, instr, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg1);
-            // Clear insCnt when insCnt > WINDOW_DISABLE
-            MINSERT(bb, instr, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg1), OPND_CREATE_CCT_INT(window_enable)));
-            skipcall = INSTR_CREATE_label(drcontext);
-            MINSERT(bb, instr, XINST_CREATE_jump_cond(drcontext, DR_PRED_GT, opnd_create_instr(skipcall)));
-        }
-        // We use instr_compute_address_ex_pos to handle gather (with VSIB addressing)
-        ZerospyInstrument::InstrumentReadValueBeforeVGather(drcontext, bb, instr, slot);
-        if(op_enable_sampling.get_value()) {
-            assert(skipcall!=NULL);
-            MINSERT(bb, instr, skipcall);
-            UNRESERVE_REG(drcontext, bb, instr, reg1);
-            UNRESERVE_AFLAGS(drcontext, bb, instr);
-        }
-    } else
-#endif
-    {
-        RESERVE_REG(drcontext, bb, instr, &vec, reg1);
-        RESERVE_REG(drcontext, bb, instr, &vec, reg2);
-        int num_srcs = instr_num_srcs(instr);
-        for(int i=0; i<num_srcs; ++i) {
-            opnd_t opnd = instr_get_src(instr, i);
-            if(opnd_is_memory_reference(opnd)) {
-                InstrumentMem(drcontext, bb, instr, opnd, slot, reg1, reg2);
-            }
-        }
-        UNRESERVE_REG(drcontext, bb, instr, reg1);
-        UNRESERVE_REG(drcontext, bb, instr, reg2);
-    }
-#endif
-#endif
 }
 
 static void
@@ -2486,8 +1757,17 @@ ThreadOutputFileInit(per_thread_t *pt)
     DR_ASSERT(pt->output_file != INVALID_FILE);
     if (op_enable_sampling.get_value()) {
         dr_fprintf(pt->output_file, "[ZEROSPY INFO] Sampling Enabled\n");
+    } else {
+        dr_fprintf(pt->output_file, "[ZEROSPY INFO] Sampling Disabled\n");
     }
 }
+
+#define DEBUG_PRINT_TB_INFO(tb) \
+    IF_DEBUG(dr_fprintf(STDOUT, #tb ": buf_ptr=%p, buf_base=%p, buf_end=%p, buf_size=%ld\n", \
+        trace_buf_get_buffer_ptr(drcontext, tb), \
+        trace_buf_get_buffer_base(drcontext, tb), \
+        trace_buf_get_buffer_end(drcontext, tb), \
+        trace_buf_get_buffer_size(drcontext, tb)))
 
 static void
 ClientThreadStart(void *drcontext)
@@ -2497,25 +1777,29 @@ ClientThreadStart(void *drcontext)
     if (pt == NULL) {
         ZEROSPY_EXIT_PROCESS("pt == NULL");
     }
-    pt->INTRedMap = new unordered_map<uint64_t, INTRedLogs>();
-    pt->FPRedMap = new unordered_map<uint64_t, FPRedLogs>();
+    pt->INTRedLogMap = new INTRedLogMap_t();
+    pt->FPRedLogMap = new FPRedLogMap_t();
+    // pt->FPRedLogMap->rehash(10000000);
+    // pt->INTRedLogMap->rehash(10000000);
     pt->instr_clones = new vector<instr_t*>();
-    pt->INTRedMap->rehash(10000000);
-    pt->FPRedMap->rehash(10000000);
-#ifdef ENABLE_SAMPLING
-#ifdef USE_CLEANCALL
-    pt->numIns = 0;
-    pt->sampleFlag = true;
-#else
     pt->numInsBuff = dr_get_dr_segment_base(tls_seg);
     BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR) = 0;
-    pt->cache_ptr = (val_cache_t*)dr_global_alloc(MAX_CACHE_SIZE*sizeof(val_cache_t));
-    pt->cache_val_num = 0;
-    BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_VAL_CACHE_PTR) = pt->cache_ptr;
-#endif
-#endif
     drmgr_set_tls_field(drcontext, tls_idx, (void *)pt);
+    // init output files
     ThreadOutputFileInit(pt);
+    // check trace
+    DEBUG_PRINT_TB_INFO(trace_buffer_i1);
+    DEBUG_PRINT_TB_INFO(trace_buffer_i2);
+    DEBUG_PRINT_TB_INFO(trace_buffer_i4);
+    DEBUG_PRINT_TB_INFO(trace_buffer_i8);
+    DEBUG_PRINT_TB_INFO(trace_buffer_i16);
+    DEBUG_PRINT_TB_INFO(trace_buffer_i32);
+    DEBUG_PRINT_TB_INFO(trace_buffer_sp1);
+    DEBUG_PRINT_TB_INFO(trace_buffer_sp4);
+    DEBUG_PRINT_TB_INFO(trace_buffer_sp8);
+    DEBUG_PRINT_TB_INFO(trace_buffer_dp1);
+    DEBUG_PRINT_TB_INFO(trace_buffer_dp2);
+    DEBUG_PRINT_TB_INFO(trace_buffer_dp4);
 }
 
 /*******************************************************************/
@@ -2549,38 +1833,42 @@ static inline bool ApproxRedundacyCompare(const struct ApproxRedundacyData &firs
 #define LOGGING_THRESHOLD 100
 #endif
 
-#include <omp.h>
-
-static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad, int threadId) {
+static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad, int threadId) 
+{
     vector<RedundacyData> tmpList;
     vector<RedundacyData>::iterator tmpIt;
 
     file_t gTraceFile = pt->output_file;
     
     uint64_t grandTotalRedundantBytes = 0;
-    tmpList.reserve(pt->INTRedMap->size());
-    printf("Dumping INTEGER Redundancy Info... Total num : %ld\n",pt->INTRedMap->size());
-    fflush(stdout);
-    dr_fprintf(gTraceFile, "\n--------------- Dumping INTEGER Redundancy Info ----------------\n");
-    dr_fprintf(gTraceFile, "\n*************** Dump Data from Thread %d ****************\n", threadId);
-    uint64_t count = 0; uint64_t rep = -1;
-    for (unordered_map<uint64_t, INTRedLogs>::iterator it = pt->INTRedMap->begin(); it != pt->INTRedMap->end(); ++it) {
+    tmpList.reserve(pt->INTRedLogMap->size());
+    dr_fprintf(STDOUT, "Dumping INTEGER Redundancy Info...\n");
+    uint64_t count = 0, rep = -1, num = 0;
+    for(auto it=pt->INTRedLogMap->begin(); it!=pt->INTRedLogMap->end(); ++it) {
         ++count;
-        if(100 * count / pt->INTRedMap->size()!=rep) {
-            rep = 100 * count / pt->INTRedMap->size();
-            printf("\r%ld%%  Finish",rep);
-            fflush(stdout);
+        if(100 * count / (pt->INTRedLogMap->size())!=rep) {
+            rep = 100 * count / (pt->INTRedLogMap->size());
+            dr_fprintf(STDOUT, "\r%ld%%  Finish",rep); fflush(stdout);
         }
-        RedundacyData tmp = { DECODE_KILL((*it).first), (*it).second.red,(*it).second.fred,(*it).second.tot,(*it).second.redByteMap,DECODE_DEAD((*it).first)};
+        uint64_t tot = DECODE_SRC(it->second.tot);
+        uint8_t accessLen = DECODE_UPPER(it->second.tot);
+        RedundacyData tmp = { it->first, it->second.red,        it->second.fred,
+                              tot,       it->second.redByteMap, accessLen };
         tmpList.push_back(tmp);
         grandTotalRedundantBytes += tmp.frequency;
+        ++num;
     }
-    printf("\r100%%  Finish\n");
-    fflush(stdout);
+    dr_fprintf(STDOUT, "\r100%%  Finish, Total num = %ld\n", count); fflush(stdout);
+    if(count == 0) {
+        dr_fprintf(STDOUT, "Warning: No valid profiling data is logged!\n");
+        return 0;
+    }
+
+    dr_fprintf(gTraceFile, "\n--------------- Dumping INTEGER Redundancy Info ----------------\n");
+    dr_fprintf(gTraceFile, "\n*************** Dump Data from Thread %d ****************\n", threadId);
     
     __sync_fetch_and_add(&grandTotBytesRedLoad,grandTotalRedundantBytes);
-    printf("Extracted Raw data, now sorting...\n");
-    fflush(stdout);
+    dr_fprintf(STDOUT, "Extracted Raw data, now sorting...\n"); fflush(stdout);
     
     dr_fprintf(gTraceFile, "\n Total redundant bytes = %f %%\n", grandTotalRedundantBytes * 100.0 / threadBytesLoad);
     dr_fprintf(gTraceFile, "\n INFO : Total redundant bytes = %f %% (%ld / %ld) \n", grandTotalRedundantBytes * 100.0 / threadBytesLoad, grandTotalRedundantBytes, threadBytesLoad);
@@ -2603,8 +1891,7 @@ static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad,
 #endif
 
     sort(tmpList.begin(), tmpList.end(), RedundacyCompare);
-    printf("Sorted, Now generating reports...\n");
-    fflush(stdout);
+    dr_fprintf(STDOUT, "Sorted, Now generating reports...\n"); fflush(stdout);
     int cntxtNum = 0;
     for (vector<RedundacyData>::iterator listIt = tmpList.begin(); listIt != tmpList.end(); ++listIt) {
         if (cntxtNum < MAX_REDUNDANT_CONTEXTS_TO_LOG) {
@@ -2634,38 +1921,48 @@ static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad,
         cntxtNum++;
     }
     dr_fprintf(gTraceFile, "\n------------ Dumping INTEGER Redundancy Info Finish -------------\n");
-    printf("INTEGER Report dumped\n");
-    fflush(stdout);
+    dr_fprintf(STDOUT, "INTEGER Report dumped\n"); fflush(stdout);
     return grandTotalRedundantBytes;
 }
 
-static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad, int threadId) {
+static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad, int threadId) 
+{
     vector<ApproxRedundacyData> tmpList;
     vector<ApproxRedundacyData>::iterator tmpIt;
-    tmpList.reserve(pt->FPRedMap->size());
+    tmpList.reserve(pt->FPRedLogMap->size());
     
     file_t gTraceFile = pt->output_file;
-
     uint64_t grandTotalRedundantBytes = 0;
-    uint64_t grandTotalRedundantIns = 0;
+
+    dr_fprintf(STDOUT, "Dumping FLOATING POINT Redundancy Info...\n");
+    uint64_t count = 0, rep = -1, num = 0;
+    for (auto it=pt->FPRedLogMap->begin(); it!=pt->FPRedLogMap->end(); ++it) {
+        ++count;
+        if(100 * count / (pt->FPRedLogMap->size())!=rep) {
+            rep = 100 * count / (pt->FPRedLogMap->size());
+            dr_fprintf(STDOUT, "\r%ld%%  Finish",rep); fflush(stdout);
+        }
+        uint8_t accessLen = DECODE_UPPER(it->second.ftot);
+        uint8_t elementSize = DECODE_UPPER(it->second.fred);
+        uint64_t redByteMap = it->second.redByteMap;
+        ApproxRedundacyData tmp = { it->first,
+                                    DECODE_SRC(it->second.fred),
+                                    DECODE_SRC(it->second.ftot),
+                                    redByteMap,
+                                    accessLen,
+                                    elementSize };
+        tmpList.push_back(tmp);
+        grandTotalRedundantBytes += DECODE_SRC(it->second.fred) * accessLen;
+        ++num;
+    }
+    dr_fprintf(STDOUT, "\r100%%  Finish, Total num = %ld\n", count); fflush(stdout);
+    if(count == 0) {
+        dr_fprintf(STDOUT, "Warning: No valid profiling data is logged!\n");
+        return 0;
+    }
+
     dr_fprintf(gTraceFile, "\n--------------- Dumping Approximation Redundancy Info ----------------\n");
     dr_fprintf(gTraceFile, "\n*************** Dump Data(delta=%.2f%%) from Thread %d ****************\n", delta*100,threadId);
-
-    printf("Dumping INTEGER Redundancy Info... Total num : %ld\n",pt->FPRedMap->size());
-    uint64_t count = 0; uint64_t rep = -1;
-    for (unordered_map<uint64_t, FPRedLogs>::iterator it = pt->FPRedMap->begin(); it != pt->FPRedMap->end(); ++it) {
-        ++count;
-        if(100 * count / pt->INTRedMap->size()!=rep) {
-            rep = 100 * count / pt->INTRedMap->size();
-            printf("\r%ld%%  Finish",rep);
-            fflush(stdout);
-        }
-        ApproxRedundacyData tmp = { static_cast<context_handle_t>((*it).first), (*it).second.fred,(*it).second.ftot, (*it).second.redByteMap,(*it).second.AccessLen, (*it).second.size};
-        tmpList.push_back(tmp);
-        grandTotalRedundantBytes += (*it).second.fred * (*it).second.AccessLen;
-    }
-    printf("\r100%%  Finish\n");
-    fflush(stdout);
     
     __sync_fetch_and_add(&grandTotBytesApproxRedLoad,grandTotalRedundantBytes);
     
@@ -2698,7 +1995,7 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
                 (*listIt).all0freq * 100.0 / grandTotalRedundantBytes,
                 (*listIt).all0freq * 100.0 / (*listIt).ftot,
                 (*listIt).all0freq,(*listIt).ftot); 
-            dr_fprintf(gTraceFile, "\n======= Redundant byte map : [mantiss | exponent | sign] ========\n");
+            dr_fprintf(gTraceFile, "\n======= Redundant byte map : [ sign | exponent | mantissa ] ========\n");
             if((*listIt).size==4) {
                 dr_fprintf(gTraceFile, "%s", getFpRedMapString_SP((*listIt).byteMap, (*listIt).accessLen/4).c_str());
             } else {
@@ -2721,15 +2018,20 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
 /*******************************************************************/
 static uint64_t getThreadByteLoad(per_thread_t *pt) {
     register uint64_t x = 0;
-    for (unordered_map<uint64_t, INTRedLogs>::iterator it = pt->INTRedMap->begin(); it != pt->INTRedMap->end(); ++it) {
-        x += (*it).second.tot;
+    for (auto it=pt->INTRedLogMap->begin(); it!=pt->INTRedLogMap->end(); ++it) {
+        x += DECODE_SRC(it->second.tot);
     }
-    for (unordered_map<uint64_t, FPRedLogs>::iterator it = pt->FPRedMap->begin(); it != pt->FPRedMap->end(); ++it) {
-        x += (*it).second.ftot * (*it).second.AccessLen;
+    for (auto it=pt->FPRedLogMap->begin(); it!=pt->FPRedLogMap->end(); ++it) {
+        x += DECODE_SRC(it->second.ftot) * DECODE_UPPER(it->second.ftot);
     }
     return x;
 }
 /*******************************************************************/
+static void
+ClientThreadEndFortrace(void *drcontext) {
+    handleBufferUpdate();
+}
+
 static void
 ClientThreadEnd(void *drcontext)
 {
@@ -2738,32 +2040,32 @@ ClientThreadEnd(void *drcontext)
 #endif
     BBSampleInstrument::bb_flush_code(MAX_CACHE_SIZE);
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-    if (pt->INTRedMap->empty() && pt->FPRedMap->empty()) return;
     uint64_t threadByteLoad = getThreadByteLoad(pt);
-    __sync_fetch_and_add(&grandTotBytesLoad,threadByteLoad);
-    int threadId = drcctlib_get_thread_id();
-    uint64_t threadRedByteLoadINT = PrintRedundancyPairs(pt, threadByteLoad, threadId);
-    uint64_t threadRedByteLoadFP = PrintApproximationRedundancyPairs(pt, threadByteLoad, threadId);
+    if(threadByteLoad!=0) 
+    {
+        __sync_fetch_and_add(&grandTotBytesLoad,threadByteLoad);
+        int threadId = drcctlib_get_thread_id();
+        uint64_t threadRedByteLoadINT = PrintRedundancyPairs(pt, threadByteLoad, threadId);
+        uint64_t threadRedByteLoadFP = PrintApproximationRedundancyPairs(pt, threadByteLoad, threadId);
 #ifdef TIMING
-    time = get_miliseconds() - time;
-    printf("Thread %d: Time %ld ms for generating outputs\n", threadId, time);
+        time = get_miliseconds() - time;
+        printf("Thread %d: Time %ld ms for generating outputs\n", threadId, time);
 #endif
 
-    dr_mutex_lock(gLock);
-    dr_fprintf(gFile, "\n#THREAD %d Redundant Read:", threadId);
-    dr_fprintf(gFile, "\nTotalBytesLoad: %lu ",threadByteLoad);
-    dr_fprintf(gFile, "\nRedundantBytesLoad: %lu %.2f",threadRedByteLoadINT, threadRedByteLoadINT * 100.0/threadByteLoad);
-    dr_fprintf(gFile, "\nApproxRedundantBytesLoad: %lu %.2f\n",threadRedByteLoadFP, threadRedByteLoadFP * 100.0/threadByteLoad);
-    dr_mutex_unlock(gLock);
-
+        dr_mutex_lock(gLock);
+        dr_fprintf(gFile, "\n#THREAD %d Redundant Read:", threadId);
+        dr_fprintf(gFile, "\nTotalBytesLoad: %lu ",threadByteLoad);
+        dr_fprintf(gFile, "\nRedundantBytesLoad: %lu %.2f",threadRedByteLoadINT, threadRedByteLoadINT * 100.0/threadByteLoad);
+        dr_fprintf(gFile, "\nApproxRedundantBytesLoad: %lu %.2f\n",threadRedByteLoadFP, threadRedByteLoadFP * 100.0/threadByteLoad);
+        dr_mutex_unlock(gLock);
+    }
     dr_close_file(pt->output_file);
-    dr_global_free(pt->cache_ptr, MAX_CACHE_SIZE*sizeof(val_cache_t));
-    delete pt->INTRedMap;
-    delete pt->FPRedMap;
     for(size_t i=0;i<pt->instr_clones->size();++i) {
         instr_destroy(drcontext, (*pt->instr_clones)[i]);
     }
     delete pt->instr_clones;
+    delete pt->INTRedLogMap;
+    delete pt->FPRedLogMap;
 #ifdef DEBUG_REUSE
     dr_close_file(pt->log_file);
 #endif
@@ -2800,39 +2102,26 @@ ClientInit(int argc, const char *argv[])
     if (op_enable_sampling.get_value()) {
         dr_fprintf(STDOUT, "[ZEROSPY INFO] Sampling Enabled\n");
         dr_fprintf(gFile, "[ZEROSPY INFO] Sampling Enabled\n");
-        if(op_no_flush.get_value()) {
-            dr_fprintf(STDOUT, "[ZEROSPY INFO] Code flush is disabled.\n");
-            dr_fprintf(gFile,  "[ZEROSPY INFO] Code flush is disabled.\n");
-        }
-        dr_fprintf(STDOUT, "[ZEROSPU INFO] Sampling Rate: %.3f, Window Size: %ld\n", conf2rate[op_rate.get_value()], conf2window[op_window.get_value()]);
-        dr_fprintf(gFile,  "[ZEROSPU INFO] Sampling Rate: %.3f, Window Size: %ld\n", conf2rate[op_rate.get_value()], conf2window[op_window.get_value()]);
-#ifdef USE_CLEANCALL
-        if (dr_using_all_private_caches()) {
-            BBSample_target[0] = BBSampleTable[op_rate.get_value()][op_window.get_value()][0];
-            BBSample_target[1] = BBSampleTable[op_rate.get_value()][op_window.get_value()][1];
-            dr_fprintf(STDOUT, "[ZEROSPY INFO] Thread Private is enabled.\n");
-            dr_fprintf(gFile,  "[ZEROSPY INFO] Thread Private is enabled.\n");
-        } else {
-            BBSample_target[0] = BBSampleTableShared[op_rate.get_value()][op_window.get_value()][0];
-            BBSample_target[1] = BBSampleTableShared[op_rate.get_value()][op_window.get_value()][1];
-            dr_fprintf(STDOUT, "[ZEROSPY INFO] Thread Private is disabled.\n");
-            dr_fprintf(gFile,  "[ZEROSPY INFO] Thread Private is disabled.\n");
-        }
-        BBSampleNoFlush_target = BBSampleNoFlushTable[op_rate.get_value()][op_window.get_value()];
-#else
-        window_enable = conf2rate[op_rate.get_value()] * conf2window[op_window.get_value()];
-        window_disable= conf2window[op_window.get_value()];
-#endif
+        window_enable = op_window_enable.get_value();
+        window_disable= op_window.get_value();
+        float rate = (float)window_enable / (float)window_disable;
+        dr_fprintf(STDOUT, "[ZEROSPU INFO] Sampling Rate: %.3f, Window Size: %ld\n", rate, window_disable);
+        dr_fprintf(gFile,  "[ZEROSPU INFO] Sampling Rate: %.3f, Window Size: %ld\n", rate, window_disable);
+    } else {
+        dr_fprintf(STDOUT, "[ZEROSPY INFO] Sampling Disabled\n");
+        dr_fprintf(gFile, "[ZEROSPY INFO] Sampling Disabled\n");
+    }
+    if (dr_using_all_private_caches()) {
+        dr_fprintf(STDOUT, "[ZEROSPY INFO] Thread Private is enabled.\n");
+        dr_fprintf(gFile,  "[ZEROSPY INFO] Thread Private is enabled.\n");
+    } else {
+        dr_fprintf(STDOUT, "[ZEROSPY INFO] Thread Private is disabled.\n");
+        dr_fprintf(gFile,  "[ZEROSPY INFO] Thread Private is disabled.\n");
     }
     if (op_help.get_value()) {
         dr_fprintf(STDOUT, "%s\n", droption_parser_t::usage_long(DROPTION_SCOPE_CLIENT).c_str());
         exit(1);
     }
-#ifndef _WERROR
-    sprintf(name+strlen(name), ".warn");
-    fwarn = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
-    DR_ASSERT(fwarn != INVALID_FILE);
-#endif
 #ifdef ZEROSPY_DEBUG
     sprintf(name+strlen(name), ".debug");
     gDebug = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
@@ -2858,37 +2147,42 @@ ClientExit(void)
 #endif
     dr_close_file(gFlagF);
     dr_close_file(gFile);
-#ifdef ENABLE_SAMPLING
-#ifndef USE_CLEANCALL
     if (!dr_raw_tls_cfree(tls_offs, INSTRACE_TLS_COUNT)) {
         ZEROSPY_EXIT_PROCESS(
             "ERROR: zerospy dr_raw_tls_calloc fail");
     }
-#endif
-#endif
+    // free trace buffers
+    trace_buf_free(trace_buffer_i1);
+    trace_buf_free(trace_buffer_i2);
+    trace_buf_free(trace_buffer_i4);
+    trace_buf_free(trace_buffer_i8);
+    trace_buf_free(trace_buffer_i16);
+    trace_buf_free(trace_buffer_i32);
+    trace_buf_free(trace_buffer_sp1);
+    trace_buf_free(trace_buffer_dp1);
+    trace_buf_free(trace_buffer_sp4);
+    trace_buf_free(trace_buffer_dp2);
+    trace_buf_free(trace_buffer_sp8);
+    trace_buf_free(trace_buffer_dp4);
+
     dr_mutex_destroy(gLock);
     drcctlib_exit();
+    drmgr_analysis_cb_t event_basic_block_ptr = op_enable_sampling.get_value()
+        ? event_basic_block<true>
+        : event_basic_block<false>;
     if (!drmgr_unregister_thread_init_event(ClientThreadStart) ||
         !drmgr_unregister_thread_exit_event(ClientThreadEnd) ||
-#ifdef USE_CLEANCALL
-#ifdef ENABLE_SAMPLING
+        !drmgr_unregister_thread_exit_event(ClientThreadEndFortrace) ||
         // must unregister event after client exit, or it will cause unexpected errors during execution
-        ( op_enable_sampling.get_value() && 
-#endif
-#endif
-            !drmgr_unregister_bb_instrumentation_event(event_basic_block) 
-#ifdef USE_CLEANCALL
-#ifdef ENABLE_SAMPLING
-        ) 
-#endif
-#endif
-        || !drmgr_unregister_tls_field(tls_idx)) {
+        !drmgr_unregister_bb_instrumentation_event(event_basic_block_ptr) ||
+        !drmgr_unregister_tls_field(tls_idx)) {
         printf("ERROR: zerospy failed to unregister in ClientExit");
         fflush(stdout);
         exit(-1);
     }
     drutil_exit();
     drreg_exit();
+    trace_exit();
     drmgr_exit();
 }
 
@@ -2903,7 +2197,7 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
                        "http://dynamorio.org/issues");
     ClientInit(argc, argv);
 
-    if (!drmgr_init()) {
+    if (!drmgr_init() || !trace_init()) {
         ZEROSPY_EXIT_PROCESS("ERROR: zerospy unable to initialize drmgr");
     }
     drreg_options_t ops = { sizeof(ops), 4 /*max slots needed*/, false };
@@ -2917,23 +2211,18 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
                                          "zerospy-thread-init", NULL, NULL,
                                          DRCCTLIB_THREAD_EVENT_PRI + 1 };
     drmgr_priority_t thread_exit_pri = { sizeof(thread_exit_pri),
-                                         "zerispy-thread-exit", NULL, NULL,
-                                         DRCCTLIB_THREAD_EVENT_PRI + 1 };
-    if (
-#ifdef USE_CLEANCALL
-#ifdef ENABLE_SAMPLING
-        ( op_enable_sampling.get_value() && 
-#endif
-#endif
-        // bb instrumentation event must be performed in analysis passes (as we don't change the application codes)
-        !drmgr_register_bb_instrumentation_event(event_basic_block, NULL, NULL) 
-#ifdef USE_CLEANCALL
-#ifdef ENABLE_SAMPLING
-        ) 
-#endif
-#endif 
+                                         "zerospy-thread-exit", NULL, NULL,
+                                         DRCCTLIB_THREAD_EVENT_PRI - 1 };
+    drmgr_priority_t thread_exit_high_pri = { sizeof(thread_exit_pri),
+                                         "zerospy-thread-exit-trace", NULL, NULL,
+                                         DRMGR_PRIORITY_THREAD_EXIT_TRACE_BUF - 1 };
+    drmgr_analysis_cb_t event_basic_block_ptr = op_enable_sampling.get_value()
+        ? event_basic_block<true>
+        : event_basic_block<false>;
+    if (   !drmgr_register_bb_instrumentation_event(event_basic_block_ptr, NULL, NULL)
         || !drmgr_register_thread_init_event_ex(ClientThreadStart, &thread_init_pri) 
-        || !drmgr_register_thread_exit_event_ex(ClientThreadEnd, &thread_exit_pri) ) {
+        || !drmgr_register_thread_exit_event_ex(ClientThreadEnd, &thread_exit_pri)
+        || !drmgr_register_thread_exit_event_ex(ClientThreadEndFortrace, &thread_exit_high_pri) ) {
         ZEROSPY_EXIT_PROCESS("ERROR: zerospy unable to register events");
     }
 
@@ -2941,19 +2230,41 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     if (tls_idx == -1) {
         ZEROSPY_EXIT_PROCESS("ERROR: zerospy drmgr_register_tls_field fail");
     }
-#ifdef ENABLE_SAMPLING
-#ifndef USE_CLEANCALL
     if (!dr_raw_tls_calloc(&tls_seg, &tls_offs, INSTRACE_TLS_COUNT, 0)) {
         ZEROSPY_EXIT_PROCESS(
             "ERROR: zerospy dr_raw_tls_calloc fail");
     }
-#endif
-#endif
     gLock = dr_mutex_create();
 
-    // drcctlib_init(ZEROSPY_FILTER_READ_MEM_ACCESS_INSTR, INVALID_FILE, InstrumentInsCallback, false/*do data centric*/);
+    //drcctlib_init(ZEROSPY_FILTER_READ_MEM_ACCESS_INSTR, INVALID_FILE, InstrumentInsCallback, false/*do data centric*/);
     drcctlib_init_ex(ZEROSPY_FILTER_READ_MEM_ACCESS_INSTR, INVALID_FILE, InstrumentInsCallback, NULL, NULL, DRCCTLIB_CACHE_MODE);
     dr_register_exit_event(ClientExit);
+
+    // Tracing Buffer
+    // Integer 1 B
+    trace_buffer_i1 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(1));
+    // Integer 2 B
+    trace_buffer_i2 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(2));
+    // Integer 4 B
+    trace_buffer_i4 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(4));
+    // Integer 8 B
+    trace_buffer_i8 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(8));
+    // Integer 16 B
+    trace_buffer_i16 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(16));
+    // Integer 32 B
+    trace_buffer_i32 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(32));
+    // Floating Point Single
+    trace_buffer_sp1 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(4));
+    // Floating Point Double
+    trace_buffer_dp1 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(8));
+    // Floating Point 4*Single
+    trace_buffer_sp4 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(16));
+    // Floating Point 2*Double
+    trace_buffer_dp2 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(16));
+    // Floating Point 8*Single
+    trace_buffer_sp8 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(32));
+    // Floating Point 4*Double
+    trace_buffer_dp4 = trace_buf_create_trace_buffer(MEM_BUF_SIZE(32));
 }
 
 #ifdef __cplusplus
