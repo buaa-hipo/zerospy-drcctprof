@@ -845,18 +845,6 @@ dr_insert_clean_call(drcontext, bb, ins, (void *)CheckNByteValueAfterVGather<(AC
 #endif
 /***************************************************************************************/
 
-static inline int
-compute_log2(int value)
-{
-    int i;
-    for (i = 0; i < 31; i++) {
-        if (value == 1 << i)
-            return i;
-    }
-    // returns -1 if value is not a power of 2.
-    return -1;
-}
-
 template<bool enable_cache>
 void insertCheckAndUpdateInt(void* drcontext, instrlist_t* ilist, instr_t* where, int accessLen, int elemLen, int32_t slot, reg_id_t reg_addr, reg_id_t scratch) {
     // quick check
@@ -1451,14 +1439,9 @@ struct ZerospyInstrument{
             // Something strange happened, so ignore it
             return ;
         }
-#ifdef ARM_CCTLIB
-        // Currently, we cannot identify the difference between floating point operand 
-        // and inter operand from instruction type (both is LD), so just ignore the fp
-        // FIXME i#4: to identify the floating point through data flow analysis.
-        if (false)
-#else
+        // On ARM, we manually implement the instr_is_floating by estimating the usage of
+        // the defined register of the load instruction.
         if (instr_is_floating(ins))
-#endif
         {
             uint32_t operSize = FloatOperandSizeTable(ins, opnd);
             switch(refSize) {
@@ -1530,14 +1513,7 @@ struct ZerospyInstrument{
             dr_fprintf(gDebug, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
             dr_mutex_unlock(gLock);
 #endif
-#ifdef ARM_CCTLIB
-        // Currently, we cannot identify the difference between floating point operand 
-        // and inter operand from instruction type (both is LD), so just ignore the fp
-        // FIXME i#4: to identify the floating point through data flow analysis.
-        if (false)
-#else
         if (instr_is_floating(ins))
-#endif
         {
             uint32_t operSize = FloatOperandSizeTable(ins, opnd);
             if(operSize>0) {
@@ -1634,8 +1610,11 @@ InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, i
         dr_fprintf(STDERR, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
         ZEROSPY_EXIT_PROCESS("InstrumentMem drutil_insert_get_mem_addr failed!");
     } else {
-        // ZerospyInstrument::InstrumentReadValueBeforeAndAfterLoading(drcontext, ilist, where, ref, slot, reg_addr, scratch);
+#ifdef USE_CLEANCALL
+        ZerospyInstrument::InstrumentReadValueBeforeAndAfterLoading(drcontext, ilist, where, ref, slot, reg_addr, scratch);
+#else
         ZerospyInstrument::InstrumentForTracing(drcontext, ilist, where, ref, slot, reg_addr, scratch);
+#endif
     }
 }
 
@@ -1654,7 +1633,6 @@ void InstrumentMemAll(void* drcontext, instrlist_t *bb, instr_t* instr, int32_t 
             InstrumentMem(drcontext, bb, instr, opnd, slot, reg_addr, scratch, need_restore_0, need_restore_1);
             ++memop;
         }
-        // UNRESERVE_AFLAGS(drcontext, ilist, where);
     }
     UNRESERVE_REG(drcontext, bb, instr, scratch);
     UNRESERVE_REG(drcontext, bb, instr, reg_addr);
@@ -1663,27 +1641,8 @@ void InstrumentMemAll(void* drcontext, instrlist_t *bb, instr_t* instr, int32_t 
 #ifdef X86
 void InstrumentVGather(void* drcontext, instrlist_t *bb, instr_t* instr, int32_t slot)
 {
-    // if(op_enable_sampling.get_value()) {
-    //     drvector_t vec;
-    //     reg_id_t reg_ctxt;
-    //     RESERVE_AFLAGS(drcontext, bb, instr);
-    //     instr_t* skipcall = INSTR_CREATE_label(drcontext);
-    //     getUnusedRegEntry(&vec, instr);
-    //     RESERVE_REG(drcontext, bb, instr, &vec, reg_ctxt);
-    //     dr_insert_read_raw_tls(drcontext, bb, instr, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ctxt);
-    //     // Clear insCnt when insCnt > WINDOW_DISABLE
-    //     MINSERT(bb, instr, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ctxt), OPND_CREATE_CCT_INT(window_enable)));
-    //     MINSERT(bb, instr, XINST_CREATE_jump_cond(drcontext, DR_PRED_GT, opnd_create_instr(skipcall)));
-    //     // We use instr_compute_address_ex_pos to handle gather (with VSIB addressing)
-    //     ZerospyInstrument::InstrumentReadValueBeforeVGather(drcontext, bb, instr, slot);
-    //     MINSERT(bb, instr, skipcall);
-    //     UNRESERVE_REG(drcontext, bb, instr, reg_ctxt);
-    //     UNRESERVE_AFLAGS(drcontext, bb, instr);
-    //     drvector_delete(&vec);
-    // } else {
-        // We use instr_compute_address_ex_pos to handle gather (with VSIB addressing)
-        ZerospyInstrument::InstrumentReadValueBeforeVGather(drcontext, bb, instr, slot);
-    // }
+    // We use instr_compute_address_ex_pos to handle gather (with VSIB addressing)
+    ZerospyInstrument::InstrumentReadValueBeforeVGather(drcontext, bb, instr, slot);
 }
 #endif
 
@@ -2038,7 +1997,6 @@ ClientThreadEnd(void *drcontext)
 #ifdef TIMING
     uint64_t time = get_miliseconds();
 #endif
-    BBSampleInstrument::bb_flush_code(MAX_CACHE_SIZE);
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
     uint64_t threadByteLoad = getThreadByteLoad(pt);
     if(threadByteLoad!=0) 
