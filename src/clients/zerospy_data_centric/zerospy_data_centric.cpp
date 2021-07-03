@@ -1390,7 +1390,7 @@ struct ZerospyInstrument{
         uint32_t refSize = opnd_size_in_bytes(opnd_get_size(opnd));
         if (refSize==0) {
             // Something strange happened, so ignore it
-            assert(0 && "Something strange happened! refSize==0.\n");
+            // assert(0 && "Something strange happened! refSize==0.\n");
             return ;
         }
 #ifdef ZEROSPY_DEBUG
@@ -1623,6 +1623,36 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
         return ;
     }
 
+#ifdef X86
+    if(!instr_is_gather(instr))
+#endif
+    {
+        bool ignore=true;
+        int num_srcs = instr_num_srcs(instr);
+        for(int i=0; i<num_srcs; ++i) {
+            opnd_t opnd = instr_get_src(instr, i);
+            if(opnd_is_memory_reference(opnd)) {
+                uint32_t refSize = opnd_size_in_bytes(opnd_get_size(opnd));
+                if (refSize!=0) {
+                    ignore = false;
+                    break;
+                }
+#ifdef DEBUG_ZEROSPY
+                else {
+                    // Something strange happened, so ignore it
+                    dr_mutex_lock(gLock);
+                    dr_fprintf(STDOUT, "^^ INFO: Disassembled Instruction ^^^\n");
+                    dr_fprintf(STDOUT, "ins=%p\n", instr);
+                    disassemble(drcontext, instr_get_app_pc(instr), STDOUT);
+                    dr_fprintf(STDOUT, "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
+                    dr_mutex_unlock(gLock);
+                }
+#endif
+            }
+        }
+        if(ignore) return ;
+    }
+
     // store cct in tls filed
     // InstrumentIns(drcontext, bb, instr, slot);
 #ifndef USE_CLEANCALL
@@ -1664,7 +1694,7 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
 #endif
     {
 #ifndef ARM_CCTLIB
-        if (drreg_reserve_register(drcontext, ilist, where, NULL, &reg2) != DRREG_SUCCESS) {
+        if (drreg_reserve_register(drcontext, bb, instr, NULL, &reg2) != DRREG_SUCCESS) {
             ZEROSPY_EXIT_PROCESS("InstrumentMem drreg_reserve_register != DRREG_SUCCESS");
         }
 #endif
@@ -1676,7 +1706,7 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
             }
         }
 #ifndef ARM_CCTLIB
-        if (drreg_unreserve_register(drcontext, ilist, where, reg2) != DRREG_SUCCESS) {
+        if (drreg_unreserve_register(drcontext, bb, instr, reg2) != DRREG_SUCCESS) {
             ZEROSPY_EXIT_PROCESS("InstrumentMem drreg_unreserve_register != DRREG_SUCCESS");
         }
 #endif

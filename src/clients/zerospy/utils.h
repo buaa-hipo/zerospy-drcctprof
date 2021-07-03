@@ -1,3 +1,5 @@
+#ifndef __UTILS_H__
+#define __UTILS_H__
 #include "dr_api.h"
 
 // TODO: search for dynamorio interface to obtain element witdh of a SIMD operation
@@ -457,4 +459,69 @@ bool instr_is_ignorable(instr_t *ins) {
     return false;
 }
 
+#endif
+
+#endif
+
+#if defined(ARM) || defined(AARCH64)
+bool instr_is_floating_self(instr_t* instr) {
+    int num_srcs = instr_num_srcs(instr);
+    for(int i=0; i<num_srcs; ++i) {
+        opnd_t opnd = instr_get_src(instr, i);
+        if(!opnd_is_memory_reference(opnd)) {
+            for(int j=0; j<opnd_num_regs_used(opnd); ++j) {
+                reg_id_t reg_used = opnd_get_reg_used(opnd, j);
+                // check for whether the register is floating point
+                if(reg_used>=DR_REG_Q0 && reg_used<=DR_REG_B31) {
+                    return true;
+                }
+            }
+        }
+    }
+    int num_dsts = instr_num_dsts(instr);
+    for(int i=0; i<num_dsts; ++i) {
+        opnd_t opnd = instr_get_dst(instr, i);
+        if(!opnd_is_memory_reference(opnd)) {
+            for(int j=0; j<opnd_num_regs_used(opnd); ++j) {
+                reg_id_t reg_used = opnd_get_reg_used(opnd, j);
+                // check for whether the register is floating point
+                if(reg_used>=DR_REG_Q0 && reg_used<=DR_REG_B31) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+bool instr_is_floating(instr_t* instr) {
+    bool is_float = instr_is_floating_self(instr);
+    // if it is memory load operation, check for the defined register usage
+    if(!is_float && instr_reads_memory(instr)) {
+        // extract defined register
+        int num_dsts = instr_num_dsts(instr);
+        for(int i=0; i<num_dsts; ++i) {
+            opnd_t opnd = instr_get_dst(instr, i);
+            // we ignore the non-register dst opnd
+            if(opnd_is_reg(opnd)) {
+                reg_id_t reg_def = opnd_get_reg(opnd);
+                for (instr_t* ins = instr; ins != NULL; ins = instr_get_next(ins)) {
+                    // Here, we aggressively suppose that if reg_def is used in a
+                    // instruction and it is a floating point instruction, this
+                    // instruction should be parsed as floating point reads.
+                    int num_srcs = instr_num_srcs(ins);
+                    for(int j=0; j<num_srcs; ++j) {
+                        opnd_t opnd = instr_get_src(ins, j);
+                        if (opnd_is_reg(opnd) && opnd_get_reg(opnd) == reg_def) {
+                            return instr_is_floating_self(ins);
+                        }
+                    }
+                }
+            } else {
+                dr_fprintf(STDERR, "??? Non register dst operand!\n");
+            }
+        }
+    }
+    return is_float;
+}
 #endif
