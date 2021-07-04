@@ -1927,7 +1927,8 @@ static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad,
             integerRedundantInfoItem.AddMember("Redmap", rapidjson::Value(("[0]" + redMap + "[" + std::to_string((*listIt).accessLen) + "]").c_str(), jsonAllocator), jsonAllocator);
 
             dr_fprintf(gTraceFile, "\n---------------------Redundant load with---------------------------\n");
-            drcctlib_print_full_cct(gTraceFile, (*listIt).cntxt, true, true, MAX_DEPTH);
+            std::string cctInfo = drcctlib_print_full_cct(gTraceFile, (*listIt).cntxt, true, true, MAX_DEPTH);
+            integerRedundantInfoItem.AddMember("CCT Info", rapidjson::Value(cctInfo.c_str(), jsonAllocator), jsonAllocator);
 
             integerRedundantInfo.PushBack(integerRedundantInfoItem, jsonAllocator);
         }
@@ -2030,7 +2031,8 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
             floatRedundantInfoItem.AddMember("AccessLen", (*listIt).accessLen, jsonAllocator);
             floatRedundantInfoItem.AddMember("typesize", (*listIt).size, jsonAllocator);
             dr_fprintf(gTraceFile, "\n---------------------Redundant load with---------------------------\n");
-            drcctlib_print_full_cct(gTraceFile, (*listIt).cntxt, true, true, MAX_DEPTH);
+            std::string cctInfo = drcctlib_print_full_cct(gTraceFile, (*listIt).cntxt, true, true, MAX_DEPTH);
+            floatRedundantInfoItem.AddMember("CCT Info", rapidjson::Value(cctInfo.c_str(), jsonAllocator), jsonAllocator);
 
             floatingPointRedundantInfo.PushBack(floatRedundantInfoItem, jsonAllocator);
         }
@@ -2204,6 +2206,7 @@ ClientExit(void)
 
     metricOverview.AddMember("Total Integer Redundant Bytes", totalIntegerRedundantBytes, jsonAllocator);
     metricOverview.AddMember("Total Floating Point Redundant Bytes", totalFloatRedundantBytes, jsonAllocator);
+    metricOverview.AddMember("Thread Num", threadDetailedMetricsMap.size(), jsonAllocator);
     gDoc.AddMember("Metric Overview", metricOverview, jsonAllocator);
 
     for(auto &threadMetrics : threadDetailedMetricsMap){

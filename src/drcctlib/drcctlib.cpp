@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <cinttypes>
 #include <vector>
+#include <string>
 
 #include "libelf.h"
 
@@ -3087,10 +3088,11 @@ drcctlib_free_full_cct(context_t * contxt_list)
 }
 
 DR_EXPORT
-void
+std::string
 drcctlib_print_ctxt_hndl_msg(file_t file, context_handle_t ctxt_hndl, bool print_asm,
                              bool print_file_path)
 {
+    std::string cct_info;
     if (!ctxt_hndl_is_valid(ctxt_hndl)) {
         DRCCTLIB_EXIT_PROCESS("drcctlib_print_ctxt_hndl_msg: !ctxt_hndl_is_valid");
     }
@@ -3099,27 +3101,35 @@ drcctlib_print_ctxt_hndl_msg(file_t file, context_handle_t ctxt_hndl, bool print
         file = global_log_file;
     }
     context_t *ctxt = ctxt_get_from_ctxt_hndl(ctxt_hndl);
+    char cct_ip[20];
+    sprintf(cct_ip, "%p", (void*)ctxt->ip);
     if (print_asm && print_file_path) {
         dr_fprintf(file, "%s(%d):\"(%p)%s\"[%s]\n", ctxt->func_name, ctxt->line_no,
                    (uint64_t)ctxt->ip, ctxt->code_asm, ctxt->file_path);
+        cct_info = std::string(ctxt->func_name) + "(" + std::to_string(ctxt->line_no) + "):\"(" +  std::string(cct_ip) + ")" + std::string(ctxt->code_asm) + "\"[" + std::string(ctxt->file_path) + "]\n";
     } else if (print_asm) {
         dr_fprintf(file, "%s(%d):\"(%p)%s\"\n", ctxt->func_name, ctxt->line_no,
                    (uint64_t)ctxt->ip, ctxt->code_asm);
+        cct_info = std::string(ctxt->func_name) + "(" + std::to_string(ctxt->line_no) + "):\"(" +  std::string(cct_ip) + ")" + std::string(ctxt->code_asm) + "\"\n";
     } else if (print_file_path) {
         dr_fprintf(file, "%s(%d):\"(%p)\"[%s]\n", ctxt->func_name, ctxt->line_no,
                    (uint64_t)ctxt->ip, ctxt->file_path);
+        cct_info = std::string(ctxt->func_name) + "(" + std::to_string(ctxt->line_no) + "):\"(" +  std::string(cct_ip) + ")\"[" + std::string(ctxt->file_path) + "]\n";
     } else {
         dr_fprintf(file, "%s(%d):\"(%p)\"\n", ctxt->func_name, ctxt->line_no,
                    (uint64_t)ctxt->ip);
+        cct_info = std::string(ctxt->func_name) + "(" + std::to_string(ctxt->line_no) + "):\"(" +  std::string(cct_ip) + ")\"\n";
     }
     ctxt_free(ctxt);
+    return cct_info;
 }
 
 DR_EXPORT
-void
+std::string
 drcctlib_print_full_cct(file_t file, context_handle_t ctxt_hndl, bool print_asm,
                         bool print_file_path, int max_depth)
 {
+    std::string cct_info;
     if (!ctxt_hndl_is_valid(ctxt_hndl)) {
         DRCCTLIB_EXIT_PROCESS("drcctlib_print_full_cct: !ctxt_hndl_is_valid");
     }
@@ -3131,7 +3141,7 @@ drcctlib_print_full_cct(file_t file, context_handle_t ctxt_hndl, bool print_asm,
         file = global_log_file;
     }
     context_handle_t cur_ctxt_hndl = ctxt_hndl;
-    drcctlib_print_ctxt_hndl_msg(file, cur_ctxt_hndl, print_asm, print_file_path);
+    cct_info = drcctlib_print_ctxt_hndl_msg(file, cur_ctxt_hndl, print_asm, print_file_path);
 
     int depth = 0;
     while (true) {
@@ -3139,13 +3149,14 @@ drcctlib_print_full_cct(file_t file, context_handle_t ctxt_hndl, bool print_asm,
             break;
         }
         if (!print_all && depth >= max_depth) {
-            dr_fprintf(file, "Truncated call path (due to client deep call chain)\n");
+            cct_info += dr_fprintf(file, "Truncated call path (due to client deep call chain)\n");
             break;
         }
         cur_ctxt_hndl = bb_node_caller_ctxt_hndl(ctxt_hndl_parent_bb_node(cur_ctxt_hndl));
-        drcctlib_print_ctxt_hndl_msg(file, cur_ctxt_hndl, print_asm, print_file_path);
+        cct_info += drcctlib_print_ctxt_hndl_msg(file, cur_ctxt_hndl, print_asm, print_file_path);
         depth++;
     }
+    return cct_info;
 }
 
 DR_EXPORT

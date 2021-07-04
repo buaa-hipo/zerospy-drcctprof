@@ -8,6 +8,7 @@
 #define _DRCCTLIB_H_
 
 #include <cstdint>
+#include <string>
 
 #include "dr_api.h"
 #include "drcctlib_defines.h"
@@ -195,12 +196,12 @@ void
 drcctlib_free_full_cct(context_t *contxt_list);
 
 DR_EXPORT
-void
+std::string
 drcctlib_print_ctxt_hndl_msg(file_t file, context_handle_t ctxt_hndl, bool print_asm,
                              bool print_file_path);
 
 DR_EXPORT
-void
+std::string
 drcctlib_print_full_cct(file_t file, context_handle_t ctxt_hndl, bool print_asm,
                         bool print_file_path, int max_depth);
 
