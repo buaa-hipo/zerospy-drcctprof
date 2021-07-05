@@ -2094,8 +2094,8 @@ ClientInit(int argc, const char *argv[])
         window_enable = op_window_enable.get_value();
         window_disable= op_window.get_value();
         float rate = (float)window_enable / (float)window_disable;
-        dr_fprintf(STDOUT, "[ZEROSPU INFO] Sampling Rate: %.3f, Window Size: %ld\n", rate, window_disable);
-        dr_fprintf(gFile,  "[ZEROSPU INFO] Sampling Rate: %.3f, Window Size: %ld\n", rate, window_disable);
+        dr_fprintf(STDOUT, "[ZEROSPY INFO] Sampling Rate: %.3f, Window Size: %ld\n", rate, window_disable);
+        dr_fprintf(gFile,  "[ZEROSPY INFO] Sampling Rate: %.3f, Window Size: %ld\n", rate, window_disable);
     } else {
         dr_fprintf(STDOUT, "[ZEROSPY INFO] Sampling Disabled\n");
         dr_fprintf(gFile, "[ZEROSPY INFO] Sampling Disabled\n");
