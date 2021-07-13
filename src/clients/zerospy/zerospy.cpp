@@ -1927,7 +1927,8 @@ static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad,
             integerRedundantInfoItem.AddMember("Redmap", rapidjson::Value(("[0]" + redMap + "[" + std::to_string((*listIt).accessLen) + "]").c_str(), jsonAllocator), jsonAllocator);
 
             dr_fprintf(gTraceFile, "\n---------------------Redundant load with---------------------------\n");
-            std::string cctInfo = drcctlib_print_full_cct(gTraceFile, (*listIt).cntxt, true, true, MAX_DEPTH);
+            drcctlib_print_full_cct(gTraceFile, (*listIt).cntxt, true, true, MAX_DEPTH);
+            std::string cctInfo = drcctlib_get_full_cct_string((*listIt).cntxt, true, true, MAX_DEPTH);
             integerRedundantInfoItem.AddMember("CCT Info", rapidjson::Value(cctInfo.c_str(), jsonAllocator), jsonAllocator);
 
             integerRedundantInfo.PushBack(integerRedundantInfoItem, jsonAllocator);
@@ -2031,7 +2032,8 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
             floatRedundantInfoItem.AddMember("AccessLen", (*listIt).accessLen, jsonAllocator);
             floatRedundantInfoItem.AddMember("typesize", (*listIt).size, jsonAllocator);
             dr_fprintf(gTraceFile, "\n---------------------Redundant load with---------------------------\n");
-            std::string cctInfo = drcctlib_print_full_cct(gTraceFile, (*listIt).cntxt, true, true, MAX_DEPTH);
+            drcctlib_print_full_cct(gTraceFile, (*listIt).cntxt, true, true, MAX_DEPTH);
+            std::string cctInfo = drcctlib_get_full_cct_string((*listIt).cntxt, true, true, MAX_DEPTH);
             floatRedundantInfoItem.AddMember("CCT Info", rapidjson::Value(cctInfo.c_str(), jsonAllocator), jsonAllocator);
 
             floatingPointRedundantInfo.PushBack(floatRedundantInfoItem, jsonAllocator);
@@ -2164,8 +2166,8 @@ ClientInit(int argc, const char *argv[])
         window_enable = op_window_enable.get_value();
         window_disable= op_window.get_value();
         float rate = (float)window_enable / (float)window_disable;
-        dr_fprintf(STDOUT, "[ZEROSPU INFO] Sampling Rate: %.3f, Window Size: %ld\n", rate, window_disable);
-        dr_fprintf(gFile,  "[ZEROSPU INFO] Sampling Rate: %.3f, Window Size: %ld\n", rate, window_disable);
+        dr_fprintf(STDOUT, "[ZEROSPY INFO] Sampling Rate: %.3f, Window Size: %ld\n", rate, window_disable);
+        dr_fprintf(gFile,  "[ZEROSPY INFO] Sampling Rate: %.3f, Window Size: %ld\n", rate, window_disable);
     } else {
         dr_fprintf(STDOUT, "[ZEROSPY INFO] Sampling Disabled\n");
         dr_fprintf(gFile, "[ZEROSPY INFO] Sampling Disabled\n");

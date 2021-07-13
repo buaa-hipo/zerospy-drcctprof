@@ -196,13 +196,23 @@ void
 drcctlib_free_full_cct(context_t *contxt_list);
 
 DR_EXPORT
-std::string
+void
 drcctlib_print_ctxt_hndl_msg(file_t file, context_handle_t ctxt_hndl, bool print_asm,
                              bool print_file_path);
 
 DR_EXPORT
-std::string
+void
 drcctlib_print_full_cct(file_t file, context_handle_t ctxt_hndl, bool print_asm,
+                        bool print_file_path, int max_depth);
+
+DR_EXPORT
+std::string
+drcctlib_get_ctxt_hndl_msg(context_handle_t ctxt_hndl, bool print_asm,
+                             bool print_file_path);
+
+DR_EXPORT
+std::string
+drcctlib_get_full_cct_string(context_handle_t ctxt_hndl, bool print_asm,
                         bool print_file_path, int max_depth);
 
 DR_EXPORT
