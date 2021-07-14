@@ -27,6 +27,7 @@ endif (UNIX)
 
 add_library(zerospy_data_centric SHARED
   zerospy_data_centric.cpp
+  trace.cpp
   )
 
 configure_DynamoRIO_client(zerospy_data_centric)

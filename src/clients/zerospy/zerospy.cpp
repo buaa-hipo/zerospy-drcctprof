@@ -35,6 +35,9 @@ uint64_t get_miliseconds() {
 #include <sys/time.h>
 #include "utils.h"
 #include "trace.h"
+#include "include/rapidjson/document.h"
+#include "include/rapidjson/filewritestream.h"
+#include "include/rapidjson/prettywriter.h"
 
 // #ifdef X86
 //     #define USE_SIMD
@@ -68,7 +71,7 @@ static droption_t<int> op_window
  "Window size of sampling. Only available when sampling is enabled.");
 
 static droption_t<int> op_window_enable
-(DROPTION_SCOPE_CLIENT, "window", WINDOW_ENABLE, 0, INT32_MAX, "Window enabled size configuration of sampling",
+(DROPTION_SCOPE_CLIENT, "window_enable", WINDOW_ENABLE, 0, INT32_MAX, "Window enabled size configuration of sampling",
  "Window enabled size of sampling. Only available when sampling is enabled.");
 
 using namespace std;
@@ -184,6 +187,7 @@ typedef struct _per_thread_t {
     INTRedLogMap_t* INTRedLogMap;
     file_t output_file;
     void* numInsBuff;
+    int32_t threadId;
     vector<instr_t*> *instr_clones;
 } per_thread_t;
 
@@ -229,6 +233,13 @@ file_t gFlagF;
 #define IS_SAMPLED(pt, WINDOW_ENABLE) ((int64_t)(BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR))<(int64_t)WINDOW_ENABLE)
 
 file_t gFile;
+FILE* gJson;
+rapidjson::Document gDoc;
+rapidjson::Document::AllocatorType &jsonAllocator = gDoc.GetAllocator();
+rapidjson::Value metricOverview(rapidjson::kObjectType);
+rapidjson::Value totalIntegerRedundantBytes(rapidjson::kObjectType);
+rapidjson::Value totalFloatRedundantBytes(rapidjson::kObjectType);
+std::map<int32_t, rapidjson::Value> threadDetailedMetricsMap;
 static void *gLock;
 #ifndef _WERROR
 file_t fwarn;
@@ -1741,6 +1752,7 @@ static void
 ThreadOutputFileInit(per_thread_t *pt)
 {
     int32_t id = drcctlib_get_thread_id();
+    pt->threadId = id;
     char name[MAXIMUM_PATH] = "";
     sprintf(name + strlen(name), "%s/thread-%d.topn.log", g_folder_name.c_str(), id);
     pt->output_file = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
@@ -1823,10 +1835,11 @@ static inline bool ApproxRedundacyCompare(const struct ApproxRedundacyData &firs
 #define LOGGING_THRESHOLD 100
 #endif
 
-static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad, int threadId) 
+static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad, int threadId, rapidjson::Value &threadDetailedMetrics, rapidjson::Value &threadDetailedCodeCentricMetrics) 
 {
     vector<RedundacyData> tmpList;
     vector<RedundacyData>::iterator tmpIt;
+    rapidjson::Value integerRedundantInfo(rapidjson::kArrayType);
 
     file_t gTraceFile = pt->output_file;
     
@@ -1885,25 +1898,40 @@ static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad,
     int cntxtNum = 0;
     for (vector<RedundacyData>::iterator listIt = tmpList.begin(); listIt != tmpList.end(); ++listIt) {
         if (cntxtNum < MAX_REDUNDANT_CONTEXTS_TO_LOG) {
+            rapidjson::Value integerRedundantInfoItem(rapidjson::kObjectType);
             dr_fprintf(gTraceFile, "\n\n======= (%f) %% of total Redundant, with local redundant %f %% (%ld Bytes / %ld Bytes) ======\n", 
                 (*listIt).frequency * 100.0 / grandTotalRedundantBytes,
                 (*listIt).frequency * 100.0 / (*listIt).ltot,
                 (*listIt).frequency,(*listIt).ltot);
+            integerRedundantInfoItem.AddMember("Redundancy", (*listIt).frequency * 100.0 / grandTotalRedundantBytes, jsonAllocator);
+            integerRedundantInfoItem.AddMember("local redundancy", rapidjson::Value((std::to_string((*listIt).frequency * 100.0 / (*listIt).ltot) + "% (" + std::to_string((*listIt).frequency) + " Bytes / " + std::to_string((*listIt).ltot) + " Bytes)").c_str(), jsonAllocator), jsonAllocator);
+
             dr_fprintf(gTraceFile, "\n\n======= with All Zero Redundant %f %% (%ld / %ld) ======\n", 
                 (*listIt).all0freq * (*listIt).accessLen * 100.0 / (*listIt).ltot,
                 (*listIt).all0freq,(*listIt).ltot/(*listIt).accessLen);
+            integerRedundantInfoItem.AddMember("Fully Redundant Zero", rapidjson::Value((std::to_string((*listIt).all0freq * (*listIt).accessLen * 100.0 / (*listIt).ltot) + "% (" + std::to_string((*listIt).all0freq) + " / " + std::to_string((*listIt).ltot/(*listIt).accessLen) + ")").c_str(), jsonAllocator), jsonAllocator);
+
             dr_fprintf(gTraceFile, "\n======= Redundant byte map : [0] ");
+            std::string redMap;
             for(uint32_t i=0;i<(*listIt).accessLen;++i) {
                 if((*listIt).byteMap & (1<<i)) {
                     dr_fprintf(gTraceFile, "00 ");
+                    redMap.append("00 ");
                 }
                 else {
                     dr_fprintf(gTraceFile, "XX ");
+                    redMap.append("XX ");
                 }
             }
             dr_fprintf(gTraceFile, " [AccessLen=%d] =======\n", (*listIt).accessLen);
+            integerRedundantInfoItem.AddMember("Redmap", rapidjson::Value(("[0]" + redMap + "[" + std::to_string((*listIt).accessLen) + "]").c_str(), jsonAllocator), jsonAllocator);
+
             dr_fprintf(gTraceFile, "\n---------------------Redundant load with---------------------------\n");
             drcctlib_print_full_cct(gTraceFile, (*listIt).cntxt, true, true, MAX_DEPTH);
+            std::string cctInfo = drcctlib_get_full_cct_string((*listIt).cntxt, true, true, MAX_DEPTH);
+            integerRedundantInfoItem.AddMember("CCT Info", rapidjson::Value(cctInfo.c_str(), jsonAllocator), jsonAllocator);
+
+            integerRedundantInfo.PushBack(integerRedundantInfoItem, jsonAllocator);
         }
         else {
             break;
@@ -1912,14 +1940,17 @@ static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad,
     }
     dr_fprintf(gTraceFile, "\n------------ Dumping INTEGER Redundancy Info Finish -------------\n");
     dr_fprintf(STDOUT, "INTEGER Report dumped\n"); fflush(stdout);
+
+    threadDetailedCodeCentricMetrics.AddMember("Integer Redundant Info", integerRedundantInfo, jsonAllocator);
     return grandTotalRedundantBytes;
 }
 
-static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad, int threadId) 
+static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad, int threadId, rapidjson::Value &threadDetailedMetrics, rapidjson::Value &threadDetailedCodeCentricMetrics) 
 {
     vector<ApproxRedundacyData> tmpList;
     vector<ApproxRedundacyData>::iterator tmpIt;
     tmpList.reserve(pt->FPRedLogMap->size());
+    rapidjson::Value floatingPointRedundantInfo(rapidjson::kArrayType);
     
     file_t gTraceFile = pt->output_file;
     uint64_t grandTotalRedundantBytes = 0;
@@ -1981,19 +2012,31 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
     int cntxtNum = 0;
     for (vector<ApproxRedundacyData>::iterator listIt = tmpList.begin(); listIt != tmpList.end(); ++listIt) {
         if (cntxtNum < MAX_REDUNDANT_CONTEXTS_TO_LOG) {
+            rapidjson::Value floatRedundantInfoItem(rapidjson::kObjectType);
             dr_fprintf(gTraceFile, "\n======= (%f) %% of total Redundant, with local redundant %f %% (%ld Zeros / %ld Reads) ======\n",
                 (*listIt).all0freq * 100.0 / grandTotalRedundantBytes,
                 (*listIt).all0freq * 100.0 / (*listIt).ftot,
-                (*listIt).all0freq,(*listIt).ftot); 
+                (*listIt).all0freq,(*listIt).ftot);
+            float totalRedundancy = grandTotalRedundantBytes == 0 ? 0 : (*listIt).all0freq * 100.0 / grandTotalRedundantBytes;
+            floatRedundantInfoItem.AddMember("Redundancy", totalRedundancy, jsonAllocator);
+            floatRedundantInfoItem.AddMember("local redundancy", rapidjson::Value((std::to_string((*listIt).all0freq * 100.0 / (*listIt).ftot) + "% (" + std::to_string((*listIt).all0freq) + " Zeros / " + std::to_string((*listIt).ftot) + " Reads)").c_str(), jsonAllocator), jsonAllocator);
             dr_fprintf(gTraceFile, "\n======= Redundant byte map : [ sign | exponent | mantissa ] ========\n");
             if((*listIt).size==4) {
                 dr_fprintf(gTraceFile, "%s", getFpRedMapString_SP((*listIt).byteMap, (*listIt).accessLen/4).c_str());
+                floatRedundantInfoItem.AddMember("Redmap: [mantissa | exponent | sign]", rapidjson::Value(getFpRedMapString_SP((*listIt).byteMap, (*listIt).accessLen/4).c_str(), jsonAllocator), jsonAllocator);
             } else {
                 dr_fprintf(gTraceFile, "%s", getFpRedMapString_DP((*listIt).byteMap, (*listIt).accessLen/8).c_str());
+                floatRedundantInfoItem.AddMember("Redmap: [mantissa | exponent | sign]", rapidjson::Value(getFpRedMapString_DP((*listIt).byteMap, (*listIt).accessLen/8).c_str(), jsonAllocator), jsonAllocator);
             }
             dr_fprintf(gTraceFile, "\n===== [AccessLen=%d, typesize=%d] =======\n", (*listIt).accessLen, (*listIt).size);
+            floatRedundantInfoItem.AddMember("AccessLen", (*listIt).accessLen, jsonAllocator);
+            floatRedundantInfoItem.AddMember("typesize", (*listIt).size, jsonAllocator);
             dr_fprintf(gTraceFile, "\n---------------------Redundant load with---------------------------\n");
             drcctlib_print_full_cct(gTraceFile, (*listIt).cntxt, true, true, MAX_DEPTH);
+            std::string cctInfo = drcctlib_get_full_cct_string((*listIt).cntxt, true, true, MAX_DEPTH);
+            floatRedundantInfoItem.AddMember("CCT Info", rapidjson::Value(cctInfo.c_str(), jsonAllocator), jsonAllocator);
+
+            floatingPointRedundantInfo.PushBack(floatRedundantInfoItem, jsonAllocator);
         }
         else {
             break;
@@ -2002,6 +2045,10 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
     }
     dr_fprintf(gTraceFile, "\n------------ Dumping Approximation Redundancy Info Finish -------------\n");
     printf("Floating Point Report dumped\n");
+
+    threadDetailedCodeCentricMetrics.AddMember("Floating Point Redundant Info", floatingPointRedundantInfo, jsonAllocator);
+    threadDetailedMetrics.AddMember("Code Centric", threadDetailedCodeCentricMetrics, jsonAllocator);
+    threadDetailedMetricsMap[threadId] = threadDetailedMetrics;
     fflush(stdout);
     return grandTotalRedundantBytes;
 }
@@ -2033,9 +2080,13 @@ ClientThreadEnd(void *drcontext)
     if(threadByteLoad!=0) 
     {
         __sync_fetch_and_add(&grandTotBytesLoad,threadByteLoad);
-        int threadId = drcctlib_get_thread_id();
-        uint64_t threadRedByteLoadINT = PrintRedundancyPairs(pt, threadByteLoad, threadId);
-        uint64_t threadRedByteLoadFP = PrintApproximationRedundancyPairs(pt, threadByteLoad, threadId);
+        int32_t threadId = pt->threadId;
+        // int32_t threadId = dr_get_thread_id(drcontext);
+        rapidjson::Value threadDetailedMetrics(rapidjson::kObjectType);
+        rapidjson::Value threadDetailedCodeCentricMetrics(rapidjson::kObjectType);
+        // uint64_t threadRedByteLoadFP = PrintApproximationRedundancyPairs(pt, threadByteLoad, threadId, threadDetailedMetrics, threadDetailedCodeCentricMetrics);
+        uint64_t threadRedByteLoadINT = PrintRedundancyPairs(pt, threadByteLoad, threadId, threadDetailedMetrics, threadDetailedCodeCentricMetrics);
+        uint64_t threadRedByteLoadFP = PrintApproximationRedundancyPairs(pt, threadByteLoad, threadId, threadDetailedMetrics, threadDetailedCodeCentricMetrics);
 #ifdef TIMING
         time = get_miliseconds() - time;
         printf("Thread %d: Time %ld ms for generating outputs\n", threadId, time);
@@ -2046,6 +2097,23 @@ ClientThreadEnd(void *drcontext)
         dr_fprintf(gFile, "\nTotalBytesLoad: %lu ",threadByteLoad);
         dr_fprintf(gFile, "\nRedundantBytesLoad: %lu %.2f",threadRedByteLoadINT, threadRedByteLoadINT * 100.0/threadByteLoad);
         dr_fprintf(gFile, "\nApproxRedundantBytesLoad: %lu %.2f\n",threadRedByteLoadFP, threadRedByteLoadFP * 100.0/threadByteLoad);
+
+        rapidjson::Value threadIntegerTotal(rapidjson::kObjectType);
+        rapidjson::Value threadFloatTotal(rapidjson::kObjectType);
+
+        threadIntegerTotal.AddMember("rate", threadRedByteLoadINT * 100.0/threadByteLoad, jsonAllocator);
+        threadIntegerTotal.AddMember("fraction", rapidjson::Value((std::to_string(threadRedByteLoadINT) + "/" + std::to_string(threadByteLoad)).c_str(), jsonAllocator), jsonAllocator);
+        threadIntegerTotal.AddMember("detail", "file:///abspath/to/thread0CCDetail.md",
+                        jsonAllocator);
+
+        threadFloatTotal.AddMember("rate", threadRedByteLoadFP * 100.0/threadByteLoad, jsonAllocator);
+        threadFloatTotal.AddMember("fraction", rapidjson::Value((std::to_string(threadRedByteLoadFP) + "/" + std::to_string(threadByteLoad)).c_str(), jsonAllocator), jsonAllocator);
+        threadFloatTotal.AddMember("detail", "file:///abspath/to/thread0CCDetail.md",
+                        jsonAllocator);
+
+        totalIntegerRedundantBytes.AddMember(rapidjson::Value(("Thread " + std::to_string(threadId)).c_str(), jsonAllocator), threadIntegerTotal, jsonAllocator);
+        totalFloatRedundantBytes.AddMember(rapidjson::Value(("Thread " + std::to_string(threadId)).c_str(), jsonAllocator), threadFloatTotal, jsonAllocator);
+
         dr_mutex_unlock(gLock);
     }
     dr_close_file(pt->output_file);
@@ -2072,6 +2140,9 @@ ClientInit(int argc, const char *argv[])
         dr_abort();
     }
     /* Creating result directories */
+
+    gDoc.SetObject();
+
     pid_t pid = getpid();
 #ifdef ARM_CCTLIB
     char name[MAXIMUM_PATH] = "arm-";
@@ -2087,6 +2158,7 @@ ClientInit(int argc, const char *argv[])
 
     sprintf(name+strlen(name), "/zerospy.log");
     gFile = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
+    gJson = fopen("report.json", "w");
     DR_ASSERT(gFile != INVALID_FILE);
     if (op_enable_sampling.get_value()) {
         dr_fprintf(STDOUT, "[ZEROSPY INFO] Sampling Enabled\n");
@@ -2127,6 +2199,27 @@ ClientExit(void)
     dr_fprintf(gFile, "\nTotalBytesLoad: %lu \n",grandTotBytesLoad);
     dr_fprintf(gFile, "\nRedundantBytesLoad: %lu %.2f\n",grandTotBytesRedLoad, grandTotBytesRedLoad * 100.0/grandTotBytesLoad);
     dr_fprintf(gFile, "\nApproxRedundantBytesLoad: %lu %.2f\n",grandTotBytesApproxRedLoad, grandTotBytesApproxRedLoad * 100.0/grandTotBytesLoad);
+
+    totalIntegerRedundantBytes.AddMember("rate", grandTotBytesRedLoad * 100.0/grandTotBytesLoad, jsonAllocator);
+    totalIntegerRedundantBytes.AddMember("fraction", rapidjson::Value((std::to_string(grandTotBytesRedLoad) + "/" + std::to_string(grandTotBytesLoad)).c_str(), jsonAllocator), jsonAllocator);
+
+    totalFloatRedundantBytes.AddMember("rate", grandTotBytesApproxRedLoad * 100.0/grandTotBytesLoad, jsonAllocator);
+    totalFloatRedundantBytes.AddMember("fraction", rapidjson::Value((std::to_string(grandTotBytesApproxRedLoad) + "/" + std::to_string(grandTotBytesLoad)).c_str(), jsonAllocator), jsonAllocator);
+
+    metricOverview.AddMember("Total Integer Redundant Bytes", totalIntegerRedundantBytes, jsonAllocator);
+    metricOverview.AddMember("Total Floating Point Redundant Bytes", totalFloatRedundantBytes, jsonAllocator);
+    metricOverview.AddMember("Thread Num", threadDetailedMetricsMap.size(), jsonAllocator);
+    gDoc.AddMember("Metric Overview", metricOverview, jsonAllocator);
+
+    for(auto &threadMetrics : threadDetailedMetricsMap){
+        gDoc.AddMember(rapidjson::Value(("Thread " + std::to_string(threadMetrics.first) + " Detailed Metrics").c_str(), jsonAllocator), threadMetrics.second, jsonAllocator);
+    }
+
+    char writeBuffer[127];
+    rapidjson::FileWriteStream os(gJson, writeBuffer, sizeof(writeBuffer));
+
+    rapidjson::PrettyWriter<rapidjson::FileWriteStream> writer(os);
+    gDoc.Accept(writer);
 #ifndef _WERROR
     if(warned) {
         dr_fprintf(gFile, "####################################\n");
@@ -2136,6 +2229,7 @@ ClientExit(void)
 #endif
     dr_close_file(gFlagF);
     dr_close_file(gFile);
+    fclose(gJson);
     if (!dr_raw_tls_cfree(tls_offs, INSTRACE_TLS_COUNT)) {
         ZEROSPY_EXIT_PROCESS(
             "ERROR: zerospy dr_raw_tls_calloc fail");
