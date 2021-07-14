@@ -177,6 +177,7 @@ typedef struct _per_thread_t {
     FPRedLogMap *FPRedMap;
     file_t output_file;
     void* numInsBuff;
+    int32_t threadId;
 #ifdef ZEROSPY_DEBUG
     vector<instr_t*> *instr_clones;
 #endif
@@ -1802,6 +1803,7 @@ static void
 ThreadOutputFileInit(per_thread_t *pt)
 {
     int32_t id = drcctlib_get_thread_id();
+    pt->threadId = id;
     char name[MAXIMUM_PATH] = "";
     sprintf(name + strlen(name), "%s/thread-%d.topn.log", g_folder_name.c_str(), id);
     pt->output_file = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
@@ -2039,12 +2041,21 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
             printf("\r[ZEROSPY INFO] Stage 1 : %3d %% Finish",rep);
             fflush(stdout);
         }
-        ObjRedundancy tmp = {(*it).first, 0};
+        ObjRedundancy tmp = {(*it).first, 0, 0};
         for(FPRedLogSizeMap::iterator it2 = it->second.begin(); it2 != it->second.end(); ++it2) {
             tmp.bytes += it2->second.red;
+            if(it2->second.red) {
+                bitref_t accmap = &(it2->second.accmap);
+                bitref_t redmap = &(it2->second.redmap);
+                for(size_t i=0;i<accmap->size;++i) {
+                    if(!bitvec_at(accmap, i)) {
+                        if(bitvec_at(redmap, i)) ++tmp.dfreq;
+                    }
+                }
+            }
         }
         if(tmp.bytes==0) continue;
-        grandTotalRedundantBytes += tmp.bytes;
+        grandTotalRedundantBytes += tmp.dfreq;
         tmpList.push_back(tmp); 
     }
     printf("\n[ZEROSPY INFO] Stage 1 Finish\n");
@@ -2182,9 +2193,13 @@ ClientThreadEnd(void *drcontext)
     if (pt->INTRedMap->empty() && pt->FPRedMap->empty()) return;
     uint64_t threadByteLoad = getThreadByteLoad(pt);
     __sync_fetch_and_add(&grandTotBytesLoad,threadByteLoad);
-    int threadId = drcctlib_get_thread_id();
-    uint64_t threadRedByteLoadINT = PrintRedundancyPairs(pt, threadByteLoad, threadId);
-    uint64_t threadRedByteLoadFP = PrintApproximationRedundancyPairs(pt, threadByteLoad, threadId);
+    int threadId = pt->threadId;
+    uint64_t threadRedByteLoadINT = 0;
+    uint64_t threadRedByteLoadFP = 0;
+    if(threadByteLoad != 0) {
+        threadRedByteLoadINT = PrintRedundancyPairs(pt, threadByteLoad, threadId);
+        threadRedByteLoadFP = PrintApproximationRedundancyPairs(pt, threadByteLoad, threadId);
+    }
 #ifdef TIMING
     time = get_miliseconds() - time;
     printf("Thread %d: Time %ld ms for generating outputs\n", threadId, time);
@@ -2193,8 +2208,10 @@ ClientThreadEnd(void *drcontext)
     dr_mutex_lock(gLock);
     dr_fprintf(gFile, "\n#THREAD %d Redundant Read:", threadId);
     dr_fprintf(gFile, "\nTotalBytesLoad: %lu ",threadByteLoad);
-    dr_fprintf(gFile, "\nRedundantBytesLoad: %lu %.2f",threadRedByteLoadINT, threadRedByteLoadINT * 100.0/threadByteLoad);
-    dr_fprintf(gFile, "\nApproxRedundantBytesLoad: %lu %.2f\n",threadRedByteLoadFP, threadRedByteLoadFP * 100.0/threadByteLoad);
+    if(threadByteLoad != 0) {
+        dr_fprintf(gFile, "\nRedundantBytesLoad: %lu %.2f",threadRedByteLoadINT, threadRedByteLoadINT * 100.0/threadByteLoad);
+        dr_fprintf(gFile, "\nApproxRedundantBytesLoad: %lu %.2f\n",threadRedByteLoadFP, threadRedByteLoadFP * 100.0/threadByteLoad);
+    }
     dr_mutex_unlock(gLock);
 
     dr_close_file(pt->output_file);
