@@ -71,7 +71,7 @@ static droption_t<int> op_window
  "Window size of sampling. Only available when sampling is enabled.");
 
 static droption_t<int> op_window_enable
-(DROPTION_SCOPE_CLIENT, "window", WINDOW_ENABLE, 0, INT32_MAX, "Window enabled size configuration of sampling",
+(DROPTION_SCOPE_CLIENT, "window_enable", WINDOW_ENABLE, 0, INT32_MAX, "Window enabled size configuration of sampling",
  "Window enabled size of sampling. Only available when sampling is enabled.");
 
 using namespace std;
