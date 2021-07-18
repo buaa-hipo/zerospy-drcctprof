@@ -2081,7 +2081,7 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
             dr_fprintf(gTraceFile, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", drcctlib_get_str_from_strpool((uint32_t)DECODE_NAME((*listIt).objID)));
         }
         dr_fprintf(gTraceFile, "\n==========================================\n");
-        dr_fprintf(gTraceFile, "Redundancy Ratio = %f %% (%ld Bytes)\n", (*listIt).bytes * 100.0 / grandTotalRedundantBytes, (*listIt).bytes);
+        dr_fprintf(gTraceFile, "Redundancy Ratio = %f %% (%ld Bytes, %ld Redundant Load Bytes)\n", (*listIt).dfreq * 100.0 / grandTotalRedundantBytes, (*listIt).dfreq, (*listIt).bytes);
 
         for(FPRedLogSizeMap::iterator it2 = (*pt->FPRedMap)[(*listIt).objID].begin(); it2 != (*pt->FPRedMap)[(*listIt).objID].end(); ++it2) {
             uint64_t dfreq = 0;
