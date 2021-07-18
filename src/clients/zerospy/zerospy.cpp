@@ -1989,6 +1989,12 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
     
     dr_fprintf(gTraceFile, "\n Total redundant bytes = %f %%\n", grandTotalRedundantBytes * 100.0 / threadBytesLoad);
     dr_fprintf(gTraceFile, "\n INFO : Total redundant bytes = %f %% (%ld / %ld) \n", grandTotalRedundantBytes * 100.0 / threadBytesLoad, grandTotalRedundantBytes, threadBytesLoad);
+
+    if(grandTotalRedundantBytes==0) {
+        dr_fprintf(gTraceFile, "\n------------ Dumping Approximation Redundancy Info Finish -------------\n");
+        printf("Floating Point Report dumped\n");
+        return 0;
+    }
     
 #ifdef ENABLE_FILTER_BEFORE_SORT
 #define FILTER_THESHOLD 1000
