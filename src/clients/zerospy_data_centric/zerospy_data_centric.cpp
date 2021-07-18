@@ -1928,6 +1928,11 @@ static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad,
     __sync_fetch_and_add(&grandTotBytesRedLoad,grandTotalRedundantBytes);
     dr_fprintf(gTraceFile, "\n Total redundant bytes = %f %%\n", grandTotalRedundantBytes * 100.0 / threadBytesLoad);
 
+    if(grandTotalRedundantBytes==0) {
+        dr_fprintf(gTraceFile, "\n------------ Dumping Redundancy Info Finish -------------\n");
+        return grandTotalRedundantBytes;
+    }
+
     sort(tmpList.begin(), tmpList.end(), ObjRedundancyCompare);
 
     int objNum = 0;
@@ -2063,6 +2068,11 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
     __sync_fetch_and_add(&grandTotBytesApproxRedLoad,grandTotalRedundantBytes);
 
     dr_fprintf(gTraceFile, "\n Total redundant bytes = %f %%\n", grandTotalRedundantBytes * 100.0 / threadBytesLoad);
+
+    if(grandTotalRedundantBytes==0) {
+        dr_fprintf(gTraceFile, "\n------------ Dumping Approx Redundancy Info Finish -------------\n");
+        return grandTotalRedundantBytes;
+    }
     sort(tmpList.begin(), tmpList.end(), ObjRedundancyCompare);
 
     int objNum = 0;
