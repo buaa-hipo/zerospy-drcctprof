@@ -13,6 +13,7 @@
 #endif
 
 // #define ZEROSPY_DEBUG
+#define DEBUG_CHECK
 #define _WERROR
 
 #ifdef TIMING
@@ -291,6 +292,9 @@ static inline void AddToApproximateRedTable(uint64_t addr, data_handle_t data, u
     } else {
         assert(it->second.redmap.size==it->second.accmap.size);
         assert(size == it->second.redmap.size);
+        if(it->second.typesz != typesz) {
+            printf("it->second.typesz=%d typesz=%d\n", it->second.typesz, typesz);
+        }
         assert(it->second.typesz == typesz);
 #ifdef DEBUG_CHECK
         if(offset+total>size) {
