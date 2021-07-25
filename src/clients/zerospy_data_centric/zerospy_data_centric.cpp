@@ -144,6 +144,12 @@ typedef unordered_map<uint64_t, FPRedLogSizeMap> FPRedLogMap;
 #define DECODE_TYPE(a) (((uint64_t)(a)&(0xffffffffffffffff))>>32)
 #define DECODE_NAME(b) ((uint64_t)(b)&(0x00000000ffffffff))
 
+
+#define MAKE_APPROX_OBJID(a, b, ts) (((uint64_t)(a)<<32) | ((b)<<8) | (ts))
+#define DECODE_APPROX_TYPE(a) (((uint64_t)(a)&(0xffffffffffffffff))>>32)
+#define DECODE_APPROX_NAME(b) (((uint64_t)(b)&(0x00000000ffffff00))>>8)
+#define DECODE_APPROX_TYPESZ(c) ((uint64_t)(c)&(0x00000000000000ff))
+
 #define MAKE_CNTXT(a, b, c) (((uint64_t)(a)<<32) | ((uint64_t)(b)<<16) | (uint64_t)(c))
 #define DECODE_CNTXT(a) (static_cast<ContextHandle_t>((((a)&(0xffffffffffffffff))>>32)))
 #define DECODE_ACCLN(b) (((uint64_t)(b)&(0x00000000ffff0000))>>16)
@@ -259,7 +265,7 @@ static inline void AddToApproximateRedTable(uint64_t addr, data_handle_t data, u
     // printf("ADDR=%lx, beg_addr=%lx, end_addr=%lx, typesz=%d, index=%ld, size=%ld\n", addr, (uint64_t)data.beg_addr, (uint64_t)data.end_addr, typesz, addr-(uint64_t)data.beg_addr, (uint64_t)data.end_addr - (uint64_t)data.beg_addr);
     assert(addr<=(uint64_t)data.end_addr);
     size_t offset = addr-(uint64_t)data.beg_addr;
-    uint64_t key = MAKE_OBJID(data.object_type,data.sym_name);
+    uint64_t key = MAKE_APPROX_OBJID(data.object_type,data.sym_name, typesz);
     FPRedLogMap::iterator it2 = pt->FPRedMap->find(key);
     FPRedLogSizeMap::iterator it;
     // the data size may not aligned with typesz, so use upper bound as the bitvec size
@@ -1932,6 +1938,11 @@ static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad,
     __sync_fetch_and_add(&grandTotBytesRedLoad,grandTotalRedundantBytes);
     dr_fprintf(gTraceFile, "\n Total redundant bytes = %f %%\n", grandTotalRedundantBytes * 100.0 / threadBytesLoad);
 
+    if(grandTotalRedundantBytes==0) {
+        dr_fprintf(gTraceFile, "\n------------ Dumping Redundancy Info Finish -------------\n");
+        return grandTotalRedundantBytes;
+    }
+
     sort(tmpList.begin(), tmpList.end(), ObjRedundancyCompare);
 
     int objNum = 0;
@@ -2067,6 +2078,11 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
     __sync_fetch_and_add(&grandTotBytesApproxRedLoad,grandTotalRedundantBytes);
 
     dr_fprintf(gTraceFile, "\n Total redundant bytes = %f %%\n", grandTotalRedundantBytes * 100.0 / threadBytesLoad);
+
+    if(grandTotalRedundantBytes==0) {
+        dr_fprintf(gTraceFile, "\n------------ Dumping Approx Redundancy Info Finish -------------\n");
+        return grandTotalRedundantBytes;
+    }
     sort(tmpList.begin(), tmpList.end(), ObjRedundancyCompare);
 
     int objNum = 0;
@@ -2078,14 +2094,14 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
             printf("\r[ZEROSPY INFO] Stage 2 : %3d %% Finish",rep);
             fflush(stdout);
         }
-        if((uint8_t)DECODE_TYPE((*listIt).objID) == DYNAMIC_OBJECT) {
+        if((uint8_t)DECODE_APPROX_TYPE((*listIt).objID) == DYNAMIC_OBJECT) {
             dr_fprintf(gTraceFile, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Dynamic Object: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
-            drcctlib_print_full_cct(gTraceFile, DECODE_NAME((*listIt).objID), true, true, MAX_DEPTH);
+            drcctlib_print_full_cct(gTraceFile, DECODE_APPROX_NAME((*listIt).objID), true, true, MAX_DEPTH);
         } else {
-            dr_fprintf(gTraceFile, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", drcctlib_get_str_from_strpool((uint32_t)DECODE_NAME((*listIt).objID)));
+            dr_fprintf(gTraceFile, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", drcctlib_get_str_from_strpool((uint32_t)DECODE_APPROX_NAME((*listIt).objID)));
         }
         dr_fprintf(gTraceFile, "\n==========================================\n");
-        dr_fprintf(gTraceFile, "Redundancy Ratio = %f %% (%ld Bytes)\n", (*listIt).bytes * 100.0 / grandTotalRedundantBytes, (*listIt).bytes);
+        dr_fprintf(gTraceFile, "Redundancy Ratio = %f %% (%ld Bytes, %ld Redundant Load Bytes)\n", (*listIt).dfreq * 100.0 / grandTotalRedundantBytes, (*listIt).dfreq, (*listIt).bytes);
 
         for(FPRedLogSizeMap::iterator it2 = (*pt->FPRedMap)[(*listIt).objID].begin(); it2 != (*pt->FPRedMap)[(*listIt).objID].end(); ++it2) {
             uint64_t dfreq = 0;
@@ -2136,10 +2152,10 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
             char fn[50] = {};
             sprintf(fn,"%lx.redmap",(*listIt).objID);
             file_t fp = dr_open(fn,"w");
-            if((uint8_t)DECODE_TYPE((*listIt).objID) == DYNAMIC_OBJECT) {
+            if((uint8_t)DECODE_APPROX_TYPE((*listIt).objID) == DYNAMIC_OBJECT) {
                 dr_fprintf(fp, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Dynamic Object: %lx^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n",(*listIt).objID);
             } else  
-                dr_fprintf(fp, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s, %lx ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", GetStringFromStringPool((uint32_t)DECODE_NAME((*listIt).objID)),(*listIt).objID);
+                dr_fprintf(fp, "\n\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Static Object: %s, %lx ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n", GetStringFromStringPool((uint32_t)DECODE_APPROX_NAME((*listIt).objID)),(*listIt).objID);
             for(size_t i=0;i<accmap->size;++i) {
                 if(!bitvec_at(accmap, i)) {
                     if(bitvec_at(redmap, i)) {
