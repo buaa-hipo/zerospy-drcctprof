@@ -37,9 +37,9 @@ uint64_t get_miliseconds() {
 #include "utils.h"
 #include "trace.h"
 #include "bitvec.h"
-#include "../common/include/rapidjson/document.h"
-#include "../common/include/rapidjson/filewritestream.h"
-#include "../common/include/rapidjson/prettywriter.h"
+#include "../cl_include/rapidjson/document.h"
+#include "../cl_include/rapidjson/filewritestream.h"
+#include "../cl_include/rapidjson/prettywriter.h"
 
 #define WINDOW_ENABLE 1000000
 #define WINDOW_DISABLE 100000000

@@ -35,9 +35,9 @@ uint64_t get_miliseconds() {
 #include <sys/time.h>
 #include "utils.h"
 #include "trace.h"
-#include "../common/include/rapidjson/document.h"
-#include "../common/include/rapidjson/filewritestream.h"
-#include "../common/include/rapidjson/prettywriter.h"
+#include "../cl_include/rapidjson/document.h"
+#include "../cl_include/rapidjson/filewritestream.h"
+#include "../cl_include/rapidjson/prettywriter.h"
 
 // #ifdef X86
 //     #define USE_SIMD
