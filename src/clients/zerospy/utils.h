@@ -200,6 +200,17 @@ FloatOperandSizeTable(instr_t *instr, opnd_t opnd)
 #endif
 
 bool instr_is_ignorable(instr_t *ins) {
+        int opc = instr_get_opcode(ins);
+        switch (opc) {
+#if defined(AARCH64)
+        case OP_ld3:
+        case OP_ld3r:
+                return true;
+#endif
+        default:
+                return false;
+        }
+
     return false;
 }
 
