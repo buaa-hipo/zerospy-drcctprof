@@ -2054,11 +2054,11 @@ static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad,
                     break;
                 }
             }
-            #if 0
+            #if 1
                     if(objNum<=MAX_PRINT_FULL) {
                         char fn[50] = {};
                         sprintf(fn,"%lx.redmap",(*listIt).objID);
-                        file_t fp = dr_open(fn,"w");
+                        FILE* fp = fopen(fn,"wb");
                         
                         for(size_t i=0;i<accmap->size;++i) {
                             int tmp = 1;
@@ -2253,11 +2253,11 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
                     break;
                 }
             }
-            #if 0
+            #if 1
                     if(objNum<=MAX_PRINT_FULL) {
                         char fn[50] = {};
                         sprintf(fn,"%lx.redmap",(*listIt).objID);
-                        file_t fp = dr_open(fn,"w");
+                        FILE* fp = fopen(fn,"wb");
                         
                         for(size_t i=0;i<accmap->size;++i) {
                             int tmp = 1;
@@ -2421,7 +2421,9 @@ ClientInit(int argc, const char *argv[])
 
     sprintf(name+strlen(name), "/zerospy.log");
     gFile = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
-    gJson = fopen("report.json", "w");
+    char gJsonName[MAXIMUM_PATH] = "";
+    sprintf(gJsonName + strlen(gJsonName), "%s/report.json", g_folder_name.c_str());
+    gJson = fopen(gJsonName, "w");
     DR_ASSERT(gFile != INVALID_FILE);
     DR_ASSERT(gJson != NULL);
     if (op_enable_sampling.get_value()) {

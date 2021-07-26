@@ -2170,7 +2170,9 @@ ClientInit(int argc, const char *argv[])
 
     sprintf(name+strlen(name), "/zerospy.log");
     gFile = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
-    gJson = fopen("report.json", "w");
+    char gJsonName[MAXIMUM_PATH] = "";
+    sprintf(gJsonName + strlen(gJsonName), "%s/report.json", g_folder_name.c_str());
+    gJson = fopen(gJsonName, "w");
     DR_ASSERT(gFile != INVALID_FILE);
     DR_ASSERT(gJson != NULL);
     if (op_enable_sampling.get_value()) {
