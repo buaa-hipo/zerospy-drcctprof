@@ -2172,6 +2172,7 @@ ClientInit(int argc, const char *argv[])
     gFile = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
     gJson = fopen("report.json", "w");
     DR_ASSERT(gFile != INVALID_FILE);
+    DR_ASSERT(gJson != NULL);
     if (op_enable_sampling.get_value()) {
         dr_fprintf(STDOUT, "[ZEROSPY INFO] Sampling Enabled\n");
         dr_fprintf(gFile, "[ZEROSPY INFO] Sampling Enabled\n");
