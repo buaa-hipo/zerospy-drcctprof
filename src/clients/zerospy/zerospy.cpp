@@ -38,9 +38,9 @@ uint64_t get_miliseconds() {
 #include "drcctlib_hpcviewer_format.h"
 =======
 #include "trace.h"
-#include "include/rapidjson/document.h"
-#include "include/rapidjson/filewritestream.h"
-#include "include/rapidjson/prettywriter.h"
+#include "../cl_include/rapidjson/document.h"
+#include "../cl_include/rapidjson/filewritestream.h"
+#include "../cl_include/rapidjson/prettywriter.h"
 
 // #ifdef X86
 //     #define USE_SIMD
@@ -2230,6 +2230,7 @@ ClientInit(int argc, const char *argv[])
     gFile = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
     gJson = fopen("report.json", "w");
     DR_ASSERT(gFile != INVALID_FILE);
+    DR_ASSERT(gJson != NULL);
     if (op_enable_sampling.get_value()) {
         dr_fprintf(STDOUT, "[ZEROSPY INFO] Sampling Enabled\n");
         dr_fprintf(gFile, "[ZEROSPY INFO] Sampling Enabled\n");
