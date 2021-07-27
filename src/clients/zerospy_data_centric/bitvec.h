@@ -23,9 +23,7 @@ inline void bitvec_alloc(bitref_t bitref, size_t size) {
     if(size>BITVEC_PAGE_SIZE*64) {
         bitref->capacity = CEIL(CEIL(size,64) + 1, BITVEC_PAGE_SIZE);
         // guaranttee to be zero
-        dr_mutex_lock(gLock);
         bitref->data.dyn_pages = (uint64_t**)dr_raw_mem_alloc(bitref->capacity*sizeof(uint64_t*), DR_MEMPROT_READ | DR_MEMPROT_WRITE, NULL);
-        dr_mutex_unlock(gLock);
         assert(bitref->data.dyn_pages!=NULL);
         memset(bitref->data.dyn_pages, 0, bitref->capacity*sizeof(uint64_t*));
     } else if(size>64) {
@@ -38,9 +36,7 @@ inline void bitvec_alloc(bitref_t bitref, size_t size) {
         // bitref->capacity = (size+63)/64 + 1;
         //assert(bitref->capacity > 0);
         // Only Dynamic Malloc for large cases (>64 Bytes)
-        dr_mutex_lock(gLock);
         bitref->data.dyn = (uint64_t*)dr_raw_mem_alloc(bitref->capacity*sizeof(uint64_t), DR_MEMPROT_READ | DR_MEMPROT_WRITE, NULL);
-        dr_mutex_unlock(gLock);
         assert(bitref->data.dyn!=NULL);
         memset(bitref->data.dyn, -1, bitref->capacity*sizeof(uint64_t));
         // // TODO: may be slow, use avx
@@ -86,9 +82,7 @@ inline void bitvec_and(bitref_t bitref, uint64_t val, size_t offset, size_t size
 #endif 
             assert(pagePosP1<bitref->capacity);
             if(bitref->data.dyn_pages[pagePosP1]==NULL) {
-                dr_mutex_lock(gLock);
                 bitref->data.dyn_pages[pagePosP1] = (uint64_t*)dr_raw_mem_alloc(BITVEC_PAGE_SIZE*sizeof(uint64_t), DR_MEMPROT_READ | DR_MEMPROT_WRITE, NULL);
-                dr_mutex_unlock(gLock);
                 assert(bitref->data.dyn_pages[pagePosP1]!=NULL);
                 memset(bitref->data.dyn_pages[pagePosP1], -1, BITVEC_PAGE_SIZE*sizeof(uint64_t));
             }
@@ -98,9 +92,7 @@ inline void bitvec_and(bitref_t bitref, uint64_t val, size_t offset, size_t size
             size = rest;
         }
         if(bitref->data.dyn_pages[pagePos]==NULL) {
-            dr_mutex_lock(gLock);
             bitref->data.dyn_pages[pagePos] = (uint64_t*)dr_raw_mem_alloc(BITVEC_PAGE_SIZE*sizeof(uint64_t), DR_MEMPROT_READ | DR_MEMPROT_WRITE, NULL);
-            dr_mutex_unlock(gLock);
             assert(bitref->data.dyn_pages[pagePos]!=NULL);
             memset(bitref->data.dyn_pages[pagePos], -1, BITVEC_PAGE_SIZE*sizeof(uint64_t));
         }
