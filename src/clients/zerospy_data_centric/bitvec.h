@@ -35,7 +35,7 @@ inline void bitvec_alloc(bitref_t bitref, size_t size) {
         // bitref->capacity = (size+63)/64 + 1;
         //assert(bitref->capacity > 0);
         // Only Dynamic Malloc for large cases (>64 Bytes)
-        bitref->data.dyn = (uint64_t**)dr_raw_mem_alloc(bitref->capacity*sizeof(uint64_t), DR_MEMPROT_READ | DR_MEMPROT_WRITE, NULL);
+        bitref->data.dyn = (uint64_t*)dr_raw_mem_alloc(bitref->capacity*sizeof(uint64_t), DR_MEMPROT_READ | DR_MEMPROT_WRITE, NULL);
         assert(bitref->data.dyn!=NULL);
         memset(bitref->data.dyn, -1, bitref->capacity*sizeof(uint64_t));
         // // TODO: may be slow, use avx
