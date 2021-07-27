@@ -5,8 +5,8 @@
 #include <unordered_map>
 /************************************************/
 /****************** Bit Vector ******************/
-// 256K Page Size (256K * 8B = 2MB)
-#define BITVEC_PAGE_SIZE (1<<18)
+// 4K Page Size (4K * 8B = 32KB)
+#define BITVEC_PAGE_SIZE (1<<12)
 #define CEIL(a, b) (((a)+(b)-1)/(b))
 struct bitvec_t { 
     union {
