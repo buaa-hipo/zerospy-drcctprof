@@ -26,7 +26,7 @@ inline void bitvec_alloc(bitref_t bitref, size_t size) {
         //bitref->data.dyn_pages = (uint64_t**)dr_raw_mem_alloc(bitref->capacity*sizeof(uint64_t*), DR_MEMPROT_READ | DR_MEMPROT_WRITE, NULL);
         bitref->data.dyn_pages = (uint64_t**)malloc(bitref->capacity*sizeof(uint64_t*));
         assert(bitref->data.dyn_pages!=NULL);
-        //memset(bitref->data.dyn_pages, 0, bitref->capacity*sizeof(uint64_t*));
+        memset(bitref->data.dyn_pages, 0, bitref->capacity*sizeof(uint64_t*));
     } else if(size>64) {
         /* FIXME i#5: Although upper bound of size/64 is usually enough, 
          * the compiler may generate overflowed memory access at the end 
