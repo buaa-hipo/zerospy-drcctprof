@@ -82,6 +82,7 @@ inline void bitvec_and(bitref_t bitref, uint64_t val, size_t offset, size_t size
             assert(pagePosP1<bitref->capacity);
             if(bitref->data.dyn_pages[pagePosP1]==NULL) {
                 bitref->data.dyn_pages[pagePosP1] = (uint64_t*)dr_raw_mem_alloc(BITVEC_PAGE_SIZE*sizeof(uint64_t), DR_MEMPROT_READ | DR_MEMPROT_WRITE, NULL);
+                assert(bitref->data.dyn_pages[pagePosP1]!=NULL);
                 memset(bitref->data.dyn_pages[pagePosP1], -1, BITVEC_PAGE_SIZE*sizeof(uint64_t));
             }
             register uint64_t mask = (0x1LL << (size-rest)) - 1;
@@ -91,6 +92,7 @@ inline void bitvec_and(bitref_t bitref, uint64_t val, size_t offset, size_t size
         }
         if(bitref->data.dyn_pages[pagePos]==NULL) {
             bitref->data.dyn_pages[pagePos] = (uint64_t*)dr_raw_mem_alloc(BITVEC_PAGE_SIZE*sizeof(uint64_t), DR_MEMPROT_READ | DR_MEMPROT_WRITE, NULL);
+            assert(bitref->data.dyn_pages[pagePos]!=NULL);
             memset(bitref->data.dyn_pages[pagePos], -1, BITVEC_PAGE_SIZE*sizeof(uint64_t));
         }
         register uint64_t mask = (0x1LL << size) - 1;
