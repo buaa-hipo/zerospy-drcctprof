@@ -225,10 +225,10 @@ static inline void AddToRedTable(uint64_t addr, data_handle_t data, uint16_t val
 static inline void AddToRedTable(uint64_t addr, data_handle_t data, uint16_t value, uint16_t total, uint32_t redmap, per_thread_t *pt) {
     assert(addr<=(uint64_t)data.end_addr);
     size_t offset = addr-(uint64_t)data.beg_addr;
+    size_t size = (uint64_t)data.end_addr - (uint64_t)data.beg_addr;
     uint64_t key = MAKE_OBJID(data.object_type,data.sym_name);
     RedLogMap::iterator it2 = pt->INTRedMap->find(key);
     RedLogSizeMap::iterator it;
-    size_t size = (uint64_t)data.end_addr - (uint64_t)data.beg_addr;
     // IF_DEBUG(dr_fprintf(
     //         STDOUT,
     //         "AddToRedTable 1: offset=%ld, total=%d, size=%ld\n", offset, total, size));
@@ -247,9 +247,9 @@ static inline void AddToRedTable(uint64_t addr, data_handle_t data, uint16_t val
         }
 #endif
         bitvec_alloc(&log.redmap, size);
-        bitvec_and(&log.redmap, redmap, offset, total);
+        //bitvec_and(&log.redmap, redmap, offset, total);
         bitvec_alloc(&log.accmap, size);
-        bitvec_and(&log.accmap, 0, offset, total);
+        //bitvec_and(&log.accmap, 0, offset, total);
         (*pt->INTRedMap)[key][size] = log;
     } else {
         assert(it->second.redmap.size==it->second.accmap.size);
@@ -266,8 +266,8 @@ static inline void AddToRedTable(uint64_t addr, data_handle_t data, uint16_t val
         }
 #endif
         it->second.red += value;
-        bitvec_and(&(it->second.redmap), redmap, offset, total);
-        bitvec_and(&(it->second.accmap), 0, offset, total);
+        //bitvec_and(&(it->second.redmap), redmap, offset, total);
+        //bitvec_and(&(it->second.accmap), 0, offset, total);
     }
 }
 
@@ -309,11 +309,10 @@ static inline void AddToApproximateRedTable(uint64_t addr, data_handle_t data, u
     } else {
         assert(it->second.redmap.size==it->second.accmap.size);
         assert(size == it->second.redmap.size);
+#ifdef DEBUG_CHECK
         if(it->second.typesz != typesz) {
             printf("it->second.typesz=%d typesz=%d\n", it->second.typesz, typesz);
         }
-        assert(it->second.typesz == typesz);
-#ifdef DEBUG_CHECK
         if(offset+total>size) {
             printf("AddToApproxRedTable 1: offset=%ld, total=%d, size=%ld\n", offset, total, size);
             if(data.object_type == DYNAMIC_OBJECT) {
@@ -324,6 +323,7 @@ static inline void AddToApproximateRedTable(uint64_t addr, data_handle_t data, u
             }
         }
 #endif
+        assert(it->second.typesz == typesz);
         it->second.red += value;
         bitvec_and(&(it->second.redmap), redmap, offset, total);
         bitvec_and(&(it->second.accmap), 0, offset, total);
@@ -904,10 +904,9 @@ struct BBInstrument {
 
 template<int accessLen, int elementSize>
 inline __attribute__((always_inline))
-void CheckAndInsertIntPage_impl(void* addr, void* pval, per_thread_t *pt) {
+void CheckAndInsertIntPage_impl(void* drcontext, void* addr, void* pval, per_thread_t *pt) {
     // update info
     uint8_t* bytes = reinterpret_cast<uint8_t*>(pval);
-    void* drcontext = dr_get_current_drcontext();
     data_handle_t data_hndl =
                 drcctlib_get_data_hndl_ignore_stack_data(drcontext, (app_pc)addr);
     if(data_hndl.object_type!=DYNAMIC_OBJECT && data_hndl.object_type!=STATIC_OBJECT) {
@@ -1002,7 +1001,7 @@ void trace_update_int() {
         trace_ptr - trace_base, trace_buf_get_buffer_size(drcontext, trace_buffer),
         trace_buf_get_buffer_end(drcontext, trace_buffer)));
     for(cache_ptr=trace_base; cache_ptr<trace_ptr; ++cache_ptr) {
-        CheckAndInsertIntPage_impl<sz, esize>(cache_ptr->addr, (void*)cache_ptr->val, pt);
+        CheckAndInsertIntPage_impl<sz, esize>(drcontext, cache_ptr->addr, (void*)cache_ptr->val, pt);
     }
     // all buffered trace is updated, reset the buffer
     trace_buf_set_buffer_ptr(drcontext, trace_buffer, buf_base);
