@@ -27,6 +27,8 @@ uint64_t get_miliseconds() {
 }
 #endif
 
+static void *gLock;
+
 #include "dr_api.h"
 #include "drmgr.h"
 #include "drreg.h"
@@ -205,7 +207,6 @@ rapidjson::Value metricOverview(rapidjson::kObjectType);
 rapidjson::Value totalIntegerRedundantBytes(rapidjson::kObjectType);
 rapidjson::Value totalFloatRedundantBytes(rapidjson::kObjectType);
 std::map<int32_t, rapidjson::Value> threadDetailedMetricsMap;
-static void *gLock;
 #ifndef _WERROR
 file_t fwarn;
 bool warned=false;
@@ -247,9 +248,9 @@ static inline void AddToRedTable(uint64_t addr, data_handle_t data, uint16_t val
         }
 #endif
         bitvec_alloc(&log.redmap, size);
-        //bitvec_and(&log.redmap, redmap, offset, total);
+        bitvec_and(&log.redmap, redmap, offset, total);
         bitvec_alloc(&log.accmap, size);
-        //bitvec_and(&log.accmap, 0, offset, total);
+        bitvec_and(&log.accmap, 0, offset, total);
         (*pt->INTRedMap)[key][size] = log;
     } else {
         assert(it->second.redmap.size==it->second.accmap.size);
@@ -266,8 +267,8 @@ static inline void AddToRedTable(uint64_t addr, data_handle_t data, uint16_t val
         }
 #endif
         it->second.red += value;
-        //bitvec_and(&(it->second.redmap), redmap, offset, total);
-        //bitvec_and(&(it->second.accmap), 0, offset, total);
+        bitvec_and(&(it->second.redmap), redmap, offset, total);
+        bitvec_and(&(it->second.accmap), 0, offset, total);
     }
 }
 
