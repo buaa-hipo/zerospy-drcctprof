@@ -21,7 +21,7 @@ typedef bitvec_t* bitref_t;
 inline void bitvec_alloc(bitref_t bitref, size_t size) {
     bitref->size = size;
     if(size>BITVEC_PAGE_SIZE*64) {
-        bitref->capacity = CEIL((CEIL(size,64) + 1, BITVEC_PAGE_SIZE);
+        bitref->capacity = CEIL(CEIL(size,64) + 1, BITVEC_PAGE_SIZE);
         bitref->data.dyn_pages = (uint64_t**)dr_raw_mem_alloc(bitref->capacity*sizeof(uint64_t*), DR_MEMPROT_READ | DR_MEMPROT_WRITE, NULL);
         assert(bitref->data.dyn_pages!=NULL);
         memset(bitref->data.dyn_pages, 0, bitref->capacity*sizeof(uint64_t*));
