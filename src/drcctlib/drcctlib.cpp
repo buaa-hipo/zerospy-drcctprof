@@ -282,7 +282,12 @@ static char *global_string_pool;
 static int global_string_pool_idle_idx = 0;
 #define ATOMIC_ADD_STRING_POOL_INDEX(origin, val) dr_atomic_add32_return_sum(&origin, val)
 
+#ifdef DRCCTLIB_USE_ADDR
+#include "concurrent_tree_map.h"
+static ConcurrentTreeMap<size_t, data_handle_t> *global_data_set;
+#else
 static ConcurrentShadowMemory<data_handle_t> *global_shadow_memory;
+#endif
 
 // ctxt to ipnode
 static inline context_handle_t
@@ -2227,6 +2232,34 @@ next_string_pool_idx(char *name)
     return next_idx - len;
 }
 
+#ifdef DRCCTLIB_USE_ADDR
+const data_handle_t GetTreeNode(size_t addr) {
+    Node<size_t, data_handle_t>* node = global_data_set->lookup_lower_bound(addr);
+    if( addr >= (size_t)node->getValue().beg_addr && 
+        addr <  (size_t)node->getValue().end_addr ) {
+        //DRCCTLIB_PRINTF("[SUCC] lookup addr: %p, get key:%p, range: %p:%p", addr, node->getKey(), node->getValue().beg_addr, node->getValue().end_addr);
+        return node->getValue();
+    } else {
+        //DRCCTLIB_PRINTF("[FAIL] lookup addr: %p, get key:%p, range: %p:%p", addr, node->getKey(), node->getValue().beg_addr, node->getValue().end_addr);
+    }
+
+    data_handle_t data;
+    data.object_type = UNKNOWN_OBJECT;
+    data.path_handle = 0;
+    return data;
+}
+void DeleteTreeNode(size_t addr) {
+    bool check = global_data_set->remove(addr);
+    if(!check && addr!=0) {
+        DRCCTLIB_PRINTF("failed to delete addr: %p", addr);
+    } 
+    // else if(check) {
+    //     DRCCTLIB_PRINTF("delete addr: %p", addr);
+    // }
+}
+#endif
+
+#ifndef DRCCTLIB_USE_ADDR
 static void
 init_shadow_memory_space(void *addr, uint32_t accessLen, data_handle_t initializer)
 {
@@ -2243,6 +2276,7 @@ init_shadow_memory_space(void *addr, uint32_t accessLen, data_handle_t initializ
         }
     }
 }
+#endif
 
 // static void
 // capture_mmap_size(void *wrapcxt, void **user_data)
@@ -2280,9 +2314,20 @@ capture_calloc_size(void *wrapcxt, void **user_data)
     pt->dmem_alloc_ctxt_hndl = pt->cur_bb_node->child_ctxt_start_idx;
 }
 
+#ifdef DRCCTLIB_USE_ADDR
+static void
+capture_free(void *wrapcxt, void **user_data)
+{
+    DeleteTreeNode((size_t)drwrap_get_arg(wrapcxt, 0));
+}
+#endif
+
 static void
 capture_realloc_size(void *wrapcxt, void **user_data)
 {
+#ifdef DRCCTLIB_USE_ADDR
+    capture_free(wrapcxt, user_data);
+#endif
     // Remember the CCT node and the allocation size
     void *drcontext = (void *)drwrap_get_drcontext(wrapcxt);
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
@@ -2303,9 +2348,15 @@ datacentric_dynamic_alloc(void *wrapcxt, void *user_data)
     data_hndl.path_handle = pt->dmem_alloc_ctxt_hndl;
 #ifdef DRCCTLIB_USE_ADDR
     data_hndl.beg_addr = ptr;
-    data_hndl.end_addr = (void*)((uint64_t)ptr + pt->dmem_alloc_size);
-#endif
+    data_hndl.end_addr = (void*)((size_t)ptr + pt->dmem_alloc_size);
+    bool check = global_data_set->insert((size_t)ptr, data_hndl);
+    if(!check) {
+        global_data_set->remove((size_t)ptr);
+        global_data_set->insert((size_t)ptr, data_hndl);
+    }
+#else
     init_shadow_memory_space(ptr, pt->dmem_alloc_size, data_hndl);
+#endif
 }
 
 // compute static variables
@@ -2363,15 +2414,24 @@ datacentric_static_alloc(const module_data_t *info)
             data_hndl.object_type = STATIC_OBJECT;
             char *sym_name = elf_strptr(elf, shdr->sh_link, syms[i].st_name);
             data_hndl.sym_name = sym_name ? next_string_pool_idx(sym_name) : 0;
+#ifdef DRCCTLIB_USE_ADDR
+            data_hndl.beg_addr = (void*)((uint64_t)(info->start) + syms[i].st_value), 
+            data_hndl.end_addr = (void*)((uint64_t)(data_hndl.beg_addr) + (uint32_t)syms[i].st_size);
+            bool check = global_data_set->insert((size_t)data_hndl.beg_addr, data_hndl);
+            if(!check) {
+                global_data_set->remove((size_t)data_hndl.beg_addr);
+                bool check = global_data_set->insert((size_t)data_hndl.beg_addr, data_hndl);
+                if(!check) {
+                    DRCCTLIB_PRINTF("failed to insert static object: %s %p:%d", sym_name, data_hndl.beg_addr, (uint32_t)syms[i].st_size);
+                }
+            }
+#else
             // DRCCTLIB_PRINTF("STATIC_OBJECT %s %d", sym_name,
             // (uint32_t)syms[i].st_size); dr_fprintf(global_debug_file, "STATIC_OBJECT %s
             // %d \n", sym_name, (uint32_t)syms[i].st_size);
-#ifdef DRCCTLIB_USE_ADDR
-            data_hndl.beg_addr = (void *)((uint64_t)(info->start) + syms[i].st_value);
-            data_hndl.end_addr = (void *)((uint64_t)(data_hndl.beg_addr) + (uint32_t)syms[i].st_size);
-#endif
             init_shadow_memory_space((void *)((uint64_t)(info->start) + syms[i].st_value),
                                      (uint32_t)syms[i].st_size, data_hndl);
+#endif
         }
     }
     dr_unmap_file(map_base, map_size);
@@ -2380,7 +2440,53 @@ datacentric_static_alloc(const module_data_t *info)
     // dr_fprintf(global_debug_file, "finish datacentric_static_alloc %s \n",
     // info->full_path);
 }
-
+#ifdef DRCCTLIB_USE_ADDR
+static void
+datacentric_static_free(const module_data_t *info)
+{
+    // DRCCTLIB_PRINTF("datacentric_static_alloc %s", info->full_path);
+    // dr_fprintf(global_debug_file, "datacentric_static_alloc %s \n", info->full_path);
+    file_t fd = dr_open_file(info->full_path, DR_FILE_READ);
+    uint64 file_size;
+    if (fd == INVALID_FILE) {
+        if (strcmp(info->full_path, "[vdso]") != 0) {
+            DRCCTLIB_PRINTF("------ unable to open %s", info->full_path);
+        }
+        return;
+    }
+    if (!dr_file_size(fd, &file_size)) {
+        DRCCTLIB_PRINTF("------ unable to get file size %s", info->full_path);
+        return;
+    }
+    size_t map_size = file_size;
+    void *map_base = dr_map_file(fd, &map_size, 0, NULL, DR_MEMPROT_READ, DR_MAP_PRIVATE);
+    /* map_size can be larger than file_size */
+    if (map_base == NULL || map_size < file_size) {
+        DRCCTLIB_PRINTF("------ unable to map %s", info->full_path);
+        return;
+    }
+    // DRCCTLIB_PRINTF("------ success map %s", info->full_path);
+    // in memory
+    Elf *elf = elf_memory((char *)map_base,
+                          map_size); // Initialize 'elf' pointer to our file descriptor
+    for (Elf_Scn *scn = elf_getscn(elf, 0); scn != NULL; scn = elf_nextscn(elf, scn)) {
+        Elf_Shdr *shdr = elf_getshdr(scn);
+        if (shdr == NULL || shdr->sh_type != SHT_SYMTAB)
+            continue;
+        int symbol_count = shdr->sh_size / shdr->sh_entsize;
+        Elf_Sym *syms = (Elf_Sym *)(((char *)map_base) + shdr->sh_offset);
+        for (int i = 0; i < symbol_count; i++) {
+            if ((syms[i].st_size == 0) ||
+                (ELF_ST_TYPE(syms[i].st_info) != STT_OBJECT)) { // not a variable
+                continue;
+            }
+            DeleteTreeNode((size_t)((uint64_t)(info->start) + syms[i].st_value));
+        }
+    }
+    dr_unmap_file(map_base, map_size);
+    dr_close_file(fd);
+}
+#endif
 static inline app_pc
 moudle_get_function_entry(const module_data_t *info, const char *func_name,
                           bool check_internal_func)
@@ -2435,12 +2541,21 @@ drcctlib_event_module_load_analysis(void *drcontext, const module_data_t *info,
                                         datacentric_dynamic_alloc);
         insert_func_instrument_by_drwap(info, FUNC_NAME_REALLOC, capture_realloc_size,
                                         datacentric_dynamic_alloc);
+#ifdef DRCCTLIB_USE_ADDR
+        insert_func_instrument_by_drwap(info, FUNC_NAME_FREE, capture_free,
+                                        NULL);
+#endif
     }
 }
 
 static void
 drcctlib_event_module_unload_analysis(void *drcontext, const module_data_t *info)
 {
+#ifdef DRCCTLIB_USE_ADDR
+    if ((global_flags & DRCCTLIB_COLLECT_DATA_CENTRIC_MESSAGE) != 0) {
+        datacentric_static_free(info);
+    }
+#endif
 }
 
 static inline void
@@ -2778,7 +2893,11 @@ drcctlib_internal_init(char flag)
             DRCCTLIB_PRINTF("INIT DATA CENTRIC FAIL: Elf Library is out of date!");
             global_flags -= DRCCTLIB_COLLECT_DATA_CENTRIC_MESSAGE;
         } else {
+#ifdef DRCCTLIB_USE_ADDR
+            global_data_set = new ConcurrentTreeMap<uint64_t, data_handle_t>();
+#else
             global_shadow_memory = new ConcurrentShadowMemory<data_handle_t>();
+#endif
         }
     }
 
@@ -2877,7 +2996,11 @@ drcctlib_exit(void)
         drmgr_unregister_module_unload_event(drcctlib_event_module_unload_analysis);
     }
     if ((global_flags & DRCCTLIB_COLLECT_DATA_CENTRIC_MESSAGE) != 0) {
+#ifdef DRCCTLIB_USE_ADDR
+        delete global_data_set;
+#else
         delete global_shadow_memory;
+#endif
     }
 
     hashtable_delete(&global_bb_key_table);
@@ -3336,14 +3459,19 @@ DR_EXPORT
 data_handle_t
 drcctlib_get_data_hndl_ignore_stack_data(void *drcontext, void *address)
 {
+    return drcctlib_get_data_hndl_runtime(drcontext, address);
     data_handle_t data_hndl;
+#ifdef DRCCTLIB_USE_ADDR
+    data_hndl = GetTreeNode((size_t)address);
+#else
     data_hndl.object_type = UNKNOWN_OBJECT;
     data_hndl.path_handle = 0;
-    data_handle_t *ptr =
+    const data_handle_t *ptr =
         global_shadow_memory->GetShadowAddress((size_t)(uint64_t)address);
     if (ptr != NULL) {
         data_hndl = *ptr;
     }
+#endif
     return data_hndl;
 }
 
@@ -3359,13 +3487,19 @@ drcctlib_get_data_hndl_runtime(void *drcontext, void *address)
         data_hndl.object_type = STACK_OBJECT;
         return data_hndl;
     }
+    
+#ifdef DRCCTLIB_USE_ADDR
+    data_hndl = GetTreeNode((size_t)address);
+    return data_hndl;
+#else
     data_hndl.object_type = UNKNOWN_OBJECT;
-    data_handle_t *ptr =
+    const data_handle_t *ptr =
         global_shadow_memory->GetShadowAddress((size_t)(uint64_t)address);
     if (ptr != NULL) {
         data_hndl = *ptr;
     }
     return data_hndl;
+#endif
 }
 
 DR_EXPORT

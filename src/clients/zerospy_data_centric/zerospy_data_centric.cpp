@@ -139,7 +139,7 @@ struct FPRedLogs{
     uint64_t red;  // how many byte zero
     bitvec_t redmap; // bitmap logging if a byte is redundant
     bitvec_t accmap; // bitmap logging if a byte is accessed
-    uint8_t typesz;
+    //uint8_t typesz;
 };
 
 typedef unordered_map<uint64_t, FPRedLogs> FPRedLogSizeMap;
@@ -288,7 +288,7 @@ static inline void AddToApproximateRedTable(uint64_t addr, data_handle_t data, u
     if ( it2  == pt->FPRedMap->end() || (it = it2->second.find(size)) == it2->second.end()) {
         FPRedLogs log;
         log.red = value;
-        log.typesz = typesz;
+        // log.typesz = typesz;
 #ifdef DEBUG_CHECK
         if(offset+total>size) {
             printf("AddToApproxRedTable 1: offset=%ld, total=%d, size=%ld\n", offset, total, size);
@@ -309,9 +309,9 @@ static inline void AddToApproximateRedTable(uint64_t addr, data_handle_t data, u
         assert(it->second.redmap.size==it->second.accmap.size);
         assert(size == it->second.redmap.size);
 #ifdef DEBUG_CHECK
-        if(it->second.typesz != typesz) {
-            printf("it->second.typesz=%d typesz=%d\n", it->second.typesz, typesz);
-        }
+        // if(it->second.typesz != typesz) {
+        //     printf("it->second.typesz=%d typesz=%d\n", it->second.typesz, typesz);
+        // }
         if(offset+total>size) {
             printf("AddToApproxRedTable 1: offset=%ld, total=%d, size=%ld\n", offset, total, size);
             if(data.object_type == DYNAMIC_OBJECT) {
@@ -322,7 +322,7 @@ static inline void AddToApproximateRedTable(uint64_t addr, data_handle_t data, u
             }
         }
 #endif
-        assert(it->second.typesz == typesz);
+        //assert(it->second.typesz == typesz);
         it->second.red += value;
         bitvec_and(&(it->second.redmap), redmap, offset, total);
         bitvec_and(&(it->second.accmap), 0, offset, total);
@@ -1847,8 +1847,8 @@ ClientThreadStart(void *drcontext)
     pt->INTRedMap = new RedLogMap();
     pt->FPRedMap = new FPRedLogMap();
     pt->instr_clones = new vector<instr_t*>();
-    pt->INTRedMap->rehash(10000000);
-    pt->FPRedMap->rehash(10000000);
+    // pt->INTRedMap->rehash(10000000);
+    // pt->FPRedMap->rehash(10000000);
     pt->numInsBuff = dr_get_dr_segment_base(tls_seg);
     BUF_PTR(pt->numInsBuff, void, INSTRACE_TLS_OFFS_BUF_PTR) = 0;
     drmgr_set_tls_field(drcontext, tls_idx, (void *)pt);
@@ -2112,30 +2112,34 @@ static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad,
 
 void free_int_logs(per_thread_t* pt) {
     int num=0;
+    size_t size=pt->INTRedMap->max_load_factor() * pt->INTRedMap->bucket_count() * sizeof(RedLogSizeMap);
     for(RedLogMap::iterator it = pt->INTRedMap->begin(); it != pt->INTRedMap->end(); ++it) {
         for(RedLogSizeMap::iterator it2 = it->second.begin(); it2 != it->second.end(); ++it2) {
             bitvec_free(&(it2->second.accmap));
             bitvec_free(&(it2->second.redmap));
             ++num;
         }
+        size+=it->second.size() * (sizeof(uint64_t) + sizeof(RedLogs));
         it->second.clear();
     }
     delete pt->INTRedMap;
-    dr_fprintf(STDOUT, "INTLOG FREED: %d\n", num);
+    dr_fprintf(STDOUT, "INTLOG FREED: %d, memory %ld\n", num, size);
 }
 
 void free_fp_logs(per_thread_t* pt) {
     int num=0;
+    size_t size=pt->FPRedMap->max_load_factor() * pt->FPRedMap->bucket_count() * sizeof(FPRedLogSizeMap);
     for(FPRedLogMap::iterator it = pt->FPRedMap->begin(); it != pt->FPRedMap->end(); ++it) {
         for(FPRedLogSizeMap::iterator it2 = it->second.begin(); it2 != it->second.end(); ++it2) {
             bitvec_free(&(it2->second.accmap));
             bitvec_free(&(it2->second.redmap));
             ++num;
         }
+        size+=it->second.size() * (sizeof(uint64_t) + sizeof(FPRedLogs));
         it->second.clear();
     }
     delete pt->FPRedMap;
-    dr_fprintf(STDOUT, "FPLOG FREED: %d\n", num);
+    dr_fprintf(STDOUT, "FPLOG FREED: %d, memory %ld\n", num, size);
 }
 
 static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad, int threadId, rapidjson::Value &threadDetailedMetrics, rapidjson::Value &threadDetailedDataCentricMetrics) {
@@ -2219,11 +2223,11 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
         floatRedundantInfoItem.AddMember("Redundancy", rapidjson::Value(str, jsonAllocator), jsonAllocator); 
 
         int dataNum = 0;
+        uint8_t  dtype = DECODE_APPROX_TYPESZ((*listIt).objID);
         for(FPRedLogSizeMap::iterator it2 = (*pt->FPRedMap)[(*listIt).objID].begin(); it2 != (*pt->FPRedMap)[(*listIt).objID].end(); ++it2) {
             uint64_t dfreq = 0;
             uint64_t dread = 0;
             uint64_t dsize = it2->first;
-            uint8_t  dtype = it2->second.typesz;
             bitref_t accmap = &(it2->second.accmap);
             bitref_t redmap = &(it2->second.redmap);
 

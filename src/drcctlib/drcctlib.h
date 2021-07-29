@@ -253,6 +253,11 @@ typedef struct _data_handle_t {
 #endif
 } data_handle_t;
 
+#ifdef DRCCTLIB_USE_ADDR
+bool operator < (data_handle_t const& a, data_handle_t const& b) {
+    return (app_pc)a.beg_addr < (app_pc)b.end_addr;
+}
+#endif
 /* API for data centric */
 
 DR_EXPORT
