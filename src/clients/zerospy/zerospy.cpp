@@ -1190,7 +1190,6 @@ void insertBufferCheck(void* drcontext, instrlist_t *bb, instr_t* ins, ushort me
     RESERVE_REG(drcontext, bb, ins, NULL, reg_end);
 #endif
     instr_t* skip_to_end = INSTR_CREATE_label(drcontext);
-    instr_t* skip_to_update = INSTR_CREATE_label(drcontext);
     if(op_enable_sampling.get_value()) {
         dr_insert_read_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
         // Clear insCnt when insCnt > WINDOW_DISABLE
@@ -1204,6 +1203,7 @@ void insertBufferCheck(void* drcontext, instrlist_t *bb, instr_t* ins, ushort me
 #else
         MINSERT(bb, ins, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(window_enable)));
 #endif
+        instr_t* skip_to_update = INSTR_CREATE_label(drcontext);
         MINSERT(bb, ins, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(skip_to_update)));
         // FP
         insertBufferClear_impl(drcontext, bb, ins, memRefCnt[0], trace_buffer_sp1, reg_ptr);
@@ -1367,7 +1367,7 @@ static void
 insert_load(void *drcontext, instrlist_t *ilist, instr_t *where, reg_id_t dst,
             reg_id_t src, ushort offset, opnd_size_t opsz)
 {
-    instr_t* ins_clone = instr_clone(drcontext, where);
+    // instr_t* ins_clone = instr_clone(drcontext, where);
     switch (opsz) {
     case OPSZ_1:
         MINSERT(ilist, where,
