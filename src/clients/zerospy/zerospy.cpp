@@ -1999,6 +1999,9 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
     if(grandTotalRedundantBytes==0) {
         dr_fprintf(gTraceFile, "\n------------ Dumping Approximation Redundancy Info Finish -------------\n");
         printf("Floating Point Report dumped\n");
+        threadDetailedCodeCentricMetrics.AddMember("Floating Point Redundant Info", floatingPointRedundantInfo, jsonAllocator);
+        threadDetailedMetrics.AddMember("Code Centric", threadDetailedCodeCentricMetrics, jsonAllocator);
+        threadDetailedMetricsMap[threadId] = threadDetailedMetrics;
         return 0;
     }
     
@@ -2113,14 +2116,16 @@ ClientThreadEnd(void *drcontext)
         rapidjson::Value threadIntegerTotal(rapidjson::kObjectType);
         rapidjson::Value threadFloatTotal(rapidjson::kObjectType);
 
+        char detailName[32] = {};
+        dr_snprintf(detailName, 32, "./thread%dCCDetail.md", threadId);
         threadIntegerTotal.AddMember("rate", threadRedByteLoadINT * 100.0/threadByteLoad, jsonAllocator);
         threadIntegerTotal.AddMember("fraction", rapidjson::Value((std::to_string(threadRedByteLoadINT) + "/" + std::to_string(threadByteLoad)).c_str(), jsonAllocator), jsonAllocator);
-        threadIntegerTotal.AddMember("detail", "file:///abspath/to/thread0CCDetail.md",
+        threadIntegerTotal.AddMember("detail", rapidjson::Value(detailName, jsonAllocator),
                         jsonAllocator);
 
         threadFloatTotal.AddMember("rate", threadRedByteLoadFP * 100.0/threadByteLoad, jsonAllocator);
         threadFloatTotal.AddMember("fraction", rapidjson::Value((std::to_string(threadRedByteLoadFP) + "/" + std::to_string(threadByteLoad)).c_str(), jsonAllocator), jsonAllocator);
-        threadFloatTotal.AddMember("detail", "file:///abspath/to/thread0CCDetail.md",
+        threadFloatTotal.AddMember("detail", rapidjson::Value(detailName, jsonAllocator),
                         jsonAllocator);
 
         totalIntegerRedundantBytes.AddMember(rapidjson::Value(("Thread " + std::to_string(threadId)).c_str(), jsonAllocator), threadIntegerTotal, jsonAllocator);
@@ -2170,7 +2175,9 @@ ClientInit(int argc, const char *argv[])
 
     sprintf(name+strlen(name), "/zerospy.log");
     gFile = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
-    gJson = fopen("report.json", "w");
+    char gJsonName[MAXIMUM_PATH] = "";
+    sprintf(gJsonName + strlen(gJsonName), "%s/report.json", g_folder_name.c_str());
+    gJson = fopen(gJsonName, "w");
     DR_ASSERT(gFile != INVALID_FILE);
     DR_ASSERT(gJson != NULL);
     if (op_enable_sampling.get_value()) {

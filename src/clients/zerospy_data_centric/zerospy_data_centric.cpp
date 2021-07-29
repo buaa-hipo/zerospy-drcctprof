@@ -2048,29 +2048,21 @@ static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad,
                     break;
                 }
             }
-            #if 0
+            #if 1
                     if(objNum<=MAX_PRINT_FULL) {
                         char fn[50] = {};
                         sprintf(fn,"%lx.redmap",(*listIt).objID);
-                        file_t fp = dr_open(fn,"w");
+                        FILE* fp = fopen(fn,"wb");
                         
-                        for(size_t i=0;i<accmap->size;++i) {
-                            int tmp = 1;
-                            if(bitvec_at(accmap, i)) {
-                                fwrite(&tmp, sizeof(char), 1, fp);
-                            } else {
-                                tmp = 0;
-                                fwrite(&tmp, sizeof(char), 1, fp);
-                            }
-
-                            tmp = 1;
-                            if(bitvec_at(redmap, i)) {
-                                fwrite(&tmp, sizeof(char), 1, fp);
-                            } else {
-                                tmp = 0;
-                                fwrite(&tmp, sizeof(char), 1, fp);
-                            }
+                        if(accmap->size > 64) {
+                            int wSize = accmap->size / 64 + (accmap->size % 64 == 0?0:1);
+                            fwrite(accmap->data.dyn, wSize * 8, 1, fp);
+                            fwrite(redmap->data.dyn, wSize * 8, 1, fp);
+                        } else {
+                            fwrite(&accmap->data.stat, 8, 1, fp);
+                            fwrite(&redmap->data.stat, 8, 1, fp);
                         }
+                        fclose(fp);
                         dr_snprintf(keyStr, 32, "Redmap %d", dataNum);
                         integerRedundantInfoItem.AddMember(rapidjson::Value(keyStr, jsonAllocator), rapidjson::Value(fn, jsonAllocator), jsonAllocator); 
                     }
@@ -2184,6 +2176,9 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
 
     if(grandTotalRedundantBytes==0) {
         dr_fprintf(gTraceFile, "\n------------ Dumping Approx Redundancy Info Finish -------------\n");
+        threadDetailedDataCentricMetrics.AddMember("Floating Point Redundant Info", floatingPointRedundantInfo, jsonAllocator);
+        threadDetailedMetrics.AddMember("Data Centric", threadDetailedDataCentricMetrics, jsonAllocator);
+        threadDetailedMetricsMap[threadId] = threadDetailedMetrics;
         return grandTotalRedundantBytes;
     }
     sort(tmpList.begin(), tmpList.end(), ObjRedundancyCompare);
@@ -2275,29 +2270,21 @@ static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t thr
                     break;
                 }
             }
-            #if 0
+            #if 1
                     if(objNum<=MAX_PRINT_FULL) {
                         char fn[50] = {};
                         sprintf(fn,"%lx.redmap",(*listIt).objID);
-                        file_t fp = dr_open(fn,"w");
+                        FILE* fp = fopen(fn,"wb");
                         
-                        for(size_t i=0;i<accmap->size;++i) {
-                            int tmp = 1;
-                            if(bitvec_at(accmap, i)) {
-                                fwrite(&tmp, sizeof(char), 1, fp);
-                            } else {
-                                tmp = 0;
-                                fwrite(&tmp, sizeof(char), 1, fp);
-                            }
-
-                            tmp = 1;
-                            if(bitvec_at(redmap, i)) {
-                                fwrite(&tmp, sizeof(char), 1, fp);
-                            } else {
-                                tmp = 0;
-                                fwrite(&tmp, sizeof(char), 1, fp);
-                            }
+                        if(accmap->size > 64) {
+                            int wSize = accmap->size / 64 + (accmap->size % 64 == 0?0:1);
+                            fwrite(accmap->data.dyn, wSize * 8, 1, fp);
+                            fwrite(redmap->data.dyn, wSize * 8, 1, fp);
+                        } else {
+                            fwrite(&accmap->data.stat, 8, 1, fp);
+                            fwrite(&redmap->data.stat, 8, 1, fp);
                         }
+                        fclose(fp); 
                         dr_snprintf(keyStr, 32, "Redmap %d", dataNum);
                         floatRedundantInfoItem.AddMember(rapidjson::Value(keyStr, jsonAllocator), rapidjson::Value(fn, jsonAllocator), jsonAllocator); 
                     }
@@ -2416,6 +2403,23 @@ ClientThreadEnd(void *drcontext)
         dr_fprintf(gFile, "\nRedundantBytesLoad: %lu %.2f",threadRedByteLoadINT, threadRedByteLoadINT * 100.0/threadByteLoad);
         dr_fprintf(gFile, "\nApproxRedundantBytesLoad: %lu %.2f\n",threadRedByteLoadFP, threadRedByteLoadFP * 100.0/threadByteLoad);
     }
+    rapidjson::Value threadIntegerTotal(rapidjson::kObjectType);
+    rapidjson::Value threadFloatTotal(rapidjson::kObjectType);
+
+    threadIntegerTotal.AddMember("rate", threadRedByteLoadINT * 100.0/threadByteLoad, jsonAllocator);
+    threadIntegerTotal.AddMember("fraction", rapidjson::Value((std::to_string(threadRedByteLoadINT) + "/" + std::to_string(threadByteLoad)).c_str(), jsonAllocator), jsonAllocator);
+    char detailName[32] = {};
+    dr_snprintf(detailName, 32, "./thread%dDCDetail.md", threadId);
+    threadIntegerTotal.AddMember("detail", rapidjson::Value(detailName, jsonAllocator),
+                    jsonAllocator);
+
+    threadFloatTotal.AddMember("rate", threadRedByteLoadFP * 100.0/threadByteLoad, jsonAllocator);
+    threadFloatTotal.AddMember("fraction", rapidjson::Value((std::to_string(threadRedByteLoadFP) + "/" + std::to_string(threadByteLoad)).c_str(), jsonAllocator), jsonAllocator);
+    threadFloatTotal.AddMember("detail", rapidjson::Value(detailName, jsonAllocator),
+                    jsonAllocator);
+
+    totalIntegerRedundantBytes.AddMember(rapidjson::Value(("Thread " + std::to_string(threadId)).c_str(), jsonAllocator), threadIntegerTotal, jsonAllocator);
+    totalFloatRedundantBytes.AddMember(rapidjson::Value(("Thread " + std::to_string(threadId)).c_str(), jsonAllocator), threadFloatTotal, jsonAllocator);
     dr_mutex_unlock(gLock);
 
     dr_close_file(pt->output_file);
@@ -2461,7 +2465,9 @@ ClientInit(int argc, const char *argv[])
 
     sprintf(name+strlen(name), "/zerospy.log");
     gFile = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
-    gJson = fopen("report.json", "w");
+    char gJsonName[MAXIMUM_PATH] = "";
+    sprintf(gJsonName + strlen(gJsonName), "%s/report.json", g_folder_name.c_str());
+    gJson = fopen(gJsonName, "w");
     DR_ASSERT(gFile != INVALID_FILE);
     DR_ASSERT(gJson != NULL);
     if (op_enable_sampling.get_value()) {
@@ -2509,6 +2515,7 @@ ClientExit(void)
     metricOverview.AddMember("Total Integer Redundant Bytes", totalIntegerRedundantBytes, jsonAllocator);
     metricOverview.AddMember("Total Floating Point Redundant Bytes", totalFloatRedundantBytes, jsonAllocator);
     metricOverview.AddMember("Thread Num", threadDetailedMetricsMap.size(), jsonAllocator);
+    metricOverview.AddMember("DC", 1, jsonAllocator);
     gDoc.AddMember("Metric Overview", metricOverview, jsonAllocator);
 
     for(auto &threadMetrics : threadDetailedMetricsMap){
