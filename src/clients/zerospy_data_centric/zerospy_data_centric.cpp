@@ -7,7 +7,7 @@
 #include <assert.h>
 #include <algorithm>
 
-#ifdef DEBUG
+#ifdef DEBUG_CHECK
 #define IF_DEBUG(stat) stat
 #else
 #define IF_DEBUG(stat)
@@ -27,6 +27,8 @@ uint64_t get_miliseconds() {
 }
 #endif
 
+static void *gLock;
+
 #include "dr_api.h"
 #include "drmgr.h"
 #include "drreg.h"
@@ -37,9 +39,9 @@ uint64_t get_miliseconds() {
 #include "utils.h"
 #include "trace.h"
 #include "bitvec.h"
-#include "../common/include/rapidjson/document.h"
-#include "../common/include/rapidjson/filewritestream.h"
-#include "../common/include/rapidjson/prettywriter.h"
+#include "../cl_include/rapidjson/document.h"
+#include "../cl_include/rapidjson/filewritestream.h"
+#include "../cl_include/rapidjson/prettywriter.h"
 
 #define WINDOW_ENABLE 1000000
 #define WINDOW_DISABLE 100000000
@@ -189,9 +191,7 @@ typedef struct _per_thread_t {
     file_t output_file;
     void* numInsBuff;
     int32_t threadId;
-#ifdef ZEROSPY_DEBUG
     vector<instr_t*> *instr_clones;
-#endif
 } per_thread_t;
 
 
@@ -205,7 +205,6 @@ rapidjson::Value metricOverview(rapidjson::kObjectType);
 rapidjson::Value totalIntegerRedundantBytes(rapidjson::kObjectType);
 rapidjson::Value totalFloatRedundantBytes(rapidjson::kObjectType);
 std::map<int32_t, rapidjson::Value> threadDetailedMetricsMap;
-static void *gLock;
 #ifndef _WERROR
 file_t fwarn;
 bool warned=false;
@@ -225,10 +224,10 @@ static inline void AddToRedTable(uint64_t addr, data_handle_t data, uint16_t val
 static inline void AddToRedTable(uint64_t addr, data_handle_t data, uint16_t value, uint16_t total, uint32_t redmap, per_thread_t *pt) {
     assert(addr<=(uint64_t)data.end_addr);
     size_t offset = addr-(uint64_t)data.beg_addr;
+    size_t size = (uint64_t)data.end_addr - (uint64_t)data.beg_addr;
     uint64_t key = MAKE_OBJID(data.object_type,data.sym_name);
     RedLogMap::iterator it2 = pt->INTRedMap->find(key);
     RedLogSizeMap::iterator it;
-    size_t size = (uint64_t)data.end_addr - (uint64_t)data.beg_addr;
     // IF_DEBUG(dr_fprintf(
     //         STDOUT,
     //         "AddToRedTable 1: offset=%ld, total=%d, size=%ld\n", offset, total, size));
@@ -309,11 +308,10 @@ static inline void AddToApproximateRedTable(uint64_t addr, data_handle_t data, u
     } else {
         assert(it->second.redmap.size==it->second.accmap.size);
         assert(size == it->second.redmap.size);
+#ifdef DEBUG_CHECK
         if(it->second.typesz != typesz) {
             printf("it->second.typesz=%d typesz=%d\n", it->second.typesz, typesz);
         }
-        assert(it->second.typesz == typesz);
-#ifdef DEBUG_CHECK
         if(offset+total>size) {
             printf("AddToApproxRedTable 1: offset=%ld, total=%d, size=%ld\n", offset, total, size);
             if(data.object_type == DYNAMIC_OBJECT) {
@@ -324,6 +322,7 @@ static inline void AddToApproximateRedTable(uint64_t addr, data_handle_t data, u
             }
         }
 #endif
+        assert(it->second.typesz == typesz);
         it->second.red += value;
         bitvec_and(&(it->second.redmap), redmap, offset, total);
         bitvec_and(&(it->second.accmap), 0, offset, total);
@@ -904,10 +903,9 @@ struct BBInstrument {
 
 template<int accessLen, int elementSize>
 inline __attribute__((always_inline))
-void CheckAndInsertIntPage_impl(void* addr, void* pval, per_thread_t *pt) {
+void CheckAndInsertIntPage_impl(void* drcontext, void* addr, void* pval, per_thread_t *pt) {
     // update info
     uint8_t* bytes = reinterpret_cast<uint8_t*>(pval);
-    void* drcontext = dr_get_current_drcontext();
     data_handle_t data_hndl =
                 drcctlib_get_data_hndl_ignore_stack_data(drcontext, (app_pc)addr);
     if(data_hndl.object_type!=DYNAMIC_OBJECT && data_hndl.object_type!=STATIC_OBJECT) {
@@ -1002,7 +1000,7 @@ void trace_update_int() {
         trace_ptr - trace_base, trace_buf_get_buffer_size(drcontext, trace_buffer),
         trace_buf_get_buffer_end(drcontext, trace_buffer)));
     for(cache_ptr=trace_base; cache_ptr<trace_ptr; ++cache_ptr) {
-        CheckAndInsertIntPage_impl<sz, esize>(cache_ptr->addr, (void*)cache_ptr->val, pt);
+        CheckAndInsertIntPage_impl<sz, esize>(drcontext, cache_ptr->addr, (void*)cache_ptr->val, pt);
     }
     // all buffered trace is updated, reset the buffer
     trace_buf_set_buffer_ptr(drcontext, trace_buffer, buf_base);
@@ -1117,7 +1115,6 @@ void insertBufferCheck(void* drcontext, instrlist_t *bb, instr_t* ins, ushort me
     RESERVE_REG(drcontext, bb, ins, NULL, reg_end);
 #endif
     instr_t* skip_to_end = INSTR_CREATE_label(drcontext);
-    instr_t* skip_to_update = INSTR_CREATE_label(drcontext);
     if(op_enable_sampling.get_value()) {
         dr_insert_read_raw_tls(drcontext, bb, ins, tls_seg, tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_ptr);
         // Clear insCnt when insCnt > WINDOW_DISABLE
@@ -1131,6 +1128,7 @@ void insertBufferCheck(void* drcontext, instrlist_t *bb, instr_t* ins, ushort me
 #else
         MINSERT(bb, ins, XINST_CREATE_cmp(drcontext, opnd_create_reg(reg_ptr), OPND_CREATE_CCT_INT(window_enable)));
 #endif
+        instr_t* skip_to_update = INSTR_CREATE_label(drcontext);
         MINSERT(bb, ins, XINST_CREATE_jump_cond(drcontext, DR_PRED_LE, opnd_create_instr(skip_to_update)));
         // FP
         insertBufferClear_impl(drcontext, bb, ins, memRefCnt[0], trace_buffer_sp1, reg_ptr);
@@ -1296,7 +1294,7 @@ insert_load(void *drcontext, instrlist_t *ilist, instr_t *where, reg_id_t dst,
             reg_id_t src, ushort offset, opnd_size_t opsz)
 {
     //dr_insert_clean_call(drcontext, ilist, where, (void *)debug_output_line, false, 0);
-    instr_t* ins_clone = instr_clone(drcontext, where);
+    //instr_t* ins_clone = instr_clone(drcontext, where);
     switch (opsz) {
     case OPSZ_1:
         MINSERT(ilist, where,
@@ -1632,9 +1630,7 @@ struct ZerospyInstrument{
         uint32_t refSize = opnd_size_in_bytes(opnd_get_size(instr_get_dst(ins, 0)));
         per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
         instr_t* ins_clone = instr_clone(drcontext, ins);
-#ifdef ZEROSPY_DEBUG
         pt->instr_clones->push_back(ins_clone);
-#endif
 #ifdef DEBUG_VGATHER
         printf("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
         printf("^^ refSize = %d, operSize = %d\n", refSize, operSize);
@@ -1850,9 +1846,7 @@ ClientThreadStart(void *drcontext)
     }
     pt->INTRedMap = new RedLogMap();
     pt->FPRedMap = new FPRedLogMap();
-#ifdef ZEROSPY_DEBUG
     pt->instr_clones = new vector<instr_t*>();
-#endif
     pt->INTRedMap->rehash(10000000);
     pt->FPRedMap->rehash(10000000);
     pt->numInsBuff = dr_get_dr_segment_base(tls_seg);
@@ -2108,6 +2102,34 @@ static uint64_t PrintRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad,
     return grandTotalRedundantBytes;
 }
 
+void free_int_logs(per_thread_t* pt) {
+    int num=0;
+    for(RedLogMap::iterator it = pt->INTRedMap->begin(); it != pt->INTRedMap->end(); ++it) {
+        for(RedLogSizeMap::iterator it2 = it->second.begin(); it2 != it->second.end(); ++it2) {
+            bitvec_free(&(it2->second.accmap));
+            bitvec_free(&(it2->second.redmap));
+            ++num;
+        }
+        it->second.clear();
+    }
+    delete pt->INTRedMap;
+    dr_fprintf(STDOUT, "INTLOG FREED: %d\n", num);
+}
+
+void free_fp_logs(per_thread_t* pt) {
+    int num=0;
+    for(FPRedLogMap::iterator it = pt->FPRedMap->begin(); it != pt->FPRedMap->end(); ++it) {
+        for(FPRedLogSizeMap::iterator it2 = it->second.begin(); it2 != it->second.end(); ++it2) {
+            bitvec_free(&(it2->second.accmap));
+            bitvec_free(&(it2->second.redmap));
+            ++num;
+        }
+        it->second.clear();
+    }
+    delete pt->FPRedMap;
+    dr_fprintf(STDOUT, "FPLOG FREED: %d\n", num);
+}
+
 static uint64_t PrintApproximationRedundancyPairs(per_thread_t *pt, uint64_t threadBytesLoad, int threadId, rapidjson::Value &threadDetailedMetrics, rapidjson::Value &threadDetailedDataCentricMetrics) {
     printf("[ZEROSPY INFO] PrintRedundancyPairs for FP...\n");
     vector<ObjRedundancy> tmpList;
@@ -2337,7 +2359,22 @@ ClientThreadEnd(void *drcontext)
     uint64_t time = get_miliseconds();
 #endif
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-    if (pt->INTRedMap->empty() && pt->FPRedMap->empty()) return;
+    if (pt->INTRedMap->empty() && pt->FPRedMap->empty()) {
+        free_int_logs(pt);
+        free_fp_logs(pt);
+        dr_close_file(pt->output_file);
+
+        for(size_t i=0;i<pt->instr_clones->size();++i) {
+            instr_destroy(drcontext, (*pt->instr_clones)[i]);
+        }
+        delete pt->instr_clones;
+
+#ifdef DEBUG_REUSE
+        dr_close_file(pt->log_file);
+#endif
+        dr_thread_free(drcontext, pt, sizeof(per_thread_t));
+        return;
+    }
     uint64_t threadByteLoad = getThreadByteLoad(pt);
     __sync_fetch_and_add(&grandTotBytesLoad,threadByteLoad);
     int threadId = pt->threadId;
@@ -2347,7 +2384,12 @@ ClientThreadEnd(void *drcontext)
     uint64_t threadRedByteLoadFP = 0;
     if(threadByteLoad != 0) {
         threadRedByteLoadINT = PrintRedundancyPairs(pt, threadByteLoad, threadId, threadDetailedMetrics, threadDetailedDataCentricMetrics);
+        free_int_logs(pt);
         threadRedByteLoadFP = PrintApproximationRedundancyPairs(pt, threadByteLoad, threadId, threadDetailedMetrics, threadDetailedDataCentricMetrics);
+        free_fp_logs(pt);
+    } else {
+        free_int_logs(pt);
+        free_fp_logs(pt);
     }
 #ifdef TIMING
     time = get_miliseconds() - time;
@@ -2381,14 +2423,12 @@ ClientThreadEnd(void *drcontext)
     dr_mutex_unlock(gLock);
 
     dr_close_file(pt->output_file);
-    delete pt->INTRedMap;
-    delete pt->FPRedMap;
-#ifdef ZEROSPY_DEBUG
+
     for(size_t i=0;i<pt->instr_clones->size();++i) {
         instr_destroy(drcontext, (*pt->instr_clones)[i]);
     }
     delete pt->instr_clones;
-#endif
+
 #ifdef DEBUG_REUSE
     dr_close_file(pt->log_file);
 #endif
@@ -2503,18 +2543,18 @@ ClientExit(void)
             "ERROR: zerospy dr_raw_tls_calloc fail");
     }
     // free trace buffers
-    trace_buf_free(trace_buffer_i1);
-    trace_buf_free(trace_buffer_i2);
-    trace_buf_free(trace_buffer_i4);
-    trace_buf_free(trace_buffer_i8);
-    trace_buf_free(trace_buffer_i16);
-    trace_buf_free(trace_buffer_i32);
-    trace_buf_free(trace_buffer_sp1);
-    trace_buf_free(trace_buffer_dp1);
-    trace_buf_free(trace_buffer_sp4);
-    trace_buf_free(trace_buffer_dp2);
-    trace_buf_free(trace_buffer_sp8);
-    trace_buf_free(trace_buffer_dp4);
+    assert(trace_buf_free(trace_buffer_i1));
+    assert(trace_buf_free(trace_buffer_i2));
+    assert(trace_buf_free(trace_buffer_i4));
+    assert(trace_buf_free(trace_buffer_i8));
+    assert(trace_buf_free(trace_buffer_i16));
+    assert(trace_buf_free(trace_buffer_i32));
+    assert(trace_buf_free(trace_buffer_sp1));
+    assert(trace_buf_free(trace_buffer_dp1));
+    assert(trace_buf_free(trace_buffer_sp4));
+    assert(trace_buf_free(trace_buffer_dp2));
+    assert(trace_buf_free(trace_buffer_sp8));
+    assert(trace_buf_free(trace_buffer_dp4));
 
     drcctlib_exit();
     drmgr_analysis_cb_t event_basic_block_ptr = op_enable_sampling.get_value()
